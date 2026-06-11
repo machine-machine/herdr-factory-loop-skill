@@ -1,4 +1,4 @@
-# hermes-skill-herdr
+# herdr-factory-loop-skill
 
 Orchestrate a fleet of AI coding agents through **herdr** — the terminal
 workspace manager (workspaces → tabs → panes) running on this machine.
@@ -74,7 +74,7 @@ See `skill/SKILL.md` §11 for the full SDD workflow, including how
 
 ```bash
 # from a fresh agent environment
-curl -sSL https://raw.githubusercontent.com/machine-machine/hermes-skill-herdr/main/scripts/install.sh | bash
+curl -sSL https://raw.githubusercontent.com/machine-machine/herdr-factory-loop-skill/main/scripts/install.sh | bash
 ```
 
 This will clone the repo and symlink the skill into the right location
@@ -83,8 +83,8 @@ for both Claude (`~/.claude/skills/herdr/`) and Hermes (`~/.hermes/skills/herdr/
 ### Manual install
 
 ```bash
-git clone https://github.com/machine-machine/hermes-skill-herdr.git
-cd hermes-skill-herdr
+git clone https://github.com/machine-machine/herdr-factory-loop-skill.git
+cd herdr-factory-loop-skill
 
 # Pick the target agent platform:
 ln -s "$(pwd)/skill" ~/.hermes/skills/herdr
@@ -95,7 +95,7 @@ ln -s "$(pwd)/skill" ~/.claude/skills/herdr
 ### Update
 
 ```bash
-cd hermes-skill-herdr && git pull
+cd herdr-factory-loop-skill && git pull
 ```
 
 The symlink stays valid, the skill is reloaded on next session.
@@ -103,7 +103,7 @@ The symlink stays valid, the skill is reloaded on next session.
 ## Repository layout
 
 ```
-hermes-skill-herdr/
+herdr-factory-loop-skill/
 ├── README.md                ← you are here
 ├── CHANGELOG.md             ← version history (semver)
 ├── LICENSE                  ← MIT

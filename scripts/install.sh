@@ -12,9 +12,9 @@
 
 set -euo pipefail
 
-REPO_URL="https://github.com/machine-machine/hermes-skill-herdr.git"
+REPO_URL="https://github.com/machine-machine/herdr-factory-loop-skill.git"
 SKILL_NAME="herdr"
-CACHE_DIR="${HERMES_SKILL_CACHE_DIR:-$HOME/.cache/hermes-skill-herdr}"
+CACHE_DIR="${HERMES_SKILL_CACHE_DIR:-$HOME/.cache/herdr-factory-loop-skill}"
 
 usage() {
   sed -n '2,12p' "$0"
