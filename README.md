@@ -39,11 +39,36 @@ This skill teaches an agent how to:
 | 8 | Notify the human | Local desktop notifications |
 | 9 | Channel-driven intent → herd | Intent arrives on a chat channel, spin up a parallel herd |
 | 10 | Compound the run | Review before reporting, write a run report, promote recurring lessons into this skill |
+| 11 | SDD factory loop (spec-kit × herdr) | Spec-driven development: spec → plan → tasks → herd implements `[P]` tasks → analyze → converge against the spec |
 
 See [`skill/SKILL.md`](./skill/SKILL.md) for the full reference and
 [`skill/reference.md`](./skill/reference.md) for verbatim CLI/socket docs.
 
-## Install
+## Onboarding (recommended): the factory loop
+
+The onboarding TUI sets up the whole factory in one pass — pick your
+orchestrator (**Claude Code** or **Hermes**), install this skill for it,
+install [github/spec-kit](https://github.com/github/spec-kit)'s `specify`
+CLI, and establish the SDD loop (`specify init`) in a target repo:
+
+```bash
+./scripts/onboard.sh                                                   # interactive
+./scripts/onboard.sh --orchestrator claude --repo /path/to/repo --yes  # scripted
+```
+
+The choice is recorded in `~/.config/herdr-factory/config.toml`. Once
+onboarded, the loop is:
+
+```
+/speckit.constitution → /speckit.specify → /speckit.clarify →
+/speckit.plan → /speckit.tasks → herd implements [P] tasks →
+/speckit.analyze → converge vs spec.md → compound
+```
+
+See `skill/SKILL.md` §11 for the full SDD workflow, including how
+`tasks.md` `[P]` markers map to parallel herdr workers.
+
+## Install (skill only)
 
 ### Quick install (one command)
 
@@ -87,6 +112,7 @@ hermes-skill-herdr/
 │   ├── SKILL.md             ← the skill itself (loaded by the agent)
 │   └── reference.md         ← verbatim CLI & socket reference
 └── scripts/
+    ├── onboard.sh           ← onboarding TUI: orchestrator choice + spec-kit + SDD loop
     ├── install.sh           ← one-line installer (see Install section)
     └── lint.sh              ← sanity checks on SKILL.md frontmatter & cross-refs
 ```

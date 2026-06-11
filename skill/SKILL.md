@@ -1,7 +1,7 @@
 ---
 name: herdr
-version: 1.2.0
-description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel.
+version: 1.3.0
+description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code or Hermes as orchestrator).
 ---
 
 # herdr Skill
@@ -67,9 +67,12 @@ Never `send-keys`, `send-text`, `pane close`, or `agent attach --takeover` your 
 
 ### 3. Spawn an agent
 ```bash
-# Start a named agent; everything after `--` is the agent's argv.
-herdr agent start claude --cwd /path/to/repo --split right --no-focus -- --dangerously-skip-permissions
-herdr agent start codex  --workspace <ws_id> --tab <tab_id> -- ...
+# Start a named agent; everything after `--` is the agent's FULL argv —
+# argv[0] MUST be the binary (full path is safest). Flags alone fail with
+# "No viable candidates found in PATH".
+herdr agent start claude --cwd /path/to/repo --split right --no-focus -- \
+  "$(command -v claude)" --dangerously-skip-permissions
+herdr agent start codex  --workspace <ws_id> --tab <tab_id> -- "$(command -v codex)" ...
 ```
 For **isolated parallel work**, give each agent its own git worktree first:
 ```bash
@@ -89,6 +92,22 @@ For a shell pane, `pane run` types the command **and** presses Enter in one step
 herdr pane run <pane_id> "pytest -q"
 ```
 `<target>` accepts terminal ids, unique agent names, detected labels, or pane ids.
+
+**Long prompts and reliable answers — use the file protocol.** Never stream a multi-line prompt into a TUI input (newlines can submit early), and never scrape a TUI screen for a deliverable (wrapped, truncated, full of chrome). Instead:
+```bash
+# 1. Prompt → file; dispatch a one-line pointer
+cat > /tmp/task-$ID.md <<EOF
+<full task here>
+Output protocol: write your COMPLETE answer to /tmp/answer-$ID.md,
+then output this exact line in the terminal: TASK_DONE_$ID
+EOF
+herdr agent send "$PANE" "Read /tmp/task-$ID.md and follow its instructions exactly."
+herdr pane send-keys "$PANE" Enter
+# 2. Wait on the sentinel; the FILE is the deliverable, not the screen
+herdr wait output "$PANE" --match "TASK_DONE_$ID" --timeout 600000
+cat /tmp/answer-$ID.md
+```
+Use `pane read` for *monitoring* (what is the agent doing?), the file protocol for *deliverables* (what did it produce?).
 
 ### 5. Monitor & wait
 Block until an agent changes state (the backbone of orchestration):
@@ -121,7 +140,7 @@ The canonical multi-agent pattern, in bash:
 for t in task_a task_b task_c; do
   herdr worktree create --cwd /repo --branch wip/$t --base main --json
   PANE=$(herdr agent start claude --cwd ~/.herdr/worktrees/repo/wip-$t --no-focus -- \
-           --dangerously-skip-permissions | jq -r '.result.pane_id')
+           "$(command -v claude)" --dangerously-skip-permissions | jq -r '.result.agent.pane_id')
   herdr agent send $PANE "$(cat tasks/$t.md)"; herdr pane send-keys $PANE Enter
   echo "$t=$PANE" >> /tmp/fleet.map
 done
@@ -177,8 +196,8 @@ for t in "${SPLITS[@]}"; do
   WT=$(cat /tmp/wt-$t)
   # 2. spawn codex worker, do NOT take focus
   PANE=$(herdr agent start codex --cwd "$WT" --split right --no-focus -- \
-           --dangerously-skip-permissions \
-    | jq -r '.result.pane_id')
+           "$(command -v codex)" --dangerously-skip-permissions \
+    | jq -r '.result.agent.pane_id')
   # 3. author a tight, scoped prompt per worker (one slice only)
   cat > /tmp/prompt-$t.md <<EOF
 Scope: $t only. Do NOT touch files outside $t's slice.
@@ -252,8 +271,9 @@ Once all workers are `idle`/`done`:
 4. **Review before you report.** Don't hand the user an unreviewed merge — spawn reviewer agents on the integration branch, in parallel, one lens each (correctness, security if the diff touches auth/input/secrets, project conventions):
    ```bash
    for lens in correctness conventions; do
-     PANE=$(herdr agent start claude --cwd "$REPO" --no-focus -- --dangerously-skip-permissions \
-       | jq -r '.result.pane_id')
+     PANE=$(herdr agent start claude --cwd "$REPO" --no-focus -- \
+              "$(command -v claude)" --dangerously-skip-permissions \
+       | jq -r '.result.agent.pane_id')
      herdr agent send "$PANE" "Review the diff between $BASE and $INT_BRANCH for $lens issues only. Severity-tag each finding P1 (must fix) / P2 (should fix) / P3 (nit). Output findings as a list, nothing else."
      herdr pane send-keys "$PANE" Enter
      echo "review-$lens=$PANE" >> /tmp/herd.map
@@ -321,6 +341,101 @@ When the same `next time` note shows up in a second run report, it stops being a
 
 Open a PR against this repo (see CONTRIBUTING.md — it's a MINOR bump). The skill is the fleet's institutional memory: a lesson that lives only in a run report gets re-learned; a lesson merged here is learned once, by every future agent.
 
+### 11. SDD factory loop — spec-kit × herdr
+
+The factory loop is herdr orchestration with [github/spec-kit](https://github.com/github/spec-kit) as the front half: **nothing is implemented without a spec, and every herd derives its slices from `tasks.md` instead of ad-hoc decomposition.** Use it whenever the user asks for SDD, the factory loop, or any `/speckit.*` command — and prefer it over §9's freeform decomposition for any feature big enough to herd.
+
+```
+constitution → specify → clarify → plan → tasks ──→ herd implements (§9 machinery)
+     ▲                                       │              │
+     └────────── compound (§10) ◄── converge ◄── analyze ◄──┘
+```
+
+#### 11.0 Onboard (once per machine, once per repo)
+
+Run the onboarding TUI from this repo to choose the orchestrator and establish the loop:
+```bash
+./scripts/onboard.sh                                    # interactive
+./scripts/onboard.sh --orchestrator claude --repo /path/to/repo --yes   # scripted
+```
+It (1) picks **Claude Code or Hermes** as the orchestrator, (2) verifies herdr/jq/git, (3) installs this skill for the chosen agent, (4) installs the `specify` CLI (`uv tool install specify-cli --from git+https://github.com/github/spec-kit.git`), (5) runs `specify init --here` in the target repo, and (6) records the choice in `~/.config/herdr-factory/config.toml`.
+
+Integration mapping: **claude** → `specify init --here --integration claude` (prompts land in `.claude/commands/speckit.*.md`); **hermes** → `specify init --here --integration generic --integration-options="--commands-dir .hermes/commands/"` (same prompts, in `.hermes/commands/`). Older spec-kit builds use `--ai` instead of `--integration` — onboard.sh detects this. Check the active orchestrator any time: `cat ~/.config/herdr-factory/config.toml`.
+
+#### 11.1 The loop, stage by stage
+
+The **orchestrator** (you) runs the spec-kit stages in its own session; only implementation fans out to workers.
+
+| # | Stage | Command / action | Artifact | Gate to pass |
+|---|-------|------------------|----------|--------------|
+| 1 | Constitution | `/speckit.constitution` (once per repo) | `.specify/memory/constitution.md` | Principles exist |
+| 2 | Specify | `/speckit.specify <feature idea>` | `specs/<feature>/spec.md` | User stories + acceptance criteria, no `[NEEDS CLARIFICATION]` left |
+| 3 | Clarify | `/speckit.clarify` | updated `spec.md` | Ambiguities resolved (ask the user, don't guess) |
+| 4 | Plan | `/speckit.plan <tech context>` | `plan.md`, `research.md`, `data-model.md`, `contracts/` | Plan consistent with constitution |
+| 5 | Tasks | `/speckit.tasks` | `tasks.md` (`[P]` = parallelizable) | Every requirement maps to ≥1 task |
+| 6 | Implement | herd executes `tasks.md` — §11.2 | commits on `wip/` branches | All assigned tasks done, tests pass per worker |
+| 7 | Analyze | `/speckit.analyze` | consistency report | No CRITICAL findings (spec↔plan↔tasks↔code drift) |
+| 8 | Converge | merge → test → review (§9.5) | integration branch | Acceptance criteria in `spec.md` verified, P1 review findings fixed |
+| 9 | Compound | §10 run report | `~/.herdr/runs/…` | `next time` line written |
+
+Small features (≤3 tasks, no `[P]`): skip the herd, run `/speckit.implement` inline in the orchestrator session. Stages 6–8 above replace `/speckit.implement` only when fanning out.
+
+#### 11.2 Dispatch `tasks.md` to the herd
+
+`tasks.md` is the herd plan — it replaces `/tmp/herd-plan.md` from §9.1 step 7. Tasks marked `[P]` touch disjoint files and may run concurrently; unmarked tasks have ordering dependencies and run serially (in the orchestrator or a single worker) **before** the parallel wave they gate.
+
+```bash
+FEATURE_DIR=$(ls -td specs/*/ | head -1)        # active feature (or take it from the spec stage output)
+TASKS="$FEATURE_DIR/tasks.md"
+
+# Slices: one worker per [P] task (or per phase-group of [P] tasks for small tasks)
+grep -E '^- \[ \] T[0-9]+ \[P\]' "$TASKS"
+
+# Spawn per slice — same worktree machinery as §9.2
+SELF=$(herdr agent list | jq -r '.result.agents[] | select(.focused==true) | .pane_id')
+while IFS= read -r task; do
+  TID=$(echo "$task" | grep -oE 'T[0-9]+' | head -1)
+  herdr worktree create --cwd "$REPO" --branch "wip/$FEATURE/$TID" --base "$BASE" --label "$TID" --json \
+    | jq -r '.result.worktree.path' > /tmp/wt-$TID
+  WT=$(cat /tmp/wt-$TID)
+  PANE=$(herdr agent start codex --cwd "$WT" --no-focus -- \
+           "$(command -v codex)" --dangerously-skip-permissions \
+    | jq -r '.result.agent.pane_id')
+  cat > /tmp/prompt-$TID.md <<EOF
+You are one worker in an SDD herd. Read these FIRST, in order:
+  1. .specify/memory/constitution.md   (project principles — binding)
+  2. $FEATURE_DIR/spec.md              (WHAT and acceptance criteria)
+  3. $FEATURE_DIR/plan.md              (HOW — stack, structure, contracts)
+Your assignment from $FEATURE_DIR/tasks.md: $task
+Do this task and ONLY this task. Do NOT edit tasks.md (the orchestrator owns it).
+When done: run the tests relevant to your change, commit on the current branch
+with message "$TID: <summary>", and report what you did and how you verified it.
+EOF
+  herdr agent send "$PANE" "$(cat /tmp/prompt-$TID.md)"
+  herdr pane send-keys "$PANE" Enter
+  echo "$TID=$PANE=$WT" >> /tmp/herd.map
+done < <(grep -E '^- \[ \] T[0-9]+ \[P\]' "$TASKS")
+```
+Monitor, unblock, and converge with the §9.3–9.5 machinery unchanged. SDD-specific rules:
+- **Workers never edit `tasks.md`** — parallel edits to it merge-conflict. The orchestrator ticks `- [x]` boxes on the integration branch as each worker's output is verified.
+- **The spec is the contract.** A worker that "improves" beyond its task's scope gets its extra changes reverted at converge.
+- Run `/speckit.analyze` on the integration branch (stage 7) **before** the §9.5 review wave — it catches spec↔code drift the lens reviewers won't look for.
+- At converge, verify against `spec.md`'s acceptance criteria (and any `/speckit.checklist` output), not just "tests pass".
+
+#### 11.3 SDD gates (the loop's contract)
+
+- **No spec → no herd.** If asked to "just implement" something non-trivial in a spec-kit repo, run stages 2–5 first (they're fast) or get the user's explicit waiver.
+- `tasks.md` is the only source of slices. If a slice feels wrong, fix `tasks.md` (re-run `/speckit.tasks` or edit it) — don't silently deviate from it.
+- A `[NEEDS CLARIFICATION]` marker anywhere in `spec.md` blocks stage 4+. Resolve via `/speckit.clarify` or the user/channel.
+- CRITICAL findings from `/speckit.analyze` block the merge — dispatch fixes to workers, re-analyze.
+- Every completed loop ends in §10 compound: the run report's `splits` section should grade how well `tasks.md`'s `[P]` markers predicted real independence — feed misses back as a `/speckit.tasks` prompt hint next run.
+
+#### 11.4 When NOT to SDD
+
+- Trivial fix / typo / config tweak → just do it (or `gsd`-style quick path). Specs for one-liners are ceremony.
+- Repo has no `.specify/` and the user wants speed → offer onboarding once, don't force it.
+- Exploration/spike work ("try X, see if it works") → spike first, spec what survives.
+
 ---
 
 ## Integrations
@@ -357,6 +472,9 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 ## Gotchas & safety
 
 - **Never run bare `herdr`** non-interactively (TUI attach → hang). Use subcommands.
+- **`agent start` argv[0] must be the binary** — `-- --some-flag` fails with "No viable candidates found in PATH". Always `-- "$(command -v claude)" --flags…`. The agent *name* (`claude`) only selects the integration/label, not the binary.
+- **`agent start` result shape** — the pane id is at `.result.agent.pane_id` (not `.result.pane_id`).
+- **First run in a new cwd may block on the folder-trust prompt** ("Do you trust the files in this folder?"). Watch for early `blocked`, read the visible screen, send Enter to accept — it's safe for worktrees you just created.
 - **Protect `$SELF`** — see §2. Don't send keys to, attach-takeover, or close your own pane; don't `herdr server stop` while orchestrating from inside.
 - **Timeouts are milliseconds** (`--timeout 600000` = 10 min). macOS has no `timeout(1)`; rely on herdr's own `wait`/`--timeout` flags, or `gtimeout` if coreutils is installed.
 - **`send` ≠ submit** — `agent send`/`pane send-text` write literal text; you must send `Enter` separately. `pane run` includes Enter.
@@ -370,8 +488,9 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 | Goal | Command |
 |------|---------|
 | Fleet state | `herdr agent list \| jq '.result.agents'` |
-| Spawn | `herdr agent start <name> --cwd P --no-focus -- <argv>` |
+| Spawn | `herdr agent start <name> --cwd P --no-focus -- "$(command -v <bin>)" <flags>` |
 | Dispatch | `herdr agent send <t> "…"` then `herdr pane send-keys <p> Enter` |
+| Deliverables | file protocol: prompt file → one-line pointer → `wait output --match <sentinel>` → read answer file (§4) |
 | Wait done | `herdr agent wait <t> --status idle --timeout MS` |
 | Wait needs-me | `herdr agent wait <t> --status blocked --timeout MS` |
 | Read output | `herdr agent read <t> --source recent --lines N` |
@@ -382,5 +501,8 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 | Channel intent → herd | re-read intent → clarify if needed → write `/tmp/herd-plan.md` → `worktree create` per slice → `agent start codex --no-focus` per slice → subscribe/poll `agent_status_changed` → unblock → converge → review → post summary on channel |
 | Review before report | spawn reviewer agents on the integration branch (one lens each) → fix P1s → carry P2/P3 into the summary (§9.5) |
 | Compound a run | write `~/.herdr/runs/<date>-<slug>.md` with a `next time` line → store gist in fleet memory → recurring lessons become PRs to this skill (§10) |
+| Onboard the factory | `./scripts/onboard.sh` — choose claude/hermes orchestrator, install spec-kit, `specify init` the repo (§11.0) |
+| SDD factory loop | `/speckit.specify` → `/speckit.clarify` → `/speckit.plan` → `/speckit.tasks` → herd the `[P]` tasks (§11.2) → `/speckit.analyze` → converge vs `spec.md` → compound (§11) |
+| Which orchestrator? | `cat ~/.config/herdr-factory/config.toml` |
 
 Full CLI + socket reference: [reference.md](reference.md).
