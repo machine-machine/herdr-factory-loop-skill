@@ -4,6 +4,34 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.2.0] - 2026-06-11
+
+Compound-engineering pass, inspired by
+[Every's Compound Engineering guide](https://every.to/guides/compound-engineering):
+each orchestration run should make the next one easier, not just ship
+its own deliverable.
+
+### Added
+- **Section 10: Compound — make the next herd cheaper than this one**
+  - 10.1 Write a run report per herd (`~/.herdr/runs/<date>-<slug>.md`)
+    with splits, reusable prompts, blockers, timings, and a single
+    `next time` line.
+  - 10.2 Store the gist where the fleet can find it (shared memory
+    system if available, `~/.herdr/runs/` otherwise).
+  - 10.3 Promote recurring lessons into this skill via PR — a lesson
+    merged here is learned once, by every future agent.
+- **§9.5 review stage** — spawn parallel reviewer agents (one lens
+  each: correctness / security / conventions) on the integration branch
+  before posting the summary; fix P1 findings first, carry P2/P3 as
+  known issues. New step 6 points converge at §10.
+- **§9.1 steps 7–8** — write the herd plan to `/tmp/herd-plan.md`
+  before spawning (plans are the source of truth; prompts, summary, and
+  run report all derive from it; ack on the channel for risky herds),
+  and check `~/.herdr/runs/` / fleet memory for prior art before
+  decomposing from scratch.
+- Quick reference table — rows for review-before-report and
+  compound-a-run; channel-intent row updated with plan + review steps.
+
 ## [1.1.0] - 2026-06-11
 
 ### Added
@@ -44,5 +72,6 @@ adheres to [Semantic Versioning](https://semver.org/).
 - This repo: README, CHANGELOG, LICENSE (MIT), CONTRIBUTING, install
   script, lint script.
 
+[1.2.0]: #120---2026-06-11
 [1.1.0]: #110---2026-06-11
 [1.0.0]: #100---2026-06-11

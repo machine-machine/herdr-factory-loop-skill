@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 1.1.0
+version: 1.2.0
 description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel.
 ---
 
@@ -155,6 +155,8 @@ If the work is a single small fix, just do it inline — do not fan out. Fan out
    Bad splits: anything that touches the same files, anything that needs a prior slice to exist (do that serially first).
 5. Decide the **base ref** for worktrees (usually `main`; or whatever the user / repo state implies).
 6. Decide the **worker agent type**. Default to `codex` (good at long-running, focused coding tasks, and it's installed in this fleet). Mix in `claude` for tasks needing broader context or `cursor` for IDE-style work — only when there's a clear reason.
+7. **Write the plan down before spawning.** Capture the decomposition in `/tmp/herd-plan.md`: intent, base ref, one line per slice (name → concrete deliverable → files it owns). The plan is the source of truth — every worker prompt in §9.2 derives from it, the converge summary in §9.5 reports against it, and the run report in §10 archives it. If the herd is risky (≥4 workers, or touches deploy/infra/data), post the plan to the channel and get an ack **before** spawning.
+8. **Check for prior art.** Before decomposing from scratch, look for an earlier run report on a similar intent (`ls ~/.herdr/runs/ | grep -i <keyword>`, or query fleet memory). A past run's splits, prompts, and "next time" notes are usually a better starting point than a fresh guess.
 
 #### 9.2 Spawn the herd (one worktree per worker, all in parallel)
 ```bash
@@ -247,8 +249,21 @@ Once all workers are `idle`/`done`:
    git -C "$REPO" push -u origin "$INT_BRANCH"
    ```
 3. Run the project's test/lint suite on the integration branch.
-4. Post a single summary on the channel: each slice's status, branch names, test result, and a one-line "what changed" per slice.
-5. Leave the worktrees and panes in place unless the user asks to tear down. To tear down:
+4. **Review before you report.** Don't hand the user an unreviewed merge — spawn reviewer agents on the integration branch, in parallel, one lens each (correctness, security if the diff touches auth/input/secrets, project conventions):
+   ```bash
+   for lens in correctness conventions; do
+     PANE=$(herdr agent start claude --cwd "$REPO" --no-focus -- --dangerously-skip-permissions \
+       | jq -r '.result.pane_id')
+     herdr agent send "$PANE" "Review the diff between $BASE and $INT_BRANCH for $lens issues only. Severity-tag each finding P1 (must fix) / P2 (should fix) / P3 (nit). Output findings as a list, nothing else."
+     herdr pane send-keys "$PANE" Enter
+     echo "review-$lens=$PANE" >> /tmp/herd.map
+   done
+   # wait + collect like any other worker (§9.3)
+   ```
+   Fix P1s before posting the summary (dispatch fixes back to the relevant worker, or fix inline). Carry P2/P3 into the summary as known issues.
+5. Post a single summary on the channel: each slice's status, branch names, test result, review verdict (P1s fixed, open P2/P3s), and a one-line "what changed" per slice.
+6. **Compound the run** — capture what you learned while it's cheap. See §10. This is not optional bookkeeping; it's what makes the next herd faster than this one.
+7. Leave the worktrees and panes in place unless the user asks to tear down. To tear down:
    ```bash
    while read line; do
      t=${line%%=*}; rest=${line#*=}; p=${rest%%=*}; wt=${rest#*=}
@@ -273,6 +288,38 @@ I'll post when each slice finishes or needs approval.
 - Slices share files → sequence them, don't parallelize.
 - User is iterating live with you → stay inline, don't spawn.
 - You're not sure what the user wants → ask, don't spawn.
+
+### 10. Compound — make the next herd cheaper than this one
+Each orchestration run should make subsequent runs easier, not just ship its own deliverable. Run this after **every** non-trivial herd or fan-out (skip for single-agent dispatches).
+
+#### 10.1 Write the run report
+One markdown file per run, in a predictable place, while the details are still fresh:
+```bash
+mkdir -p ~/.herdr/runs
+cat > ~/.herdr/runs/$(date +%Y-%m-%d)-<intent-slug>.md <<EOF
+# herd run: <intent>
+- plan: $(cat /tmp/herd-plan.md 2>/dev/null || echo "<inline the plan>")
+- splits: <which were truly independent; which collided or had to be serialized>
+- prompts: <the per-worker prompts that worked — verbatim, they're reusable>
+- blockers: <every \`blocked\` event: what prompted it, how resolved, auto-approvable next time?>
+- review: <P1/P2/P3 counts; anything a worker prompt could have prevented>
+- timings: <per-slice wall clock; which slice was the long pole>
+- verdict: <merged / partial / abandoned> — and why
+- next time: <ONE concrete change — to a prompt, a split heuristic, or this skill>
+EOF
+```
+The `next time` line is the whole point. Everything else is evidence for it.
+
+#### 10.2 Store it where the fleet can find it
+A report nobody can discover compounds nothing. If the fleet has a shared memory system, store the gist there (intent, verdict, the `next time` line, path to the full report) so any agent planning a similar herd later — see §9.1 step 8 — finds it. Otherwise `~/.herdr/runs/` is the index; keep slugs descriptive.
+
+#### 10.3 Promote recurring lessons into this skill
+When the same `next time` note shows up in a second run report, it stops being a note and becomes a defect in this skill. Fix it at the source:
+- A prompt pattern that keeps working → add it to §9.2.
+- A blocker class you keep auto-approving → add it to the §9.4 auto-approve list.
+- A split heuristic that keeps failing → amend §9.1 step 4.
+
+Open a PR against this repo (see CONTRIBUTING.md — it's a MINOR bump). The skill is the fleet's institutional memory: a lesson that lives only in a run report gets re-learned; a lesson merged here is learned once, by every future agent.
 
 ---
 
@@ -332,6 +379,8 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 | Worktree | `herdr worktree create --cwd P --branch B --base main` |
 | Notify | `herdr notification show "T" --body "B" --sound done` |
 | Integrations | `herdr integration status` |
-| Channel intent → herd | re-read intent → clarify if needed → `worktree create` per slice → `agent start codex --no-focus` per slice → subscribe/pol `agent_status_changed` → unblock → converge → post summary on channel |
+| Channel intent → herd | re-read intent → clarify if needed → write `/tmp/herd-plan.md` → `worktree create` per slice → `agent start codex --no-focus` per slice → subscribe/poll `agent_status_changed` → unblock → converge → review → post summary on channel |
+| Review before report | spawn reviewer agents on the integration branch (one lens each) → fix P1s → carry P2/P3 into the summary (§9.5) |
+| Compound a run | write `~/.herdr/runs/<date>-<slug>.md` with a `next time` line → store gist in fleet memory → recurring lessons become PRs to this skill (§10) |
 
 Full CLI + socket reference: [reference.md](reference.md).
