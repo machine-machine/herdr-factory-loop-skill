@@ -38,6 +38,7 @@ This skill teaches an agent how to:
 | 7 | Fan-out → converge | Classic multi-agent parallel pattern |
 | 8 | Notify the human | Local desktop notifications |
 | 9 | Channel-driven intent → herd | Intent arrives on a chat channel, spin up a parallel herd |
+| 10 | Compound the run | Review before reporting, write a run report, promote recurring lessons into this skill |
 
 See [`skill/SKILL.md`](./skill/SKILL.md) for the full reference and
 [`skill/reference.md`](./skill/reference.md) for verbatim CLI/socket docs.
