@@ -177,7 +177,7 @@ If the work is a single small fix, just do it inline — do not fan out. Fan out
 
    | worker | `agent start <name>` | argv |
    |--------|----------------------|------|
-   | codex  | `codex`  | `"$(command -v codex)" --dangerously-skip-permissions` |
+   | codex  | `codex`  | `"$(command -v codex)" --dangerously-bypass-approvals-and-sandbox` |
    | claude | `claude` | `"$(command -v claude)" --dangerously-skip-permissions` |
    | cursor | `cursor` | `"$(command -v cursor-agent)" --force` |
 
@@ -205,7 +205,7 @@ for t in "${SPLITS[@]}"; do
   # 2. spawn worker, do NOT take focus. Swap codex for claude/cursor per the
   #    §9.1-step-6 table — e.g. cursor: agent start cursor -- "$(command -v cursor-agent)" --force
   PANE=$(herdr agent start codex --cwd "$WT" --split right --no-focus -- \
-           "$(command -v codex)" --dangerously-skip-permissions \
+           "$(command -v codex)" --dangerously-bypass-approvals-and-sandbox \
     | jq -r '.result.agent.pane_id')
   # 3. author a tight, scoped prompt per worker (one slice only)
   cat > /tmp/prompt-$t.md <<EOF
@@ -409,7 +409,7 @@ while IFS= read -r task; do
   WT=$(cat /tmp/wt-$TID)
   # swap codex for claude/cursor per the §9.1-step-6 table when a task suits a different worker
   PANE=$(herdr agent start codex --cwd "$WT" --no-focus -- \
-           "$(command -v codex)" --dangerously-skip-permissions \
+           "$(command -v codex)" --dangerously-bypass-approvals-and-sandbox \
     | jq -r '.result.agent.pane_id')
   cat > /tmp/prompt-$TID.md <<EOF
 You are one worker in an SDD herd. Read these FIRST, in order:

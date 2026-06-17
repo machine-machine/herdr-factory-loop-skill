@@ -6,7 +6,7 @@ How the loop picks a worker and isolates it. Stable across runs — edit deliber
 
 | worker  | herdr integration | binary | flag |
 |---------|-------------------|--------|------|
-| `codex`  | codex  | `codex` | `--dangerously-skip-permissions` |
+| `codex`  | codex  | `codex` | `--dangerously-bypass-approvals-and-sandbox` |
 | `claude` | claude | `claude` | `--dangerously-skip-permissions` |
 | `cursor` | cursor | `cursor-agent` | `--force` |
 
