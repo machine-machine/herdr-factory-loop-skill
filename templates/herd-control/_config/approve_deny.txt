@@ -1,0 +1,12 @@
+# Always-escalate blocked prompts (extended-regex, case-insensitive, one per line).
+# These override approve_allow.txt. Keep BROAD.
+force[- ]?push
+push .*(origin|main|master|production)
+git push
+delete (branch|worktree|remote)
+branch -d|branch -D|worktree remove
+rm -rf|rm -fr
+secret|credential|api[ _-]?key|token|\.env
+publish|npm publish|cargo publish|pypi
+sudo|chmod 777
+drop (table|database)|truncate

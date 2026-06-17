@@ -1,0 +1,10 @@
+# Auto-approvable blocked prompts (extended-regex, case-insensitive, one per line).
+# Keep NARROW. deny patterns override these.
+do you trust the files in this folder
+run (this |the )?command\??
+(npm|pnpm|yarn|pip|uv|cargo|go) (install|add|sync)
+run tests?\??
+(pytest|jest|vitest|go test|cargo test)
+read (this )?file
+create (a )?(new )?file
+apply (this )?(edit|change|patch)\??

@@ -5,6 +5,7 @@
 #   ./scripts/install.sh                 # install for all detected agents
 #   ./scripts/install.sh --hermes        # ~/.hermes/skills/herdr
 #   ./scripts/install.sh --claude        # ~/.claude/skills/herdr
+#   ./scripts/install.sh --cursor        # ~/.cursor/skills/herdr
 #   ./scripts/install.sh --local         # install from the local repo (no clone)
 #   ./scripts/install.sh --uninstall
 #
@@ -23,12 +24,14 @@ usage() {
 
 install_hermes=0
 install_claude=0
+install_cursor=0
 local_mode=0
 uninstall=0
 for arg in "$@"; do
   case "$arg" in
     --hermes) install_hermes=1 ;;
     --claude) install_claude=1 ;;
+    --cursor) install_cursor=1 ;;
     --local)  local_mode=1 ;;
     --uninstall) uninstall=1 ;;
     -h|--help) usage 0 ;;
@@ -36,10 +39,11 @@ for arg in "$@"; do
   esac
 done
 
-# Default: install for both if neither flag was given
-if [ "$install_hermes" -eq 0 ] && [ "$install_claude" -eq 0 ]; then
+# Default: install for all supported agents if no agent flag was given
+if [ "$install_hermes" -eq 0 ] && [ "$install_claude" -eq 0 ] && [ "$install_cursor" -eq 0 ]; then
   install_hermes=1
   install_claude=1
+  install_cursor=1
 fi
 
 # Resolve the skill source path
@@ -91,6 +95,9 @@ if [ "$install_hermes" -eq 1 ]; then
 fi
 if [ "$install_claude" -eq 1 ]; then
   install_one "$HOME/.claude/skills" "claude"
+fi
+if [ "$install_cursor" -eq 1 ]; then
+  install_one "$HOME/.cursor/skills" "cursor"
 fi
 
 if [ "$uninstall" -eq 1 ]; then
