@@ -71,7 +71,9 @@ LEDGER() { echo "$WS/_fleet/ledger.tsv"; }
 ledger_init() { [ -f "$(LEDGER)" ] || printf 'slice\tworker\tpane\tbranch\tworktree\tstatus\tcollected\n' > "$(LEDGER)"; }
 ledger_has()  { awk -F'\t' -v s="$1" 'NR>1 && $1==s {f=1} END{exit !f}' "$(LEDGER)"; }
 ledger_get()  { awk -F'\t' -v s="$1" -v c="$2" 'NR>1 && $1==s {print $c}' "$(LEDGER)" | head -1; }
-ledger_add()  { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$4" "$5" "$6" "$7" >> "$(LEDGER)"; }
+ledger_add()  { # empty fields → "-" so IFS=$'\t' read never collapses adjacent tabs
+  local f=(); local a; for a in "$1" "$2" "$3" "$4" "$5" "$6" "$7"; do f+=("${a:--}"); done
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "${f[@]}" >> "$(LEDGER)"; }
 ledger_set()  { # ledger_set <slice> <col> <value>
   local s="$1" c="$2" v="$3" tmp; tmp="$(mktemp)"
   awk -F'\t' -v OFS='\t' -v s="$s" -v c="$c" -v v="$v" 'NR==1{print;next} {if($1==s)$c=v; print}' "$(LEDGER)" > "$tmp"
