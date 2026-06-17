@@ -14,6 +14,11 @@ Default worker: **codex** (long-running, focused). Use `claude` for tasks needin
 context, `cursor` for IDE-style / codebase-aware refactors. A `slices.tsv` row may name
 the worker in column 2 to override the default.
 
+Before relying on a worker type, confirm its binary actually launches: `codex --version`,
+`claude --version`, `cursor-agent --version`. A worker whose binary errors at startup will
+spawn a pane that dies instantly; the loop marks the slice `gone` → `NEEDS_REVIEW` rather
+than hanging. (codex + claude are validated end-to-end; cursor needs a healthy cursor-cli.)
+
 ## Isolation
 
 - One git worktree per slice: `wip/<stage>/<slice>` off `BASE` (from `herd.conf`).

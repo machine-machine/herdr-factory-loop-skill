@@ -91,7 +91,8 @@ observe() {
   awk -F'\t' 'NR>1{print $1"\t"$3}' "$(LEDGER)" | while IFS=$'\t' read -r slice pane; do
     [ -n "$pane" ] || continue
     local st; st="$(jq -r --arg p "$pane" '.result.agents[]|select(.pane_id==$p)|.agent_status' "$WS/_fleet/agents.json" 2>/dev/null | head -1)"
-    if [ -n "$st" ]; then ledger_set "$slice" 6 "$st"; fi
+    if [ -n "$st" ]; then ledger_set "$slice" 6 "$st"
+    elif [ "$pane" != "DRYRUN" ] && [ "$pane" != "-" ]; then ledger_set "$slice" 6 "gone"; fi  # pane vanished (worker died)
   done || true
   return 0
 }
@@ -150,6 +151,18 @@ EOF
   echo "$out"
 }
 
+# Send the one-line pointer + submit. Used at spawn AND as the reconcile nudge — TUIs
+# accept input at different times (claude shows a welcome screen, codex loads its model),
+# so we may need to (re)send the text, not just Enter. Re-sending to an idle worker is
+# safe: it just reads the same prompt file again.
+submit_prompt() {
+  local pane="$1" pf="$2"
+  [ -n "$pane" ] && [ "$pane" != "-" ] && [ "$pane" != "DRYRUN" ] || return 0
+  is_self "$pane" && return 0
+  herdr agent send "$pane" "Read $pf and follow its instructions exactly." >/dev/null 2>&1 || true
+  herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
+}
+
 spawn_slice() {
   local stage="$1" slice="$2" worker="$3"
   worker="${worker:-$WORKER_DEFAULT}"
@@ -171,11 +184,10 @@ spawn_slice() {
   ledger_add "$slice" "$worker" "$pane" "$branch" "$wt" "working" "no"
   log "spawned $worker → $slice (pane $pane, $wt)"
   # file protocol: NEVER stream a multi-line prompt into a TUI (newlines submit early).
-  # The prompt lives on disk; send a one-line pointer. Settle first — the TUI needs a
-  # moment to accept input after launch.
+  # The prompt lives on disk; send a one-line pointer. Settle first, then submit. If the
+  # TUI wasn't ready and the text was dropped, the reconcile nudge re-sends it next tick.
   sleep 2
-  herdr agent send "$pane" "Read $prompt and follow its instructions exactly." >/dev/null 2>&1 || true
-  herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
+  submit_prompt "$pane" "$prompt"
 }
 
 # ---------- handle a blocked worker (approve or escalate) --------------------
@@ -254,12 +266,18 @@ tick() {
         idle|done)
           if [ "$collected" = "yes" ]; then :
           elif worker_done "$wt"; then collect_slice "$stage" "$slice" "$pane"
-          elif [ "$DRY_RUN" -eq 0 ] && ! is_self "$pane"; then
-            # idle + no commit yet = the prompt is likely sitting unsubmitted in the TUI
-            # (codex was still loading when spawn pressed Enter). Nudge a submit; an empty
-            # input box just ignores it. Self-heals the spawn-time Enter race.
-            herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true; log "nudged $slice (submit pending prompt)"
+          elif [ "$DRY_RUN" -eq 0 ]; then
+            # idle + no commit yet = the prompt was dropped (TUI not ready at spawn) or is
+            # sitting unsubmitted. Re-send the pointer + Enter. Self-heals the spawn race
+            # regardless of which TUI and how slow it was to accept input.
+            submit_prompt "$pane" "$WS/stages/$stage/prompts/$slice.md"; log "nudged $slice (resend prompt)"
           fi ;;
+        gone)    # pane vanished. If it committed before dying, salvage it; else escalate.
+                 if [ "$collected" != "yes" ] && worker_done "$wt"; then collect_slice "$stage" "$slice" "$pane"
+                 elif [ "$collected" != "yes" ]; then
+                   { echo "# $slice: worker pane died before committing — re-dispatch (KILL then RESCOPE) or investigate"; } > "$WS/stages/$stage/review/$slice.md" 2>/dev/null || true
+                   echo errored > "$WS/_fleet/.needs_review"; log "GONE slice $slice → review"
+                 fi ;;
         error)   { echo "# error: $slice failed to spawn/run — see ledger"; } > "$WS/stages/$stage/review/$slice.md" 2>/dev/null || true
                  echo errored > "$WS/_fleet/.needs_review"; log "ERROR slice $slice → review" ;;
         abandoned) : ;;  # deliberately killed; terminal, not blocking completeness
