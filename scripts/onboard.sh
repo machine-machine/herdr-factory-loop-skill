@@ -2,7 +2,7 @@
 # onboard.sh — interactive onboarding TUI for the herdr factory loop.
 #
 # Walks you through:
-#   1. Choosing an orchestrator: Claude Code, Hermes, or both
+#   1. Choosing an orchestrator: Claude Code, Hermes, Cursor, or all
 #   2. Verifying the substrate (herdr server, jq, git)
 #   3. Installing this skill for the chosen orchestrator(s)
 #   4. Installing spec-kit's `specify` CLI (github/spec-kit)
@@ -11,7 +11,7 @@
 #
 # Usage:
 #   ./scripts/onboard.sh                # interactive TUI
-#   ./scripts/onboard.sh --orchestrator claude|hermes|both \
+#   ./scripts/onboard.sh --orchestrator claude|hermes|cursor|all \
 #                        [--repo /path/to/repo] [--yes]    # non-interactive
 #
 # Idempotent. Safe to re-run.
@@ -112,12 +112,15 @@ if [ -z "$ORCHESTRATOR" ]; then
   CHOICE=$(menu "Which orchestrator should run the factory loop?" \
     "claude  — Claude Code drives spec-kit + the herd" \
     "hermes  — Hermes drives spec-kit + the herd" \
-    "both    — install for both, pick per-session")
+    "cursor  — Cursor (cursor-agent) drives spec-kit + the herd" \
+    "all     — install for all, pick per-session")
   ORCHESTRATOR="${CHOICE%% *}"
 fi
+# `both` accepted as a legacy alias for `all` (pre-cursor onboarding).
+[ "$ORCHESTRATOR" = "both" ] && ORCHESTRATOR="all"
 case "$ORCHESTRATOR" in
-  claude|hermes|both) ok "orchestrator: ${BOLD}$ORCHESTRATOR${RESET}" ;;
-  *) fail "invalid orchestrator '$ORCHESTRATOR' (claude|hermes|both)"; exit 1 ;;
+  claude|hermes|cursor|all) ok "orchestrator: ${BOLD}$ORCHESTRATOR${RESET}" ;;
+  *) fail "invalid orchestrator '$ORCHESTRATOR' (claude|hermes|cursor|all)"; exit 1 ;;
 esac
 
 # ---------- step 2: substrate checks -------------------------------------------
@@ -138,10 +141,13 @@ for tool in jq git; do
   if command -v "$tool" >/dev/null 2>&1; then ok "$tool found"; else fail "$tool not found (required)"; MISSING=1; fi
 done
 case "$ORCHESTRATOR" in
-  claude|both) command -v claude >/dev/null 2>&1 && ok "claude CLI found" || warn "claude CLI not on PATH" ;;
+  claude|all) command -v claude >/dev/null 2>&1 && ok "claude CLI found" || warn "claude CLI not on PATH" ;;
 esac
 case "$ORCHESTRATOR" in
-  hermes|both) command -v hermes >/dev/null 2>&1 && ok "hermes CLI found" || warn "hermes CLI not on PATH" ;;
+  hermes|all) command -v hermes >/dev/null 2>&1 && ok "hermes CLI found" || warn "hermes CLI not on PATH" ;;
+esac
+case "$ORCHESTRATOR" in
+  cursor|all) command -v cursor-agent >/dev/null 2>&1 && ok "cursor-agent CLI found" || warn "cursor-agent CLI not on PATH (install: https://cursor.com/cli)" ;;
 esac
 if [ "$MISSING" -eq 1 ]; then
   fail "fix the missing required tools above, then re-run onboarding"
@@ -154,7 +160,8 @@ step "3/6  Install the herdr skill for $ORCHESTRATOR"
 case "$ORCHESTRATOR" in
   claude) "$SCRIPT_DIR/install.sh" --local --claude ;;
   hermes) "$SCRIPT_DIR/install.sh" --local --hermes ;;
-  both)   "$SCRIPT_DIR/install.sh" --local ;;
+  cursor) "$SCRIPT_DIR/install.sh" --local --cursor ;;
+  all)    "$SCRIPT_DIR/install.sh" --local ;;
 esac
 
 # ---------- step 4: spec-kit CLI ------------------------------------------------
@@ -207,10 +214,11 @@ if [ -n "$TARGET_REPO" ]; then
       AGENT_FLAG="--integration"
       HAS_GENERIC=1
     fi
-    # Pick the integration for the chosen orchestrator. Hermes is not a
-    # spec-kit-native agent: use the generic integration so the /speckit.*
-    # prompts land in .hermes/commands/ (falls back to claude templates on
-    # old spec-kit builds — Hermes can read .claude/commands/*.md as prompts).
+    # Pick the integration for the chosen orchestrator. claude and cursor are
+    # spec-kit-native (prompts land in .claude/commands/ and .cursor/commands/
+    # respectively). Hermes is not native: use the generic integration so the
+    # /speckit.* prompts land in .hermes/commands/ (falls back to claude
+    # templates on old spec-kit builds — Hermes can read .claude/commands/*.md).
     INIT_ARGS=(init --here --script sh)
     # we already confirm below; skip spec-kit's own "directory not empty" prompt
     printf '%s' "$INIT_HELP" | grep -q -- '--force' && INIT_ARGS+=(--force)
@@ -222,7 +230,8 @@ if [ -n "$TARGET_REPO" ]; then
           INIT_ARGS+=("$AGENT_FLAG" claude --ignore-agent-tools)
         fi ;;
       claude) INIT_ARGS+=("$AGENT_FLAG" claude) ;;
-      both)   INIT_ARGS+=("$AGENT_FLAG" claude) ;;  # claude native; hermes reads .claude/commands/*.md
+      cursor) INIT_ARGS+=("$AGENT_FLAG" cursor) ;;  # native; prompts → .cursor/commands/
+      all)    INIT_ARGS+=("$AGENT_FLAG" claude) ;;  # claude native; hermes reads .claude/commands/*.md; re-run with --integration cursor for .cursor/commands/
     esac
     say "  Running: specify ${INIT_ARGS[*]}  (in $TARGET_REPO)"
     if confirm "Proceed?"; then

@@ -1,7 +1,7 @@
 ---
 name: herdr
-version: 1.3.0
-description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code or Hermes as orchestrator).
+version: 1.5.0
+description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator).
 ---
 
 # herdr Skill
@@ -173,7 +173,15 @@ If the work is a single small fix, just do it inline — do not fan out. Fan out
    - **By independent feature branch** (when the user asks for several features at once)
    Bad splits: anything that touches the same files, anything that needs a prior slice to exist (do that serially first).
 5. Decide the **base ref** for worktrees (usually `main`; or whatever the user / repo state implies).
-6. Decide the **worker agent type**. Default to `codex` (good at long-running, focused coding tasks, and it's installed in this fleet). Mix in `claude` for tasks needing broader context or `cursor` for IDE-style work — only when there's a clear reason.
+6. Decide the **worker agent type**. Default to `codex` (good at long-running, focused coding tasks, and it's installed in this fleet). Mix in `claude` for tasks needing broader context, or `cursor` for IDE-style edits and codebase-aware refactors — only when there's a clear reason. Each maps to a herdr integration name and a binary+auto-approve flag:
+
+   | worker | `agent start <name>` | argv |
+   |--------|----------------------|------|
+   | codex  | `codex`  | `"$(command -v codex)" --dangerously-skip-permissions` |
+   | claude | `claude` | `"$(command -v claude)" --dangerously-skip-permissions` |
+   | cursor | `cursor` | `"$(command -v cursor-agent)" --force` |
+
+   (`cursor-agent --force` = run the Cursor agent TUI auto-approving all commands — the cursor analog of claude's `--dangerously-skip-permissions`. herdr's `cursor` integration is installed, so cursor panes report authoritative lifecycle state like any other agent.)
 7. **Write the plan down before spawning.** Capture the decomposition in `/tmp/herd-plan.md`: intent, base ref, one line per slice (name → concrete deliverable → files it owns). The plan is the source of truth — every worker prompt in §9.2 derives from it, the converge summary in §9.5 reports against it, and the run report in §10 archives it. If the herd is risky (≥4 workers, or touches deploy/infra/data), post the plan to the channel and get an ack **before** spawning.
 8. **Check for prior art.** Before decomposing from scratch, look for an earlier run report on a similar intent (`ls ~/.herdr/runs/ | grep -i <keyword>`, or query fleet memory). A past run's splits, prompts, and "next time" notes are usually a better starting point than a fresh guess.
 
@@ -194,7 +202,8 @@ for t in "${SPLITS[@]}"; do
     | jq -r '.result.worktree.path' > /tmp/wt-$t
 
   WT=$(cat /tmp/wt-$t)
-  # 2. spawn codex worker, do NOT take focus
+  # 2. spawn worker, do NOT take focus. Swap codex for claude/cursor per the
+  #    §9.1-step-6 table — e.g. cursor: agent start cursor -- "$(command -v cursor-agent)" --force
   PANE=$(herdr agent start codex --cwd "$WT" --split right --no-focus -- \
            "$(command -v codex)" --dangerously-skip-permissions \
     | jq -r '.result.agent.pane_id')
@@ -358,9 +367,9 @@ Run the onboarding TUI from this repo to choose the orchestrator and establish t
 ./scripts/onboard.sh                                    # interactive
 ./scripts/onboard.sh --orchestrator claude --repo /path/to/repo --yes   # scripted
 ```
-It (1) picks **Claude Code or Hermes** as the orchestrator, (2) verifies herdr/jq/git, (3) installs this skill for the chosen agent, (4) installs the `specify` CLI (`uv tool install specify-cli --from git+https://github.com/github/spec-kit.git`), (5) runs `specify init --here` in the target repo, and (6) records the choice in `~/.config/herdr-factory/config.toml`.
+It (1) picks **Claude Code, Hermes, or Cursor** (or `all`) as the orchestrator, (2) verifies herdr/jq/git, (3) installs this skill for the chosen agent, (4) installs the `specify` CLI (`uv tool install specify-cli --from git+https://github.com/github/spec-kit.git`), (5) runs `specify init --here` in the target repo, and (6) records the choice in `~/.config/herdr-factory/config.toml`.
 
-Integration mapping: **claude** → `specify init --here --integration claude` (prompts land in `.claude/commands/speckit.*.md`); **hermes** → `specify init --here --integration generic --integration-options="--commands-dir .hermes/commands/"` (same prompts, in `.hermes/commands/`). Older spec-kit builds use `--ai` instead of `--integration` — onboard.sh detects this. Check the active orchestrator any time: `cat ~/.config/herdr-factory/config.toml`.
+Integration mapping: **claude** → `specify init --here --integration claude` (prompts land in `.claude/commands/speckit.*.md`); **cursor** → `specify init --here --integration cursor` (spec-kit-native; prompts in `.cursor/commands/`); **hermes** → `specify init --here --integration generic --integration-options="--commands-dir .hermes/commands/"` (same prompts, in `.hermes/commands/`). The `all` choice initializes the claude integration (Hermes also reads `.claude/commands/*.md`; for Cursor's own command palette re-run `specify init --here --integration cursor`). Older spec-kit builds use `--ai` instead of `--integration` — onboard.sh detects this. Check the active orchestrator any time: `cat ~/.config/herdr-factory/config.toml`.
 
 #### 11.1 The loop, stage by stage
 
@@ -398,6 +407,7 @@ while IFS= read -r task; do
   herdr worktree create --cwd "$REPO" --branch "wip/$FEATURE/$TID" --base "$BASE" --label "$TID" --json \
     | jq -r '.result.worktree.path' > /tmp/wt-$TID
   WT=$(cat /tmp/wt-$TID)
+  # swap codex for claude/cursor per the §9.1-step-6 table when a task suits a different worker
   PANE=$(herdr agent start codex --cwd "$WT" --no-focus -- \
            "$(command -v codex)" --dangerously-skip-permissions \
     | jq -r '.result.agent.pane_id')
@@ -435,6 +445,57 @@ Monitor, unblock, and converge with the §9.3–9.5 machinery unchanged. SDD-spe
 - Trivial fix / typo / config tweak → just do it (or `gsd`-style quick path). Specs for one-liners are ceremony.
 - Repo has no `.specify/` and the user wants speed → offer onboarding once, don't force it.
 - Exploration/spike work ("try X, see if it works") → spike first, spec what survives.
+
+### 12. ICM-steered orchestration loop
+
+Everything above (§9 herd, §11 SDD) is orchestration you drive by hand or in one bash run.
+§12 makes that orchestration **a standing, steerable, disk-reconstructible loop** by adopting
+the Interpretable Context Methodology (ICM): the folder is the orchestrator's state, herdr is
+its body, and a reconciliation loop keeps them in sync.
+
+The model is a controller: **the folder is desired state, the herdr socket is observed state,
+the loop computes the diff and acts.** ICM contributes the inspectable on-disk state that an
+ad-hoc herd (`/tmp/herd.map`) lacks; herdr contributes the live execution + lifecycle that ICM
+(a passive protocol) lacks. The extended state is:
+
+```
+OrchestratorState = AGENT.md + ROUTER.md + active stage CONTEXT.md + declared refs/inputs
+                  + FleetObservation (_fleet/agents.json)   ← written every tick
+                  + DispatchLedger    (_fleet/ledger.tsv)    ← slice → pane → branch → status
+```
+
+#### 12.1 The workspace
+`templates/herd-control/` is the scaffold. Layers: `AGENT.md` (0, identity, loaded every tick),
+`ROUTER.md` (1, routing by task type **and** fleet state), `stages/NN_*/CONTEXT.md` (2, contracts
+— Inputs/Process/Outputs/Verify + a machine-parseable `mode`/`gate`/`deliverable`/`handoff` block),
+`_config/`+`shared/` (3, stable reference), `_fleet/`+`stages/*/output/`+`inbox/` (4, working).
+Stages: `01_spec→02_plan→03_tasks→04_implement→05_analyze→06_converge`. `04_implement` is
+**fanout** (one worker per `slices.tsv` row, in worktrees); the rest are **solo** (you run the
+Process — e.g. a `/speckit.*` step — and the loop checks the deliverable + gates).
+
+#### 12.2 The loop
+```bash
+scripts/herd-loop.sh init --ws ~/herd/<feature> --repo /path/to/repo --base main
+scripts/herd-loop.sh tick   --ws ~/herd/<feature>     # one reconciliation pass
+scripts/herd-loop.sh run    --ws ~/herd/<feature>     # standing loop
+scripts/herd-loop.sh status --ws ~/herd/<feature>
+```
+Each `tick`: observe fleet → drain `inbox/STEER.md` → for the active stage, spawn missing
+workers / collect finished ones / auto-approve routine blocks (`_config/approve_allow.txt`) or
+escalate the rest to `stages/<stage>/review/` (`approve_deny.txt` wins) → evaluate exit criteria
+→ gate. It does the **mechanical** work and escalates **judgment** via its `STATUS:` line
+(`AWAITING_SOLO`, `RECONCILED`, `NEEDS_REVIEW`, `STAGE_COMPLETE`, `ADVANCED`, `DONE`) — the
+orchestrator (you, or Hermes) reacts to that line. See `AGENT.md` for the status→action table.
+
+#### 12.3 Steering
+Because all state is on disk, you steer by editing files, not interrupting a process. Drop a
+command into `inbox/STEER.md` and the loop drains it next tick: `PAUSE` / `RESUME` /
+`KILL <slice>` / `RESCOPE <slice>` (after editing its `prompts/<slice>.md`) / `GOTO <stage>` /
+`NOTE <text>`. Read `_fleet/ledger.tsv` + `agents.json` to see the whole fleet as herdr sees it.
+
+Discipline (ICM's anti-drift): per-tick context stays tiny — identity + router + active contract
++ `_fleet` + declared inputs, nothing else. Parallelism lives *inside* the fanout stage, not
+across stages. Mechanical work is the script's; judgment is the orchestrator's.
 
 ---
 
@@ -501,7 +562,8 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 | Channel intent → herd | re-read intent → clarify if needed → write `/tmp/herd-plan.md` → `worktree create` per slice → `agent start codex --no-focus` per slice → subscribe/poll `agent_status_changed` → unblock → converge → review → post summary on channel |
 | Review before report | spawn reviewer agents on the integration branch (one lens each) → fix P1s → carry P2/P3 into the summary (§9.5) |
 | Compound a run | write `~/.herdr/runs/<date>-<slug>.md` with a `next time` line → store gist in fleet memory → recurring lessons become PRs to this skill (§10) |
-| Onboard the factory | `./scripts/onboard.sh` — choose claude/hermes orchestrator, install spec-kit, `specify init` the repo (§11.0) |
+| Onboard the factory | `./scripts/onboard.sh` — choose claude/hermes/cursor orchestrator, install spec-kit, `specify init` the repo (§11.0) |
+| ICM-steered loop | `scripts/herd-loop.sh init\|tick\|run\|status` over a `templates/herd-control/` workspace — folder=desired, socket=observed, loop reconciles (§12) |
 | SDD factory loop | `/speckit.specify` → `/speckit.clarify` → `/speckit.plan` → `/speckit.tasks` → herd the `[P]` tasks (§11.2) → `/speckit.analyze` → converge vs `spec.md` → compound (§11) |
 | Which orchestrator? | `cat ~/.config/herdr-factory/config.toml` |
 

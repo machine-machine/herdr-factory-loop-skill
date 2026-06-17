@@ -47,7 +47,7 @@ See [`skill/SKILL.md`](./skill/SKILL.md) for the full reference and
 ## Onboarding (recommended): the factory loop
 
 The onboarding TUI sets up the whole factory in one pass — pick your
-orchestrator (**Claude Code** or **Hermes**), install this skill for it,
+orchestrator (**Claude Code**, **Hermes**, or **Cursor**), install this skill for it,
 install [github/spec-kit](https://github.com/github/spec-kit)'s `specify`
 CLI, and establish the SDD loop (`specify init`) in a target repo:
 
@@ -78,7 +78,8 @@ curl -sSL https://raw.githubusercontent.com/machine-machine/herdr-factory-loop-s
 ```
 
 This will clone the repo and symlink the skill into the right location
-for both Claude (`~/.claude/skills/herdr/`) and Hermes (`~/.hermes/skills/herdr/`).
+for Claude (`~/.claude/skills/herdr/`), Hermes (`~/.hermes/skills/herdr/`),
+and Cursor (`~/.cursor/skills/herdr/`).
 
 ### Manual install
 

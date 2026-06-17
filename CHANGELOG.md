@@ -4,6 +4,45 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.5.0] - 2026-06-17
+
+ICM-steered orchestration: the folder is the orchestrator, herdr is the body.
+
+### Added
+- **`templates/herd-control/`** — a filesystem-native control workspace built on the
+  Interpretable Context Methodology (ICM, arXiv:2603.16021). Layered context
+  (`AGENT.md` identity / `ROUTER.md` routing / per-stage `CONTEXT.md` contracts with
+  Inputs·Process·Outputs·Verify / `_config`+`shared` reference / `_fleet`+`output`
+  working artifacts) and six numbered stages (spec→plan→tasks→implement→analyze→converge).
+  The implement stage is **fanout** (workers per `slices.tsv`); the rest are **solo**.
+- **`scripts/herd-loop.sh`** — the reconciliation loop. Treats the folder as *desired*
+  state and the herdr socket as *observed* state: `observe` snapshots the fleet to
+  `_fleet/`, `tick` spawns missing workers (codex/claude/cursor in worktrees), collects
+  finished ones, auto-approves routine blocks or escalates the rest (`_config/approve_*.txt`),
+  and gates stage advancement. Does the mechanical work; escalates judgment via a `STATUS:`
+  line. `run` is the standing loop; `inbox/STEER.md` is the live steering channel
+  (PAUSE/RESUME/KILL/RESCOPE/GOTO/NOTE). Fleet observation + dispatch ledger are written to
+  disk every tick, keeping the orchestrator state reconstructible from the folder alone.
+
+## [1.4.0] - 2026-06-15
+
+Cursor joins the loop as a first-class orchestrator **and** worker.
+
+### Added
+- **Cursor as an orchestrator.** `scripts/onboard.sh` now offers
+  `cursor` alongside `claude` and `hermes` (the old `both` choice is
+  renamed `all` and still accepted as a legacy alias). Cursor is
+  spec-kit-native, so onboarding wires `specify init --here --integration
+  cursor` (prompts land in `.cursor/commands/`) and verifies the
+  `cursor-agent` CLI in the substrate checks.
+- **Cursor as a worker.** `scripts/install.sh` gained `--cursor`
+  (symlinks the skill into `~/.cursor/skills/herdr`) and now installs for
+  all three agents by default. SKILL.md §9.1 documents the worker
+  binary+flag table — cursor workers spawn via
+  `herdr agent start cursor -- "$(command -v cursor-agent)" --force`, the
+  Cursor analog of `--dangerously-skip-permissions`. §9.2/§11.2 dispatch
+  blocks note how to swap codex for a cursor worker.
+
 ## [1.3.0] - 2026-06-11
 
 The factory loop becomes spec-driven: spec-kit in front, herdr behind.
