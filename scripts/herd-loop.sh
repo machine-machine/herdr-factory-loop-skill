@@ -59,7 +59,7 @@ do_or_echo() { if [ "$DRY_RUN" -eq 1 ]; then echo "  [dry-run] $*"; else eval "$
 # worker -> "binary<TAB>flag"
 worker_argv() {
   case "$1" in
-    codex)  printf '%s\t%s\n' "codex" "--dangerously-skip-permissions" ;;
+    codex)  printf '%s\t%s\n' "codex" "--dangerously-bypass-approvals-and-sandbox" ;;
     claude) printf '%s\t%s\n' "claude" "--dangerously-skip-permissions" ;;
     cursor) printf '%s\t%s\n' "cursor-agent" "--force" ;;
     *) printf '%s\t%s\n' "$1" "" ;;
@@ -163,13 +163,19 @@ spawn_slice() {
   fi
   wt="$(herdr worktree create --cwd "$REPO" --branch "$branch" --base "$BASE" --label "$slice" --json 2>/dev/null | jq -r '.result.worktree.path')"
   [ -n "$wt" ] && [ "$wt" != "null" ] || { log "! $slice: worktree create failed"; ledger_add "$slice" "$worker" "" "$branch" "" "error" "no"; return; }
-  local pane; pane="$(herdr agent start "$worker" --cwd "$wt" --no-focus -- "$(command -v "$bin")" $flag 2>/dev/null | jq -r '.result.agent.pane_id')"
+  # herdr requires a UNIQUE agent name; the integration is detected from the binary,
+  # so a "<worker>-<slice>" label coexists with other workers of the same type.
+  local pane; pane="$(herdr agent start "$worker-$slice" --cwd "$wt" --no-focus -- "$(command -v "$bin")" $flag 2>/dev/null | jq -r '.result.agent.pane_id')"
   [ -n "$pane" ] && [ "$pane" != "null" ] || { log "! $slice: agent start failed"; ledger_add "$slice" "$worker" "" "$branch" "$wt" "error" "no"; return; }
   local prompt; prompt="$(gen_prompt "$stage" "$slice" "$wt")"
-  herdr agent send "$pane" "$(cat "$prompt")" >/dev/null 2>&1 || true
-  herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
   ledger_add "$slice" "$worker" "$pane" "$branch" "$wt" "working" "no"
   log "spawned $worker → $slice (pane $pane, $wt)"
+  # file protocol: NEVER stream a multi-line prompt into a TUI (newlines submit early).
+  # The prompt lives on disk; send a one-line pointer. Settle first — the TUI needs a
+  # moment to accept input after launch.
+  sleep 2
+  herdr agent send "$pane" "Read $prompt and follow its instructions exactly." >/dev/null 2>&1 || true
+  herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
 }
 
 # ---------- handle a blocked worker (approve or escalate) --------------------
@@ -194,11 +200,23 @@ escalate() {
   echo escalated > "$WS/_fleet/.needs_review"
 }
 
+# a fanout worker is "done" when it has committed on its branch — NOT merely when the
+# TUI is idle (a TUI agent is idle while waiting for input too). Commits beyond base = work.
+worker_done() {
+  local wt="$1"
+  [ -n "$wt" ] && [ "$wt" != "-" ] && [ -d "$wt" ] || return 1
+  local n; n="$(git -C "$wt" rev-list --count "$BASE"..HEAD 2>/dev/null || echo 0)"
+  [ "${n:-0}" -gt 0 ]
+}
+
 # ---------- collect a finished worker ----------------------------------------
 collect_slice() {
   local stage="$1" slice="$2" pane="$3"
   local out="$WS/stages/$stage/output/$slice.out"
-  herdr agent read "$pane" --source recent-unwrapped --lines 300 > "$out" 2>/dev/null || true
+  # `herdr ... read` prints the raw JSON socket envelope — extract the text payload.
+  herdr agent read "$pane" --source recent-unwrapped --lines 300 2>/dev/null \
+    | jq -r '.result.read.text // empty' > "$out" 2>/dev/null || true
+  [ -s "$out" ] || herdr agent read "$pane" --source recent-unwrapped --lines 300 > "$out" 2>/dev/null || true
   ledger_set "$slice" 7 "yes"
   log "collected $slice → stages/$stage/output/$slice.out"
 }
@@ -233,8 +251,18 @@ tick() {
     while IFS=$'\t' read -r slice worker pane branch wt status collected; do
       case "$status" in
         blocked) handle_blocked "$stage" "$slice" "$pane" ;;
-        idle|done) [ "$collected" = "yes" ] || collect_slice "$stage" "$slice" "$pane" ;;
-        abandoned|error) : ;;  # terminal, not blocking completeness
+        idle|done)
+          if [ "$collected" = "yes" ]; then :
+          elif worker_done "$wt"; then collect_slice "$stage" "$slice" "$pane"
+          elif [ "$DRY_RUN" -eq 0 ] && ! is_self "$pane"; then
+            # idle + no commit yet = the prompt is likely sitting unsubmitted in the TUI
+            # (codex was still loading when spawn pressed Enter). Nudge a submit; an empty
+            # input box just ignores it. Self-heals the spawn-time Enter race.
+            herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true; log "nudged $slice (submit pending prompt)"
+          fi ;;
+        error)   { echo "# error: $slice failed to spawn/run — see ledger"; } > "$WS/stages/$stage/review/$slice.md" 2>/dev/null || true
+                 echo errored > "$WS/_fleet/.needs_review"; log "ERROR slice $slice → review" ;;
+        abandoned) : ;;  # deliberately killed; terminal, not blocking completeness
       esac
     done < <(awk -F'\t' 'NR>1' "$(LEDGER)")
     # complete when every desired slice is collected (or terminal)
