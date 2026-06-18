@@ -1,7 +1,7 @@
 ---
 name: herdr
-version: 1.5.0
-description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator).
+version: 1.6.0
+description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator). ALSO trigger for meta-orchestration — when the user wants to be the "meta-orchestrator" / "orchestrator of orchestrators", oversee or launch multiple orchestrators (each driving its own herd of workers) across several missions/repos, or drive a portfolio of parallel missions with /goal-based autonomy (fleet-loop.sh / fleet-control).
 ---
 
 # herdr Skill
@@ -497,6 +497,71 @@ Discipline (ICM's anti-drift): per-tick context stays tiny — identity + router
 + `_fleet` + declared inputs, nothing else. Parallelism lives *inside* the fanout stage, not
 across stages. Mechanical work is the script's; judgment is the orchestrator's.
 
+### 13. Meta-orchestration — the orchestrator of orchestrators
+
+§12 makes ONE orchestrator a standing, disk-reconstructible loop driving WORKERS for one
+feature. §13 adds a tier ABOVE it: a **meta-orchestrator** that launches and oversees
+**orchestrators**, each of which drives its own herd. Three tiers, same ICM reconciler at each:
+
+```
+meta-orchestrator   fleet-loop.sh  over  templates/fleet-control/   ← reconciles MISSIONS (orchestrators)
+  └ orchestrator    herd-loop.sh   over  templates/herd-control/    ← reconciles SLICES (workers)   [§12]
+      └ workers      codex / claude / cursor in worktrees                                            [§3,§9]
+```
+
+**Use when** the work is a *portfolio* of ≥2 **independent missions** — different repos, or
+disjoint services/features in one repo — each big enough to deserve its own orchestrator (its
+own spec→plan→tasks→implement→converge). One feature in one repo → don't meta-orchestrate; run
+a single orchestrator (§12). A single small change → just do it (§9.7).
+
+#### 13.1 The `/goal` hook — autonomy all the way down
+
+The meta-orchestrator's primitive is **`/goal`**: a session **Stop hook** that blocks an agent
+from stopping until a stated condition holds, re-prompting it to keep working. `fleet-loop.sh`
+**arms each orchestrator's `/goal`** to its mission's `done_when` (by typing the slash command
+into the orchestrator's TUI), so the orchestrator self-drives its herd and the meta only
+re-engages when it goes `blocked` or `done`. You (the meta) run under your own `/goal` set to
+the fleet's overall done condition. **Hooks all the way down: meta-goal → orchestrator-goals →
+workers.** Not every agent supports `/goal` (claude ✅, codex ✅, cursor ❌) — non-goal agents
+degrade to a per-tick re-nudge. See `templates/fleet-control/shared/goal_support.md`.
+
+#### 13.2 The workspace + loop
+
+`templates/fleet-control/` mirrors `herd-control/` one level up: `FLEET.md` (L0 meta identity),
+`ROUTER.md` (L1), `missions.tsv` (the desired orchestrator set — `mission  orchestrator  repo
+intent  done_when`), `goals/<mission>.md` (each orchestrator's generated charter+goal),
+`stages/01_dispatch` (**fanout**: launch + oversee one orchestrator per mission) and
+`stages/02_converge` (**solo**: integrate across missions + meta run report), `_config/`
+(launch / approval / gate policies + `goal_support.txt`), `_fleet/` (observed: `agents.json`,
+`missions.ledger.tsv`), `inbox/STEER.md` (live steering).
+
+```bash
+scripts/fleet-loop.sh init   --ws ~/fleet/<name> [--worker claude]   # scaffold
+# fill ~/fleet/<name>/missions.tsv — one row per INDEPENDENT mission
+scripts/fleet-loop.sh tick   --ws ~/fleet/<name>     # one reconciliation pass
+scripts/fleet-loop.sh run    --ws ~/fleet/<name>     # standing loop
+scripts/fleet-loop.sh status --ws ~/fleet/<name>
+```
+
+Each `tick`: observe fleet → drain `inbox/STEER.md` → launch an orchestrator per missing mission
+(in its repo, scaffold its herd-control workspace, **arm `/goal`**) → refresh each mission's
+status from the orchestrator's pane **and** its `herd-control/_fleet/active_stage == DONE` (the
+cross-tier completion signal) → auto-approve routine orchestrator blocks (`_config/approve_allow.txt`)
+or escalate the rest to `stages/<stage>/review/` → collect finished missions → gate. It does the
+**mechanical** work and escalates **judgment** via its `STATUS:` line (`AWAITING_SOLO`,
+`RECONCILED`, `NEEDS_REVIEW`, `MISSION_COMPLETE`, `ADVANCED`, `DONE`) — you react per `FLEET.md`.
+
+#### 13.3 Discipline (same ICM rules, one tier up)
+
+- The meta never reaches two levels down: it sends work to **orchestrators**, never to a
+  mission's **workers**; an orchestrator never reasons about another mission. Results flow up via
+  `output/`, escalations via `review/`, autonomy down via `/goal`.
+- One orchestrator per mission; parallelism lives **across missions** (the meta fanout) — each
+  mission's internal `[P]` parallelism belongs to its orchestrator.
+- Completion is a **disk** signal (`active_stage == DONE`), not "the TUI looks idle".
+- Cross-mission merges to `main` / prod deploys are escalated to the human even when a single
+  mission's orchestrator was authorized for its own scope (`_config/gate_policy.md`).
+
 ---
 
 ## Integrations
@@ -565,6 +630,7 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 | Onboard the factory | `./scripts/onboard.sh` — choose claude/hermes/cursor orchestrator, install spec-kit, `specify init` the repo (§11.0) |
 | ICM-steered loop | `scripts/herd-loop.sh init\|tick\|run\|status` over a `templates/herd-control/` workspace — folder=desired, socket=observed, loop reconciles (§12) |
 | SDD factory loop | `/speckit.specify` → `/speckit.clarify` → `/speckit.plan` → `/speckit.tasks` → herd the `[P]` tasks (§11.2) → `/speckit.analyze` → converge vs `spec.md` → compound (§11) |
+| Meta-orchestrate | `scripts/fleet-loop.sh init\|tick\|run\|status` over a `templates/fleet-control/` workspace — one orchestrator per mission in `missions.tsv`, each `/goal`-armed to self-drive its herd; meta launches/oversees/converges (§13) |
 | Which orchestrator? | `cat ~/.config/herdr-factory/config.toml` |
 
 Full CLI + socket reference: [reference.md](reference.md).
