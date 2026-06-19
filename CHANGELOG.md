@@ -4,6 +4,38 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.0] - 2026-06-19
+
+Meta-orchestration: the orchestrator of orchestrators. A tier above §12 — launch and oversee
+orchestrators (each driving its own herd of workers), with `/goal` as the autonomy hook.
+
+### Added
+- **`templates/fleet-control/`** — an ICM workspace for the **meta-orchestrator** (tier 0),
+  mirroring `herd-control/` one level up: `FLEET.md` (L0 meta identity), `ROUTER.md` (L1),
+  `missions.tsv` (the desired orchestrator set — `mission  orchestrator  repo  intent  done_when`),
+  `goals/<mission>.md` (each orchestrator's generated charter+goal), two stages
+  `01_dispatch` (**fanout**: one orchestrator per mission) and `02_converge` (**solo**:
+  cross-mission integration + meta run report), `_config/` (launch / approval / gate policies +
+  `goal_support.txt`), `shared/` (architecture, the `/goal` hook), `_fleet/` (observed),
+  `inbox/STEER.md` (live steering).
+- **`scripts/fleet-loop.sh`** — the meta reconciler. Same folder=desired / socket=observed loop
+  as `herd-loop.sh`, but its "workers" are **orchestrators** and its "slices" are **missions**.
+  Each `tick`: observe fleet → drain steering → launch an orchestrator per missing mission (in its
+  repo, scaffold its herd-control workspace, **arm its `/goal`** to the mission's `done_when`) →
+  refresh status from the orchestrator pane **and** its `herd-control/_fleet/active_stage == DONE`
+  → auto-approve routine blocks or escalate → collect → gate. Mechanical work only; escalates
+  judgment via a `STATUS:` line (`AWAITING_SOLO`/`RECONCILED`/`NEEDS_REVIEW`/`MISSION_COMPLETE`/
+  `ADVANCED`/`DONE`). `run` is the standing loop; `inbox/STEER.md` steers it over **missions**.
+- **`/goal` autonomy hook** — `fleet-loop.sh` arms each orchestrator's `/goal <done_when>` (a
+  session Stop hook) so it self-drives its herd; the meta only re-engages on `blocked`/`done`.
+  Per-agent capability matrix (claude/codex ✅, cursor ❌ → re-nudge) in `shared/goal_support.md`
+  + overridable via `_config/goal_support.txt`. Hooks all the way down: meta-goal →
+  orchestrator-goals → workers.
+- **`skill/SKILL.md` §13 (Meta-orchestration)** — the three-tier model, when to use it (a
+  portfolio of ≥2 independent missions), the `/goal` hook propagation, the workspace + loop, and
+  the discipline rules (no tier reaches two levels down; completion is a disk signal;
+  cross-mission merges / prod-deploys escalate to the human).
+
 ## [1.5.0] - 2026-06-17
 
 ICM-steered orchestration: the folder is the orchestrator, herdr is the body.

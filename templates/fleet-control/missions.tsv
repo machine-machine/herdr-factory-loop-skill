@@ -1,0 +1,11 @@
+# missions.tsv — DESIRED set of orchestrators (Layer 4). One row = one mission = one orchestrator.
+# Tab-separated. Lines starting with # are ignored. fleet-loop.sh launches an orchestrator per row.
+# Columns:  mission  orchestrator  repo  intent  done_when
+#   mission       short kebab id (also the herdr name + goals/<mission>.md)
+#   orchestrator  claude | codex | cursor  (which agent drives this mission's herd)
+#   repo          absolute path to the mission's git repo
+#   intent        one-line WHAT (the orchestrator turns this into a spec)
+#   done_when     the /goal condition — what "delivered" means (verifiable, one line)
+# Example (delete and replace):
+# auth-revamp	claude	/Users/me/app	add OAuth login + rate limiting	OAuth login works end-to-end on staging and tests pass
+# billing-ui	codex	/Users/me/app	rebuild the billing dashboard	billing dashboard renders real data and vitest is green

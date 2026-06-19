@@ -1,0 +1,7 @@
+# goal_support.txt — per-agent /goal capability (overrides fleet-loop.sh defaults).
+# Format: "<agent> <yes|no>". /goal arms a session Stop hook that blocks stopping until a
+# condition holds, so the orchestrator self-drives. Agents marked "no" are re-nudged each tick.
+claude yes
+codex yes
+cursor no
+opencode no

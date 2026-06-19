@@ -1,0 +1,7 @@
+# approve_deny.txt — NEVER auto-approve; always escalate to the human (deny wins over allow).
+force.?push
+push .*(main|master|prod|production)
+deploy .*(prod|production)
+delete .*(branch|database|volume|secret)
+secret|credential|token|api[_-]?key
+rm -rf

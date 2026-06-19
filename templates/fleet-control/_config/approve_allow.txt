@@ -1,0 +1,7 @@
+# approve_allow.txt — orchestrator escalations the META auto-approves (one regex per line).
+# These are ROUTINE for an orchestrator to be doing; pressing Enter is safe.
+# (case-insensitive, matched against the blocked orchestrator's visible screen)
+run .*tests?
+install .*(package|dependency|dependencies)
+create .*worktree
+read .*file
