@@ -155,11 +155,18 @@ EOF
 # accept input at different times (claude shows a welcome screen, codex loads its model),
 # so we may need to (re)send the text, not just Enter. Re-sending to an idle worker is
 # safe: it just reads the same prompt file again.
+#
+# A TUI needs a beat to render the injected text into its input box. If the Enter races
+# the text it submits an empty line and the pointer is left sitting in the input box,
+# unsubmitted — the "typed but never sent" symptom. Settle between the text and the Enter.
+# Override the delay with SUBMIT_SETTLE (seconds) for slow machines.
+SUBMIT_SETTLE="${SUBMIT_SETTLE:-1}"
 submit_prompt() {
   local pane="$1" pf="$2"
   [ -n "$pane" ] && [ "$pane" != "-" ] && [ "$pane" != "DRYRUN" ] || return 0
   is_self "$pane" && return 0
   herdr agent send "$pane" "Read $pf and follow its instructions exactly." >/dev/null 2>&1 || true
+  sleep "$SUBMIT_SETTLE"
   herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
 }
 

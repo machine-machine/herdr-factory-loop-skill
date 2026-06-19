@@ -4,6 +4,18 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.6.1] - 2026-06-19
+
+### Fixed
+- **Dispatch race — prompt typed but never submitted.** `submit_prompt` (herd-loop.sh) and
+  the orchestrator dispatch sites (fleet-loop.sh) fired `agent send` and `pane send-keys Enter`
+  back-to-back. A TUI (claude/codex) needs a beat to render injected text into its input box;
+  the Enter raced the text, submitted an empty line, and left the prompt sitting in the input
+  unsubmitted. Now settle between the text and the Enter (`SUBMIT_SETTLE`, default 1s) — and in
+  fleet-loop.sh the three paired sites are unified behind a single `submit_pane` helper.
+- Docs (SKILL.md, reference.md): the dispatch examples, the `send ≠ submit` gotcha, and the
+  cheat-sheet now teach the settle-before-Enter step.
+
 ## [1.6.0] - 2026-06-19
 
 Meta-orchestration: the orchestrator of orchestrators. A tier above §12 — launch and oversee
