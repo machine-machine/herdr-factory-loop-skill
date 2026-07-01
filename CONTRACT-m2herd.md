@@ -38,6 +38,36 @@ show archived areas as a one-line footer, not full entries. Living ≠ hoarding.
 and `scripts/m2herd-up.sh` → `~/.local/bin/m2herd-up` (idempotent, --uninstall removes), so any
 repo can run the engine. Hooks call `command -v m2herd` and degrade silently when absent.
 
+## Doctrine amendment v1.2 — agentic loop: the machine prompts itself (binding)
+
+**The orchestrator is also the intent coach.** A fuzzy goal is not dispatchable. The
+orchestrator's first job is to sharpen intent into `goal` + `done_when` + slices, recording
+what it cannot resolve as `open_questions` instead of guessing. Schema addition to
+overview.json (both optional, engine writes them): `"done_when": "string"` and
+`"open_questions": ["string"]`. `init --goal` seeds `done_when: ""` — empty means
+"intent not yet coached".
+
+**`m2herd.sh next` — the self-prompting primitive (slice A).** Mechanical priority walk,
+NO LLM calls, prints exactly one line starting `NEXT: `:
+1. drift (`sync --check` logic fails)            → `NEXT: context drift — run: m2herd sync`
+2. `done_when` empty                              → `NEXT: coach the intent — set done_when + record open_questions (m2herd.sh has no opinion; you do)`
+3. loose content in NOTES.md below the marker     → `NEXT: refile notes — run: m2herd refile --area <pick>`
+4. workers[] entry with state spawned|working whose pane is gone/idle → `NEXT: collect worker <slice> — run: m2herd-up collect --slice <slice>`
+5. open_questions non-empty                       → `NEXT: resolve open question: <first>`
+6. otherwise                                      → `NEXT: compare RESUME.md against goal/done_when and dispatch or finish`
+Add `next` to the selftest (drive at least cases 2, 3, 6).
+
+**Hooks inject the next move (slice B).** m2herd-session.sh appends the output of
+`m2herd next` (when the binary exists; bounded ~3s; silent-fail) to its additionalContext,
+after the RESUME digest. Every wake-up = orientation + the next move. This supersedes the
+v1.1 drift-nudge for the session hook (drift is case 1 of `next`); m2herd-precompact.sh
+keeps its own v1.1 drift line.
+
+**Docs (slice D).** §16 opens with the agentic-loop doctrine: the folder is a living harness
+loop — hooks are the heartbeat, `next` is the pulse it injects, the orchestrator coaches
+intent before dispatching, and the machine prompts itself from its own state. Document
+`next`, `done_when`/`open_questions`.
+
 ## .m2herd/ layout (created by `m2herd.sh init`)
 
 ```
