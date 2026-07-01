@@ -143,9 +143,13 @@ submit_pointer() { # submit_pointer <pane> <text>
 }
 
 # ---------- up: workspace bootstrap -------------------------------------------
-# Notes pane viewer command (exact strings from the contract).
+# Notes pane viewer command (exact strings from the contract). v1.3: prefer the
+# read-only dashboard when the m2herd binary is on PATH; the pane is a WATCHER,
+# never a writer, in every variant.
 notes_viewer_cmd() {
-  if command -v watch >/dev/null 2>&1; then
+  if command -v m2herd >/dev/null 2>&1 && command -v watch >/dev/null 2>&1; then
+    printf '%s' 'watch -n 2 -t "m2herd dashboard"'
+  elif command -v watch >/dev/null 2>&1; then
     printf '%s' 'watch -n 2 -t cat .m2herd/NOTES.md'
   else
     printf '%s' 'while :; do clear; cat .m2herd/NOTES.md; sleep 2; done'
