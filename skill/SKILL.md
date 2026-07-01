@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 1.6.0
+version: 1.6.1
 description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator). ALSO trigger for meta-orchestration — when the user wants to be the "meta-orchestrator" / "orchestrator of orchestrators", oversee or launch multiple orchestrators (each driving its own herd of workers) across several missions/repos, or drive a portfolio of parallel missions with /goal-based autonomy (fleet-loop.sh / fleet-control).
 ---
 
@@ -82,11 +82,17 @@ herdr agent start claude --cwd ~/.herdr/worktrees/<repo>/feature-x --no-focus --
 `agent start` returns the new pane/agent identifiers in its JSON result — capture them.
 
 ### 4. Dispatch work to an agent
-`agent send` writes **literal text** (no submit). To submit a prompt to a TUI agent, send the text then an Enter:
+`agent send` writes **literal text** (no submit). To submit a prompt to a TUI agent, send the text, **let it settle (~1s), then** press Enter:
 ```bash
 herdr agent send <target> "Refactor the auth module. Report back when done."
+sleep 1   # let the TUI render the text into its input box first
 herdr pane send-keys <pane_id> Enter
 ```
+> **Settle before Enter.** A TUI (claude/codex) needs a beat to render injected text
+> into its input box. Fire the Enter back-to-back and it races the text: it submits an
+> empty line and the prompt is left sitting in the input, **unsubmitted** — the classic
+> "typed but never sent" bug. Always pause between the text and the Enter, and re-send on
+> the next reconcile tick if the agent is still idle.
 For a shell pane, `pane run` types the command **and** presses Enter in one step:
 ```bash
 herdr pane run <pane_id> "pytest -q"
@@ -102,6 +108,7 @@ Output protocol: write your COMPLETE answer to /tmp/answer-$ID.md,
 then output this exact line in the terminal: TASK_DONE_$ID
 EOF
 herdr agent send "$PANE" "Read /tmp/task-$ID.md and follow its instructions exactly."
+sleep 1   # settle so the Enter doesn't race the text injection
 herdr pane send-keys "$PANE" Enter
 # 2. Wait on the sentinel; the FILE is the deliverable, not the screen
 herdr wait output "$PANE" --match "TASK_DONE_$ID" --timeout 600000
@@ -603,7 +610,7 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 - **First run in a new cwd may block on the folder-trust prompt** ("Do you trust the files in this folder?"). Watch for early `blocked`, read the visible screen, send Enter to accept — it's safe for worktrees you just created.
 - **Protect `$SELF`** — see §2. Don't send keys to, attach-takeover, or close your own pane; don't `herdr server stop` while orchestrating from inside.
 - **Timeouts are milliseconds** (`--timeout 600000` = 10 min). macOS has no `timeout(1)`; rely on herdr's own `wait`/`--timeout` flags, or `gtimeout` if coreutils is installed.
-- **`send` ≠ submit** — `agent send`/`pane send-text` write literal text; you must send `Enter` separately. `pane run` includes Enter.
+- **`send` ≠ submit, and Enter must not race the text** — `agent send`/`pane send-text` write literal text; you must send `Enter` separately. Settle ~1s between the text and the Enter so the TUI has rendered the input — fire them back-to-back and the Enter submits an empty line, leaving the prompt typed-but-unsubmitted. `pane run` includes Enter.
 - **`blocked` is strict** — herdr only flags `blocked` on a recognized approval/question/permission UI; an agent stuck for other reasons may read as `working`. Cross-check with `pane read --source visible`.
 - **Heuristic vs authoritative** — agents without an installed integration are detected from the screen and can misreport. Prefer installing the integration for any agent you orchestrate heavily.
 - **Worktree isolation** prevents parallel agents from clobbering each other's working tree; default root `~/.herdr/worktrees/<repo>/<branch-slug>`.
@@ -615,7 +622,7 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 |------|---------|
 | Fleet state | `herdr agent list \| jq '.result.agents'` |
 | Spawn | `herdr agent start <name> --cwd P --no-focus -- "$(command -v <bin>)" <flags>` |
-| Dispatch | `herdr agent send <t> "…"` then `herdr pane send-keys <p> Enter` |
+| Dispatch | `herdr agent send <t> "…"` → `sleep 1` → `herdr pane send-keys <p> Enter` |
 | Deliverables | file protocol: prompt file → one-line pointer → `wait output --match <sentinel>` → read answer file (§4) |
 | Wait done | `herdr agent wait <t> --status idle --timeout MS` |
 | Wait needs-me | `herdr agent wait <t> --status blocked --timeout MS` |
