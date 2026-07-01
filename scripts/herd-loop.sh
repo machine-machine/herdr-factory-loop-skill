@@ -26,6 +26,7 @@ set -euo pipefail
 # ---------- arg parsing ------------------------------------------------------
 CMD="${1:-help}"; shift || true
 WS=""; REPO=""; BASE="main"; FEATURE=""; WORKER_DEFAULT="codex"
+MODEL="GLM-5.2"; BUDGET="384000"          # context-budget layer defaults (GLM-5.2 / 384k)
 INTERVAL=10; MAX_TICKS=0; DRY_RUN=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -34,6 +35,8 @@ while [ $# -gt 0 ]; do
     --base) BASE="$2"; shift 2 ;;
     --feature) FEATURE="$2"; shift 2 ;;
     --worker) WORKER_DEFAULT="$2"; shift 2 ;;
+    --model) MODEL="$2"; shift 2 ;;
+    --budget) BUDGET="$2"; shift 2 ;;
     --interval) INTERVAL="$2"; shift 2 ;;
     --max-ticks) MAX_TICKS="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
@@ -134,12 +137,17 @@ gen_prompt() {
   local out="$WS/stages/$stage/prompts/$slice.md"
   mkdir -p "$WS/stages/$stage/prompts"
   [ -f "$out" ] && { echo "$out"; return; }
+  # context-budget layer: if a budget-sized manifest exists for this slice, point the
+  # worker at it (links only, sized to fit the budget) instead of the full stage inputs.
+  local ctx="$WS/stages/$stage/context/$slice.md" ctxline=""
+  [ -f "$ctx" ] && ctxline="  0. $ctx   (YOUR CONTEXT MANIFEST — load exactly these links, nothing more)
+"
   cat > "$out" <<EOF
 You are one worker in an ICM-steered herd. Scope: **$slice only** — do not touch files
 outside this slice. Repo: $wt (worktree, branch wip/$stage/$slice).
 
 Read first, in order (load only these):
-  1. $WS/AGENT.md                          (orchestrator charter — your context)
+$ctxline  1. $WS/AGENT.md                          (orchestrator charter — your context)
   2. $WS/stages/01_spec/output/spec.md      (WHAT + acceptance criteria)
   3. $WS/stages/02_plan/output/plan.md      (HOW — stack, structure, contracts)
   4. $WS/stages/03_tasks/output/tasks.md    (your task: the row matching $slice)
@@ -347,6 +355,9 @@ REPO=$REPO
 BASE=$BASE
 FEATURE=$FEATURE
 WORKER_DEFAULT=$WORKER_DEFAULT
+# context-budget layer (see _config/budget_policy.md, scripts/context-budget.sh)
+MODEL=$MODEL
+BUDGET=$BUDGET
 EOF
   echo "01_spec" > "$WS/_fleet/active_stage"
   ledger_init

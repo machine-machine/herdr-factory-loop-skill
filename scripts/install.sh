@@ -92,6 +92,15 @@ install_one() {
 
 if [ "$install_hermes" -eq 1 ]; then
   install_one "$HOME/.hermes/skills" "hermes"
+  # context-budget layer: wire the Hermes hooks (idempotent self-installer).
+  hooks_installer="$(cd "$(dirname "$0")" && pwd)/install-hermes-context.sh"
+  if [ -x "$hooks_installer" ]; then
+    if [ "$uninstall" -eq 1 ]; then
+      "$hooks_installer" --uninstall || echo "[hermes] context-budget hooks uninstall failed (non-fatal)" >&2
+    else
+      "$hooks_installer" || echo "[hermes] context-budget hooks install failed (non-fatal)" >&2
+    fi
+  fi
 fi
 if [ "$install_claude" -eq 1 ]; then
   install_one "$HOME/.claude/skills" "claude"
