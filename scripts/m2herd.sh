@@ -19,6 +19,8 @@
 #   m2herd.sh gist    [--dir P] [--push]      # one-paragraph project gist; --push pipes it to $M2HERD_GIST_CMD if set
 #   m2herd.sh next    [--dir P]               # self-prompting primitive: mechanical priority walk, prints exactly one "NEXT: " line
 #                                             #   (drift → coach intent → refile notes → collect worker → open question → compare/dispatch)
+#   m2herd.sh dashboard [--dir P]             # tier-1 TUI: read-only render — header (drift dot, ages), NEXT, areas, workers,
+#                                             #   open questions, NOTES tail; tput colors on a tty, plain when piped; NEVER writes
 #   m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync (+--check drift) → archive → gist → next; jq asserts
 #
 # --dir defaults to $PWD. Everything idempotent. jq required. overview.json writes are
@@ -346,6 +348,72 @@ next_cmd() {
   echo "NEXT: compare RESUME.md against goal/done_when and dispatch or finish"
 }
 
+# ---------- dashboard: tier-1 TUI — a pure read-only renderer -----------------
+# One writer (the orchestrator), many watchers: this code path NEVER writes.
+epoch_of() { date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || date -u -d "$1" +%s 2>/dev/null || echo 0; }
+age_of() { # humanize an ISO-8601 UTC timestamp → 42s / 3m / 7h / 4d
+  local e now d; e="$(epoch_of "${1:-}")"
+  [ "${e:-0}" -gt 0 ] || { echo "?"; return 0; }
+  now="$(date -u +%s)"; d=$((now - e)); [ "$d" -ge 0 ] || d=0
+  if   [ "$d" -lt 60 ];    then echo "${d}s"
+  elif [ "$d" -lt 3600 ];  then echo "$((d/60))m"
+  elif [ "$d" -lt 86400 ]; then echo "$((d/3600))h"
+  else                          echo "$((d/86400))d"; fi
+}
+
+dashboard() {
+  resolve_dir; need_init
+  local m2="$DIR/.m2herd" B="" D="" G="" Y="" R=""
+  if [ -t 1 ] && command -v tput >/dev/null 2>&1; then   # colors only on a tty; plain when piped
+    B="$(tput bold 2>/dev/null || true)"; D="$(tput dim 2>/dev/null || true)"
+    G="$(tput setaf 2 2>/dev/null || true)"; Y="$(tput setaf 3 2>/dev/null || true)"
+    R="$(tput sgr0 2>/dev/null || true)"
+  fi
+  # 1. header: goal • status • done_when • drift dot • humanized age
+  local goal st dw up dot
+  goal="$(jq -r 'if (.goal//"")=="" then "(none)" else .goal end' "$(OV)")"
+  st="$(jq -r '.status//"active"' "$(OV)")"
+  dw="$(jq -r 'if (.done_when//"")=="" then "(not coached)" else .done_when end' "$(OV)")"
+  up="$(jq -r '.updated_at//""' "$(OV)")"
+  if drift_report >/dev/null; then dot="${G}●${R}"; else dot="${Y}◐ drift${R}"; fi
+  printf '%sm2herd%s %s • %s • done: %s • %s • %s ago\n' "$B" "$R" "$goal" "$st" "$dw" "$dot" "$(age_of "$up")"
+  # 2. the self-prompt (same code path as `next`)
+  next_cmd
+  # 3. AREAS: staleness ages make rot visible; archived rendered dim, one line
+  echo
+  printf '%sAREAS%s\n' "$B" "$R"
+  local names n astatus rel aage
+  names="$(jq -r '(.areas//[])[].name' "$(OV)")"
+  [ -n "$names" ] || echo "  (no areas yet)"
+  for n in $names; do
+    astatus="$(jq -r --arg n "$n" '[.areas[]|select(.name==$n)|(.status//"active")][0]' "$(OV)")"
+    rel="$(jq -r --arg n "$n" '[.areas[]|select(.name==$n)|(.related//[])|join(", ")][0] // ""' "$(OV)")"
+    aage="$(age_of "$(hdr_get "$m2/context/$n/context.md" updated)")"
+    if [ "$astatus" = "archived" ]; then
+      printf '  %s%-14s archived  %s%s\n' "$D" "$n" "$aage" "$R"
+    else
+      printf '  %-14s active    %-5s %s\n' "$n" "$aage" "${rel:+(related: $rel)}"
+    fi
+  done
+  # 4. WORKERS (only when non-empty)
+  if [ "$(jq -r '(.workers//[])|length' "$(OV)")" -gt 0 ]; then
+    echo
+    printf '%sWORKERS%s\n' "$B" "$R"
+    jq -r '(.workers//[])[] | "  " + .slice + "  [" + (.state//"?") + "]  " + (.branch//"-")' "$(OV)"
+  fi
+  # 5. OPEN QUESTIONS (only when non-empty)
+  if [ "$(jq -r '(.open_questions//[])|length' "$(OV)")" -gt 0 ]; then
+    echo
+    printf '%sOPEN QUESTIONS%s\n' "$B" "$R"
+    jq -r '(.open_questions//[])[] | "  - " + .' "$(OV)"
+  fi
+  # 6. NOTES tail: last 5 content lines below the marker
+  echo
+  printf '%sNOTES%s (last 5)\n' "$B" "$R"
+  local tail5; tail5="$(live_tail "$m2/NOTES.md" | awk 'NF' | tail -5)"
+  if [ -n "$tail5" ]; then printf '%s\n' "$tail5" | sed 's/^/  /'; else echo "  (empty)"; fi
+}
+
 # ---------- selftest: tmpdir end-to-end ---------------------------------------
 selftest() {
   need_jq
@@ -432,6 +500,16 @@ selftest() {
   "$self" next --dir "$td" | grep -q '^NEXT: compare RESUME.md against goal/done_when' || fail "next(6): want compare/dispatch"
   [ "$("$self" next --dir "$td" | wc -l | tr -d ' ')" = "1" ] || fail "next printed more than one line"
 
+  # dashboard: read-only render — NEXT line + area rows present, and NO writes to the fabric
+  local before after dash
+  before="$(find "$td/.m2herd" -type f -exec cksum {} + | sort)"
+  dash="$("$self" dashboard --dir "$td")" || fail "dashboard exited non-zero"
+  after="$(find "$td/.m2herd" -type f -exec cksum {} + | sort)"
+  [ "$before" = "$after" ] || fail "dashboard WROTE to .m2herd/ (must be a pure renderer)"
+  printf '%s\n' "$dash" | grep -q '^NEXT: ' || fail "dashboard missing the NEXT line"
+  printf '%s\n' "$dash" | grep -q '^  demo .*active' || fail "dashboard missing the active area row"
+  printf '%s\n' "$dash" | grep -q 'extra .*archived' || fail "dashboard missing the archived area row"
+
   echo "selftest: PASS"
 }
 
@@ -445,7 +523,8 @@ case "$CMD" in
   sync)     sync_cmd ;;
   archive)  archive ;;
   gist)     gist_cmd ;;
-  next)     next_cmd ;;
-  selftest) selftest ;;
-  help|*)   sed -n '2,26p' "$0" ;;
+  next)      next_cmd ;;
+  dashboard) dashboard ;;
+  selftest)  selftest ;;
+  help|*)    sed -n '2,28p' "$0" ;;
 esac
