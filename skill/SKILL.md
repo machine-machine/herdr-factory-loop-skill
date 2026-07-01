@@ -682,7 +682,10 @@ bytes twice, and no summary is ever the only copy:
   "resume from `_fleet/context_pointer.md` + `digest.md`" (the SessionStart hook orients it),
   retires the old pane, and clears the sentinel — enforced reorg by restart. It **refuses to close
   `$SELF`, the new pane, or an empty/unknown pane id**, and `--dry-run` prints the plan while
-  spawning and closing nothing.
+  spawning and closing nothing. To make rotation **automatic**, run the loop with
+  `herd-loop.sh run --auto-rotate --orchestrator PANE [--max-rotations 5]`: on `NEEDS_ROTATION` it
+  rotates in place and keeps ticking (capped against runaway; a refused rotate is contained and the
+  loop yields to a human instead of crashing). Without `--auto-rotate` the loop yields as above.
 
 Wiring: `context-budget.sh summarize|compact` produce the distilled summaries;
 `install-hermes-context.sh --compression on|off` tunes (or disables) the `compression:` block to

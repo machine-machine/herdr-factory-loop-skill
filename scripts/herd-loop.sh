@@ -14,6 +14,7 @@
 #   herd-loop.sh init --ws DIR --repo PATH [--base main] [--feature DIR] [--worker codex]
 #   herd-loop.sh tick     [--ws DIR] [--dry-run]      # one reconciliation pass
 #   herd-loop.sh run      [--ws DIR] [--interval 10] [--max-ticks 0] [--dry-run]
+#                         [--auto-rotate [--orchestrator PANE] [--max-rotations 5]]  # self-rotate on CRITICAL
 #   herd-loop.sh observe  [--ws DIR]                  # snapshot fleet → _fleet/
 #   herd-loop.sh status   [--ws DIR]                  # human-readable rollup
 #   herd-loop.sh advance  [--ws DIR]                  # move active stage → its handoff
@@ -29,6 +30,7 @@ CMD="${1:-help}"; shift || true
 WS=""; REPO=""; BASE="main"; FEATURE=""; WORKER_DEFAULT="codex"
 MODEL="GLM-5.2"; BUDGET="384000"          # context-budget layer defaults (GLM-5.2 / 384k)
 INTERVAL=10; MAX_TICKS=0; DRY_RUN=0; ORCH=""
+AUTO_ROTATE=0; MAX_ROTATIONS=5            # run --auto-rotate: rotate on CRITICAL, capped
 while [ $# -gt 0 ]; do
   case "$1" in
     --ws) WS="$2"; shift 2 ;;
@@ -42,6 +44,8 @@ while [ $# -gt 0 ]; do
     --max-ticks) MAX_TICKS="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     --orchestrator) ORCH="$2"; shift 2 ;;
+    --auto-rotate) AUTO_ROTATE=1; shift ;;
+    --max-rotations) MAX_ROTATIONS="$2"; shift 2 ;;
     -h|--help) CMD="help"; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -425,12 +429,29 @@ rotate() {
 # ---------- run: standing loop -----------------------------------------------
 run() {
   resolve_ws
-  local n=0
+  # --auto-rotate needs to know which pane the orchestrator is; warn early if it can't.
+  if [ "$AUTO_ROTATE" -eq 1 ] && [ -z "$ORCH" ] && [ ! -f "$WS/_fleet/orchestrator" ]; then
+    log "! --auto-rotate set but no orchestrator pane known (pass --orchestrator PANE or write $WS/_fleet/orchestrator); rotations will refuse and the loop will yield instead"
+  fi
+  local n=0 rots=0
   while true; do
     local out; out="$(tick || true)"; printf '%s\n' "$out"
     local st="${out##*STATUS: }"
     case "$st" in
-      DONE|NEEDS_REVIEW|NEEDS_ROTATION|AWAITING_SOLO|STAGE_COMPLETE|PAUSED|ERROR*) log "loop yields on: $st"; break ;;
+      NEEDS_ROTATION)
+        if [ "$AUTO_ROTATE" -ne 1 ]; then log "loop yields on: $st"; break; fi
+        if [ "$MAX_ROTATIONS" -gt 0 ] && [ "$rots" -ge "$MAX_ROTATIONS" ]; then
+          log "auto-rotate: cap ($MAX_ROTATIONS) reached — yielding for human"; log "loop yields on: $st"; break
+        fi
+        log "auto-rotate: NEEDS_ROTATION → rotating (#$((rots+1)))"
+        # Subshell contains rotate's `exit` on a REFUSE so a bad rotate can't kill the loop;
+        # its filesystem/herdr side effects (spawn, close, clear .needs_rotation) still persist.
+        if ( rotate ); then
+          rots=$((rots+1)); log "auto-rotate: rotated (#$rots); continuing loop"
+        else
+          log "auto-rotate: rotate refused/failed — yielding for human"; log "loop yields on: $st"; break
+        fi ;;
+      DONE|NEEDS_REVIEW|AWAITING_SOLO|STAGE_COMPLETE|PAUSED|ERROR*) log "loop yields on: $st"; break ;;
     esac
     n=$((n+1)); [ "$MAX_TICKS" -gt 0 ] && [ "$n" -ge "$MAX_TICKS" ] && { log "max-ticks reached"; break; }
     sleep "$INTERVAL"
@@ -478,5 +499,5 @@ case "$CMD" in
   advance) advance ;;
   rotate)  rotate ;;
   status)  status ;;
-  help|*)  sed -n '2,34p' "$0" ;;
+  help|*)  sed -n '2,24p' "$0" ;;
 esac

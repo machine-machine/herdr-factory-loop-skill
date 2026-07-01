@@ -25,7 +25,9 @@ holds the lossless deep-dives, and a rolling digest + session-rotation bridge th
   starts a fresh orchestrator that boots from `_fleet/context_pointer.md` + `digest.md` (via the
   SessionStart hook), retires the old pane, and clears the sentinel — enforced reorg by restart. Refuses
   to close `$SELF`, the new pane, or an empty/unknown pane id; `--dry-run` prints the plan and spawns/closes
-  nothing.
+  nothing. Opt-in **`herd-loop.sh run --auto-rotate [--orchestrator PANE] [--max-rotations 5]`** rotates
+  automatically on `NEEDS_ROTATION` and keeps ticking (capped; a refused rotate is contained so it can't
+  crash the loop).
 - **Hermes-compressor wiring** — `install-hermes-context.sh --compression on|off` tunes (or disables) the
   `~/.hermes/config.yaml` `compression:` block (`enabled`, `threshold` 0.5, `target_ratio` 0.2,
   `protect_first_n`/`protect_last_n`) to budget-aligned values. Backs up config, touches only those keys,
