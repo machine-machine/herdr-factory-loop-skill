@@ -4,6 +4,30 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] - 2026-07-01
+
+Default-on dispatch nudge: hooks for Claude Code and Hermes that re-check "should this herd?"
+every turn, so the fleet gets considered without the user having to say "herdr" first — the
+model still proposes a plan and gets explicit confirmation before anything is spawned.
+
+### Added
+- **`hooks/herdr-dispatch-nudge.sh`** — a single script wired into Claude Code's
+  `UserPromptSubmit` hook and Hermes's `pre_llm_call` shell hook (its documented
+  `UserPromptSubmit` equivalent). Fires every turn, discards its input, and always returns the
+  same short reminder to check §9/§11/§13 applicability and get confirmation before spawning —
+  it never parses the prompt or decides anything itself; that judgment stays with the model.
+- **`skill/SKILL.md` §14 (Default-on dispatch nudge)** — documents the hook, why it can't embed
+  the decomposability judgment itself, the install/uninstall flow, and the Hermes non-interactive
+  consent gotcha (`--accept-hooks` / `HERMES_ACCEPT_HOOKS=1` / `hooks_auto_accept: true`), which
+  matters most for exactly the channel-driven case §9 is built for.
+- **`scripts/install.sh`** — installs and idempotently registers the hook by default for
+  `claude`/`hermes` targets (`--no-nudge-hook` to skip; `--uninstall` cleanly removes the
+  registration and symlink). Requires `jq` (Claude) / `yq` v4 (Hermes) for registration; degrades
+  to "hook file installed, not wired up" with a warning if either is missing. Takes a
+  timestamped `.bak-<ts>` copy of `settings.json`/`config.yaml` before every edit. Cursor is
+  skipped (no shell-hook mechanism).
+- **`scripts/onboard.sh`** — step 3 now notes that the nudge hook is part of the default install.
+
 ## [1.6.1] - 2026-06-19
 
 ### Fixed
