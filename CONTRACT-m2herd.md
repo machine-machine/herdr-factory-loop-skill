@@ -11,6 +11,33 @@ This file is the schema the herd builds against. Do not change it mid-run; if a
 slice can't honor it, STOP and report the conflict in your answer file instead
 of improvising.
 
+## Doctrine amendment (v1.1 — orchestrator-issued, binding)
+
+**Living harness loop.** The hooks are the heartbeat (SessionStart orients, PostToolUse
+watches the budget, PreCompact refiles before compaction eats notes); drift is an ERROR.
+`m2herd.sh sync --check` exits **3** with a human-readable drift report when overview.json
+and the context/ tree disagree (missing areas, orphan entries); plain `sync` repairs.
+The hooks nudge the orchestrator to run `m2herd sync` when drift is detected.
+
+**Memory tiers — division of labor.** `.m2herd/` is the PROJECT's working memory (files,
+links, state — things you point workers at). AMS (memory.machinemachine.ai) is the FLEET's
+recall (searchable gists, cross-project). `~/.claude` auto-memory is the orchestrator's own
+lessons. `.m2herd` never tries to be a vector store; AMS never holds file trees. Bridge:
+`m2herd.sh gist [--push]` emits a one-paragraph project gist (goal, status, one line per
+active area); `--push` pipes it to the pluggable command `$M2HERD_GIST_CMD` if set (the
+--llm pattern), else prints it with a note. Self-documentation is the point: every refile
+IS the documentation act; nothing lives only in the live window.
+
+**Decay discipline.** `m2herd.sh archive --area A` distills a done area: context.md is
+reduced to its header + ≤10 summary lines with `status: archived` added to the header;
+`deep/` stays lossless and untouched; overview.json area entry gets `"status": "archived"`
+(areas[].status: "active"|"archived", default "active" — schema addition). `status`/`resume`
+show archived areas as a one-line footer, not full entries. Living ≠ hoarding.
+
+**PATH wiring (slice D).** install.sh also symlinks `scripts/m2herd.sh` → `~/.local/bin/m2herd`
+and `scripts/m2herd-up.sh` → `~/.local/bin/m2herd-up` (idempotent, --uninstall removes), so any
+repo can run the engine. Hooks call `command -v m2herd` and degrade silently when absent.
+
 ## .m2herd/ layout (created by `m2herd.sh init`)
 
 ```
