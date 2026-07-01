@@ -124,6 +124,16 @@ process.stdin.on('end', () => {
     if (isHighOrCritical && wsDir && !warnData.spilled[currentLevel]) {
       pointerPath = spillPointer(wsDir);
       if (pointerPath) warnData.spilled[currentLevel] = true;
+      // At CRITICAL, additionally raise the rotation signal — the loop yields on it
+      // (STATUS: NEEDS_ROTATION) so the session can reboot from the pointer. Guarded by
+      // the same per-level `spilled` sentinel, so it fires once per crossing. Silent-fail.
+      if (currentLevel === 'critical') {
+        try {
+          const fleetDir = path.join(wsDir, '_fleet');
+          fs.mkdirSync(fleetDir, { recursive: true });
+          fs.writeFileSync(path.join(fleetDir, '.needs_rotation'), `critical ${usedPct}%\n`);
+        } catch (e) { /* ignore */ }
+      }
     } else if (isHighOrCritical && wsDir && warnData.spilled[currentLevel]) {
       // Already spilled for this level this crossing — reference the existing file.
       const existing = path.join(wsDir, '_fleet', 'context_pointer.md');
