@@ -48,7 +48,17 @@ MARKER='<!-- === M2HERD:LIVE === -->'
 ts()       { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log()      { printf '  %s\n' "$*"; }
 OV()       { echo "$DIR/.m2herd/overview.json"; }
-tmpl_dir() { cd "$(dirname "$0")/../templates/m2herd" 2>/dev/null && pwd; }
+# Resolve through symlinks ($0 may be ~/.local/bin/m2herd → scripts/m2herd.sh);
+# macOS has no readlink -f, so walk the link chain by hand.
+self_path() {
+  local p="$0" l
+  while [ -L "$p" ]; do
+    l="$(readlink "$p")"
+    case "$l" in /*) p="$l" ;; *) p="$(dirname "$p")/$l" ;; esac
+  done
+  printf '%s' "$p"
+}
+tmpl_dir() { cd "$(dirname "$(self_path)")/../templates/m2herd" 2>/dev/null && pwd; }
 need_jq()  { command -v jq >/dev/null 2>&1 || { echo "m2herd.sh: jq is required" >&2; exit 1; }; }
 resolve_dir() { DIR="$(cd "$DIR" 2>/dev/null && pwd)" || { echo "no such dir: $DIR" >&2; exit 1; }; need_jq; }
 need_init(){ [ -f "$(OV)" ] || { echo "no .m2herd/ at $DIR (run: m2herd.sh init --dir $DIR)" >&2; exit 1; }; }
