@@ -337,7 +337,8 @@ dispatch() {
   # copy + an explicit "do all work here" line; only the report may leave the worktree.
   copy_task_into_wt() { # copy_task_into_wt <wt> -> echoes worktree-local task path
     local wtask="$1/TASK-m2herd-$SLICE.md" excl
-    if [ "$DRY_RUN" -eq 1 ]; then plan "cp '$task' '$wtask' (+ git-exclude it in the worktree)"; else
+    # (plan → stderr: this function's stdout is captured by the caller)
+    if [ "$DRY_RUN" -eq 1 ]; then plan "cp '$task' '$wtask' (+ git-exclude it in the worktree)" >&2; else
       cp "$task" "$wtask"
       excl="$(git -C "$1" rev-parse --git-path info/exclude 2>/dev/null || true)"
       [ -n "$excl" ] && { grep -qxF "TASK-m2herd-$SLICE.md" "$excl" 2>/dev/null || echo "TASK-m2herd-$SLICE.md" >> "$excl"; }
