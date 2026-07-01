@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 2.0.0
+version: 2.1.0
 description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator). ALSO trigger for meta-orchestration — when the user wants to be the "meta-orchestrator" / "orchestrator of orchestrators", oversee or launch multiple orchestrators (each driving its own herd of workers) across several missions/repos, or drive a portfolio of parallel missions with /goal-based autonomy (fleet-loop.sh / fleet-control). ALSO trigger for m2herd — the Claude Code (Fable) main-orchestrator context fabric — when the user mentions m2herd, .m2herd, "context fabric", wants to offload context into the repo folder (the folder holds the context, the orchestrator holds pointers), refile or archive notes/areas, push a project gist to fleet memory, or come back to a project via the resume file (RESUME.md).
 ---
 
@@ -892,10 +892,13 @@ entries.
 
 #### 16.3 The workspace — `scripts/m2herd-up.sh`
 
-The workspace shape is fixed: **exactly ONE orchestrator pane (claude) + ONE notes pane**.
-The notes pane runs `watch -n 2 -t "m2herd dashboard"` when both `m2herd` and `watch` exist;
-else it falls back to the NOTES.md viewer chain (`watch -n 2 -t cat .m2herd/NOTES.md` if
-`watch` exists, else a `while :; do clear; cat .m2herd/NOTES.md; sleep 2; done` bash loop).
+The workspace shape is fixed: **exactly ONE orchestrator pane (claude) + ONE machineroom
+pane** (tab label `machineroom`; pre-2.1.0 installs used `m2herd-notes`, still honored).
+The machineroom pane runs `m2herd dashboard --watch` — the engine's built-in flicker-free
+repaint loop (home-cursor redraw, tput colors, human-readable NOTES timestamps) that also
+refreshes `m2herd self-update --check` every 10 minutes, so "N commit(s) behind" surfaces
+in the dashboard header. Fallbacks when `m2herd` is absent: `watch -n 2 -t cat
+.m2herd/NOTES.md`, else the `while :; do clear; cat …; sleep 2; done` loop.
 The pane is a WATCHER, never a writer. On PATH as `m2herd-up`.
 
 ```

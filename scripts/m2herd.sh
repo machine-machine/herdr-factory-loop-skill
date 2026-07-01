@@ -19,8 +19,13 @@
 #   m2herd.sh gist    [--dir P] [--push]      # one-paragraph project gist; --push pipes it to $M2HERD_GIST_CMD if set
 #   m2herd.sh next    [--dir P]               # self-prompting primitive: mechanical priority walk, prints exactly one "NEXT: " line
 #                                             #   (drift → coach intent → refile notes → collect worker → open question → compare/dispatch)
-#   m2herd.sh dashboard [--dir P]             # tier-1 TUI: read-only render — header (drift dot, ages), NEXT, areas, workers,
-#                                             #   open questions, NOTES tail; tput colors on a tty, plain when piped; NEVER writes
+#   m2herd.sh dashboard [--dir P] [--watch [--interval N]]
+#                                             # tier-1 TUI: read-only render — header (drift dot, update line, ages), NEXT, areas,
+#                                             #   workers, open questions, NOTES tail; tput colors on a tty, plain when piped; NEVER
+#                                             #   writes to the fabric. --watch: flicker-free repaint loop (home-cursor redraw, no
+#                                             #   clear) every N s (default 2), refreshing the self-update check every 10 min
+#   m2herd.sh self-update [--check]           # --check: fetch the engine repo, cache behind-count in ~/.cache/m2herd/update-status
+#                                             #   (dashboard renders it); no flag: ff-only pull of the engine repo (refuses dirty tree)
 #   m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync (+--check drift) → archive → gist → next; jq asserts
 #
 # --dir defaults to $PWD. Everything idempotent. jq required. overview.json writes are
@@ -30,7 +35,7 @@ set -euo pipefail
 
 # ---------- arg parsing ------------------------------------------------------
 CMD="${1:-help}"; shift || true
-DIR="$PWD"; GOAL=""; AREA=""; TEXT=""; CHECK=0; PUSH=0
+DIR="$PWD"; GOAL=""; AREA=""; TEXT=""; CHECK=0; PUSH=0; WATCH=0; INTERVAL=2
 while [ $# -gt 0 ]; do
   case "$1" in
     --dir)   DIR="$2"; shift 2 ;;
@@ -38,6 +43,8 @@ while [ $# -gt 0 ]; do
     --area)  AREA="$2"; shift 2 ;;
     --check) CHECK=1; shift ;;
     --push)  PUSH=1; shift ;;
+    --watch) WATCH=1; shift ;;
+    --interval) INTERVAL="$2"; shift 2 ;;
     -h|--help) CMD="help"; shift ;;
     *) if [ -z "$TEXT" ]; then TEXT="$1"; shift; else echo "unknown arg: $1" >&2; exit 2; fi ;;
   esac
@@ -428,29 +435,115 @@ render_workers() {
     done
 }
 
+# ---------- self-update: keep the installed engine current --------------------
+UPDATE_CACHE="$HOME/.cache/m2herd/update-status"
+
+# engine repo root (through the symlink chain — $0 may be ~/.local/bin/m2herd)
+engine_repo() { cd "$(dirname "$(self_path)")/.." 2>/dev/null && pwd; }
+
+self_update_cmd() {
+  need_jq
+  local repo behind
+  repo="$(engine_repo)" || { echo "self-update: cannot resolve engine repo" >&2; exit 1; }
+  git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || { echo "self-update: $repo is not a git repo" >&2; exit 1; }
+  mkdir -p "$(dirname "$UPDATE_CACHE")"
+  if [ "$CHECK" -eq 1 ]; then
+    if ! GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet origin main 2>/dev/null; then
+      printf 'unknown 0 %s\n' "$(ts)" > "$UPDATE_CACHE"
+      echo "self-update: fetch failed (offline?) — status unknown"; return 0
+    fi
+    behind="$(git -C "$repo" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
+    if [ "$behind" -gt 0 ]; then
+      printf 'behind %s %s\n' "$behind" "$(ts)" > "$UPDATE_CACHE"
+      echo "update available: $behind commit(s) behind — run: m2herd self-update"
+    else
+      printf 'up-to-date 0 %s\n' "$(ts)" > "$UPDATE_CACHE"
+      echo "m2herd up-to-date"
+    fi
+    return 0
+  fi
+  # real update: ff-only, never on a dirty tree
+  if [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]; then
+    echo "self-update: REFUSING — engine repo has uncommitted changes: $repo" >&2; exit 2
+  fi
+  GIT_TERMINAL_PROMPT=0 git -C "$repo" pull --ff-only origin main
+  printf 'up-to-date 0 %s\n' "$(ts)" > "$UPDATE_CACHE"
+  log "self-update: engine at $(git -C "$repo" log --oneline -1)"
+}
+
+# header row rendered by dashboard: only when the cached check is fresh (<24h) and behind
+update_row() {
+  local Y="$1" R="$2" word n when age now
+  [ -f "$UPDATE_CACHE" ] || return 0
+  read -r word n when < "$UPDATE_CACHE" 2>/dev/null || return 0
+  [ "$word" = "behind" ] || return 0
+  now="$(date -u +%s)"
+  age="$(( now - $(date -u -j -f %Y-%m-%dT%H:%M:%SZ "$when" +%s 2>/dev/null || echo "$now") ))"
+  [ "$age" -lt 86400 ] || return 0
+  printf 'update:    %s%s commit(s) behind — run: m2herd self-update%s\n' "$Y" "$n" "$R"
+}
+
+# ---------- dashboard --watch: flicker-free repaint loop -----------------------
+# Home-cursor redraw (no `clear` per frame → no blink); alt-screen + hidden
+# cursor, restored on exit. Refreshes the self-update check every 10 min.
+dashboard_watch() {
+  local iv="$INTERVAL" chk=600 last=0 now frame
+  if command -v tput >/dev/null 2>&1 && [ -t 1 ]; then
+    tput smcup 2>/dev/null || true; tput civis 2>/dev/null || true
+    trap 'tput cnorm 2>/dev/null || true; tput rmcup 2>/dev/null || true' EXIT INT TERM
+  fi
+  printf '\033[2J'
+  while :; do
+    now="$(date +%s)"
+    if [ $((now - last)) -ge "$chk" ]; then
+      ( CHECK=1 self_update_cmd >/dev/null 2>&1 ) || true
+      last="$now"
+    fi
+    frame="$(M2HERD_FORCE_TTY=1 COLUMNS="${COLUMNS:-$(tput cols 2>/dev/null || echo 100)}" dashboard 2>&1 || true)"
+    printf '\033[H%s\n\033[0J' "$frame"
+    sleep "$iv"
+  done
+}
+
 dashboard() {
   resolve_dir; need_init
-  local m2="$DIR/.m2herd" B="" D="" G="" Y="" R="" cols=80
-  if [ -t 1 ] && command -v tput >/dev/null 2>&1; then   # colors only on a tty; plain when piped
+  local m2="$DIR/.m2herd" B="" D="" G="" Y="" RD="" C="" M="" R="" cols=80
+  # colors on a tty, plain when piped; M2HERD_FORCE_TTY=1 keeps colors when the
+  # frame is captured by --watch (which redraws it on a real tty).
+  if { [ -t 1 ] || [ "${M2HERD_FORCE_TTY:-}" = "1" ]; } && command -v tput >/dev/null 2>&1; then
     B="$(tput bold 2>/dev/null || true)"; D="$(tput dim 2>/dev/null || true)"
     G="$(tput setaf 2 2>/dev/null || true)"; Y="$(tput setaf 3 2>/dev/null || true)"
+    RD="$(tput setaf 1 2>/dev/null || true)"; C="$(tput setaf 6 2>/dev/null || true)"
+    M="$(tput setaf 5 2>/dev/null || true)"
     R="$(tput sgr0 2>/dev/null || true)"
-    cols="$(tput cols 2>/dev/null || echo 80)"
+    cols="${COLUMNS:-$(tput cols 2>/dev/null || echo 80)}"
   fi
+  # colorize a table block AFTER width-alignment so padding stays correct:
+  # state words get their color, ANSI added post-join.
+  paint_states() {
+    if [ -n "$R" ]; then
+      sed -e "s/ active /${G} active ${R}/g" -e "s/ archived/${D} archived${R}/g" \
+          -e "s/ done / ${G}done${R} /g" -e "s/ working / ${Y}working${R} /g" \
+          -e "s/ failed / ${RD}failed${R} /g" -e "s/ spawned / ${Y}spawned${R} /g"
+    else cat; fi
+  }
   # header: m2herd · <repo> ── ● <status> · drift ✓|◐  + goal / done_when / budget rows
   local goal st dw sdot dmark
   goal="$(jq -r 'if (.goal//"")=="" then "(none)" else .goal end' "$(OV)")"
   st="$(jq -r '.status//"active"' "$(OV)")"
   dw="$(jq -r 'if (.done_when//"")=="" then "(not coached)" else .done_when end' "$(OV)")"
+  local scol=""
   if drift_report >/dev/null; then dmark="${G}✓${R}"; else dmark="${Y}◐${R}"; fi
-  case "$st" in active) sdot="${G}●${R}" ;; paused) sdot="${Y}●${R}" ;; *) sdot="●" ;; esac
-  printf '%sm2herd%s · %s ── %s %s · drift %s\n' "$B" "$R" "$(basename "$DIR")" "$sdot" "$st" "$dmark"
-  printf 'goal:      %s\n' "$goal"
-  printf 'done_when: %s\n' "$dw"
+  case "$st" in active) sdot="${G}●${R}"; scol="$G" ;; paused) sdot="${Y}●${R}"; scol="$Y" ;; *) sdot="●" ;; esac
+  printf '%sm2herd%s · %s%s%s ── %s %s%s%s · drift %s\n' "$B$C" "$R" "$B" "$(basename "$DIR")" "$R" "$sdot" "$scol" "$st" "$R" "$dmark"
+  printf '%sgoal:%s      %s\n' "$D" "$R" "$goal"
+  printf '%sdone_when:%s %s\n' "$D" "$R" "$dw"
   budget_row
+  update_row "$Y" "$R"
   echo
-  # the self-prompt (same code path as `next`)
-  next_cmd
+  # the self-prompt (same code path as `next`) — bold magenta prefix
+  local nx; nx="$(next_cmd)"
+  printf '%sNEXT:%s%s\n' "$B$M" "$R" "${nx#NEXT:}"
   echo
   # AREAS + WORKERS: side-by-side on a wide tty (>=100 cols), stacked otherwise
   local ablock wblock=""
@@ -458,10 +551,10 @@ dashboard() {
   if [ "$(jq -r '(.workers//[])|length' "$(OV)")" -gt 0 ]; then wblock="$(render_workers)"; fi
   if [ -n "$wblock" ] && [ "$cols" -ge 100 ]; then
     paste -d $'\t' <(printf '%s\n' "$ablock") <(printf '%s\n' "$wblock") \
-      | awk -F'\t' '{printf "%-52s %s\n", $1, $2}'
+      | awk -F'\t' '{printf "%-52s %s\n", $1, $2}' | paint_states
   else
-    printf '%s\n' "$ablock"
-    if [ -n "$wblock" ]; then echo; printf '%s\n' "$wblock"; fi
+    printf '%s\n' "$ablock" | paint_states
+    if [ -n "$wblock" ]; then echo; printf '%s\n' "$wblock" | paint_states; fi
   fi
   # OPEN QUESTIONS (only when non-empty)
   if [ "$(jq -r '(.open_questions//[])|length' "$(OV)")" -gt 0 ]; then
@@ -469,11 +562,27 @@ dashboard() {
     printf '%sOPEN QUESTIONS%s\n' "$B" "$R"
     jq -r '(.open_questions//[])[] | "  - " + .' "$(OV)"
   fi
-  # NOTES tail: last 5 content lines below the marker
+  # NOTES tail: last 5 content lines below the marker; ISO timestamps rendered
+  # local + human-short (HH:MM today, "Mon D HH:MM" otherwise), dimmed.
   echo
   printf '%sNOTES%s (last 5)\n' "$B" "$R"
-  local tail5; tail5="$(live_tail "$m2/NOTES.md" | awk 'NF' | tail -5)"
-  if [ -n "$tail5" ]; then printf '%s\n' "$tail5" | sed 's/^/  /'; else echo "  (empty)"; fi
+  local tail5 line iso rest ep hum today
+  tail5="$(live_tail "$m2/NOTES.md" | awk 'NF' | tail -5)"
+  today="$(date +%Y-%m-%d)"
+  if [ -n "$tail5" ]; then
+    printf '%s\n' "$tail5" | while IFS= read -r line; do
+      case "$line" in
+        "- ["*Z"]"*)
+          iso="${line#- [}"; iso="${iso%%]*}"; rest="${line#*\] }"
+          ep="$(date -j -u -f %Y-%m-%dT%H:%M:%SZ "$iso" +%s 2>/dev/null || true)"
+          if [ -n "$ep" ]; then
+            if [ "$(date -r "$ep" +%Y-%m-%d)" = "$today" ]; then hum="$(date -r "$ep" +%H:%M)"; else hum="$(date -r "$ep" '+%b %-d %H:%M')"; fi
+            printf '  - %s[%s]%s %s\n' "$D" "$hum" "$R" "$rest"
+          else printf '  %s\n' "$line"; fi ;;
+        *) printf '  %s\n' "$line" ;;
+      esac
+    done
+  else echo "  (empty)"; fi
   echo
   printf '%sread-only · steering: .m2herd/inbox/STEER.md%s\n' "$D" "$R"
 }
@@ -597,7 +706,8 @@ case "$CMD" in
   archive)  archive ;;
   gist)     gist_cmd ;;
   next)      next_cmd ;;
-  dashboard) dashboard ;;
+  dashboard) if [ "$WATCH" -eq 1 ]; then dashboard_watch; else dashboard; fi ;;
+  self-update) self_update_cmd ;;
   selftest)  selftest ;;
   help|*)    sed -n '2,28p' "$0" ;;
 esac

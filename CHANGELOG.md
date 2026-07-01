@@ -4,6 +4,24 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.1.0] - 2026-07-02
+
+### Added
+- **`m2herd dashboard --watch [--interval N]`** — built-in flicker-free repaint loop (alt-screen,
+  hidden cursor, home-cursor redraw instead of `clear` — no more blinking) with tput colors kept
+  in watch mode; the machineroom pane now runs this instead of a shell `clear` loop.
+- **`m2herd self-update [--check]`** — `--check` fetches the engine repo and caches the
+  behind-count in `~/.cache/m2herd/update-status` (the watch loop refreshes it every 10 min);
+  the dashboard header renders "N commit(s) behind — run: m2herd self-update" while fresh (<24h).
+  Plain `self-update` ff-only-pulls the engine repo, refusing a dirty tree.
+- **Dashboard colors + human dates** — cyan branding, magenta `NEXT:` prefix, green/yellow/red
+  state words painted AFTER column alignment (padding stays correct), dimmed labels/footer, and
+  NOTES timestamps rendered local + human-short (`14:32` today, `Jul 1 14:32` otherwise).
+
+### Changed
+- **Notes pane → machineroom.** The m2herd-up tab label is now `machineroom` (old
+  `m2herd-notes` label still detected for idempotence).
+
 ## [2.0.0] - 2026-07-02
 
 m2herd: the Fable main-orchestrator context fabric. **Claude Code (Fable) is the MAIN

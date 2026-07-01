@@ -52,7 +52,9 @@ self_path() {
   printf '%s' "$p"
 }
 SCRIPT_DIR="$(cd "$(dirname "$(self_path)")" && pwd)"
-NOTES_TAB_LABEL="m2herd-notes"
+NOTES_TAB_LABEL="machineroom"
+# pre-rename installs used this label; still honored for idempotence
+NOTES_TAB_LABEL_OLD="m2herd-notes"
 SUBMIT_SETTLE="${SUBMIT_SETTLE:-1}"                 # settle between `agent send` and Enter
 WAIT_TIMEOUT="${M2HERD_WAIT_TIMEOUT:-1800000}"      # collect: ms to wait for worker idle
 
@@ -153,12 +155,12 @@ submit_pointer() { # submit_pointer <pane> <text>
 }
 
 # ---------- up: workspace bootstrap -------------------------------------------
-# Notes pane viewer command (exact strings from the contract). v1.3: prefer the
-# read-only dashboard when the m2herd binary is on PATH; the pane is a WATCHER,
-# never a writer, in every variant.
+# Machineroom pane viewer command. Prefer the engine's built-in flicker-free
+# watch mode (home-cursor repaint, self-update check every 10 min); the pane is
+# a WATCHER, never a writer, in every variant.
 notes_viewer_cmd() {
-  if command -v m2herd >/dev/null 2>&1 && command -v watch >/dev/null 2>&1; then
-    printf '%s' 'watch -n 2 -t "m2herd dashboard"'
+  if command -v m2herd >/dev/null 2>&1; then
+    printf '%s' 'm2herd dashboard --watch'
   elif command -v watch >/dev/null 2>&1; then
     printf '%s' 'watch -n 2 -t cat .m2herd/NOTES.md'
   else
@@ -238,8 +240,8 @@ up() {
   #    a labeled tab survives restarts and is observable via `herdr tab list`.
   local viewer tab notes
   viewer="$(notes_viewer_cmd)"
-  tab="$(herdr tab list --workspace "$ws" 2>/dev/null | jq -r --arg l "$NOTES_TAB_LABEL" \
-    '[.result.tabs[] | select((.label // "")==$l)] | first | .tab_id // empty' 2>/dev/null || true)"
+  tab="$(herdr tab list --workspace "$ws" 2>/dev/null | jq -r --arg l "$NOTES_TAB_LABEL" --arg o "$NOTES_TAB_LABEL_OLD" \
+    '[.result.tabs[] | select((.label // "")==$l or (.label // "")==$o)] | first | .tab_id // empty' 2>/dev/null || true)"
   if [ -n "$tab" ]; then
     notes="$(herdr pane list --workspace "$ws" 2>/dev/null | jq -r --arg t "$tab" \
       '[.result.panes[] | select(.tab_id==$t)] | first | .pane_id // empty' 2>/dev/null || true)"
