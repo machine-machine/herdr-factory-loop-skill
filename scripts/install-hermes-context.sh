@@ -37,7 +37,7 @@ HOOK_SH="herdr-context-session.sh"
 
 # --- messaging helpers (match install.sh style) -----------------------------
 usage() {
-  sed -n '2,20p' "$0"
+  sed -n '2,16p' "$0"
   exit "${1:-0}"
 }
 say()  { echo "$*"; }
