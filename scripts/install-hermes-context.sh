@@ -8,6 +8,7 @@
 #   ./scripts/install-hermes-context.sh                  # install with defaults
 #   ./scripts/install-hermes-context.sh --budget 512000  # custom context budget
 #   ./scripts/install-hermes-context.sh --model GLM-5.2   # record intended model
+#   ./scripts/install-hermes-context.sh --compression off # disable Hermes native compression
 #   ./scripts/install-hermes-context.sh --dry-run        # show actions, change nothing
 #   ./scripts/install-hermes-context.sh --uninstall      # remove hooks + entries
 #   ./scripts/install-hermes-context.sh --help
@@ -19,6 +20,7 @@ set -euo pipefail
 # --- defaults ---------------------------------------------------------------
 BUDGET=384000
 MODEL="GLM-5.2"
+COMPRESSION=on
 DRY_RUN=0
 UNINSTALL=0
 
@@ -37,7 +39,7 @@ HOOK_SH="herdr-context-session.sh"
 
 # --- messaging helpers (match install.sh style) -----------------------------
 usage() {
-  sed -n '2,16p' "$0"
+  sed -n '2,17p' "$0"
   exit "${1:-0}"
 }
 say()  { echo "$*"; }
@@ -52,6 +54,7 @@ while [ "$#" -gt 0 ]; do
     --uninstall) UNINSTALL=1 ;;
     --budget)    shift; BUDGET="${1:?--budget requires a value}" ;;
     --model)     shift; MODEL="${1:?--model requires a value}" ;;
+    --compression) shift; COMPRESSION="${1:?--compression requires on|off}" ;;
     -h|--help)   usage 0 ;;
     *) echo "Unknown arg: $1" >&2; usage 1 ;;
   esac
@@ -62,6 +65,13 @@ if ! echo "$BUDGET" | grep -qE '^[0-9]+$'; then
   echo "Error: --budget must be an integer (got '$BUDGET')" >&2
   exit 1
 fi
+
+case "$COMPRESSION" in
+  on|off) ;;
+  *) echo "Error: --compression must be 'on' or 'off' (got '$COMPRESSION')" >&2; exit 1 ;;
+esac
+# Desired compression.enabled value as a YAML boolean.
+[ "$COMPRESSION" = on ] && COMPRESSION_ENABLED=true || COMPRESSION_ENABLED=false
 
 command -v jq >/dev/null 2>&1 || { echo "Error: jq is required but not on PATH." >&2; exit 1; }
 
@@ -120,6 +130,13 @@ stripped_settings() {
     ' "$src"
 }
 
+# Back up config.yaml once per run (multiple config steps share one .bak.$TS,
+# so the backup always captures the pre-run original, never an intermediate).
+backup_config() {
+  [ -f "$CONFIG.bak.$TS" ] && return 0
+  cp "$CONFIG" "$CONFIG.bak.$TS" && info "backed up → $CONFIG.bak.$TS"
+}
+
 # ---------------------------------------------------------------------------
 # config.yaml: rewrite ONLY model.context_length; record MODEL as a comment.
 # Prints the rewritten file to stdout; touches no other key.
@@ -141,15 +158,36 @@ rewrite_config() {
 }
 
 # ---------------------------------------------------------------------------
+# config.yaml: rewrite ONLY compression.enabled within the top-level
+# compression: block. Prints the rewritten file to stdout; touches no other
+# key (threshold/target_ratio/etc. are left exactly as Hermes has them).
+# ---------------------------------------------------------------------------
+rewrite_compression() {
+  local src="$1"
+  awk -v want="$COMPRESSION_ENABLED" '
+    /^compression:[[:space:]]*$/ { in_comp=1; print; next }
+    # a new top-level key (no leading space, not a comment) closes the block
+    in_comp && /^[^[:space:]#]/ { in_comp=0 }
+    in_comp && /^[[:space:]]+enabled:[[:space:]]*/ {
+      match($0, /^[[:space:]]+/); indent=substr($0, 1, RLENGTH)
+      printf "%senabled: %s\n", indent, want
+      done=1; next
+    }
+    { print }
+    END { if (!done) exit 3 }
+  ' "$src"
+}
+
+# ---------------------------------------------------------------------------
 # install
 # ---------------------------------------------------------------------------
 do_install() {
   say "Installing Hermes context-budget hooks → $HERMES_DIR"
-  say "  budget=$BUDGET  model=$MODEL  dry-run=$DRY_RUN"
+  say "  budget=$BUDGET  model=$MODEL  compression=$COMPRESSION  dry-run=$DRY_RUN"
   say
 
   # 1. Copy hook files -------------------------------------------------------
-  say "[1/3] hook files → $HOOKS_DIR"
+  say "[1/4] hook files → $HOOKS_DIR"
   local f missing=0
   for f in "$HOOK_JS" "$HOOK_SH"; do
     if [ ! -f "$SRC_HOOKS/$f" ]; then
@@ -170,7 +208,7 @@ do_install() {
   say
 
   # 2. Merge settings.json ---------------------------------------------------
-  say "[2/3] settings.json ← 1 PostToolUse + 1 SessionStart entry (idempotent)"
+  say "[2/4] settings.json ← 1 PostToolUse + 1 SessionStart entry (idempotent)"
   if [ ! -f "$SETTINGS" ]; then
     if [ "$DRY_RUN" -eq 1 ]; then
       info "would create $SETTINGS with the two hook entries"
@@ -207,7 +245,7 @@ do_install() {
   say
 
   # 3. config.yaml context_length -------------------------------------------
-  say "[3/3] config.yaml model.context_length → $BUDGET"
+  say "[3/4] config.yaml model.context_length → $BUDGET"
   if [ ! -f "$CONFIG" ]; then
     fail "$CONFIG not found — skipping context_length update"
   else
@@ -225,9 +263,35 @@ do_install() {
       pass "config.yaml already at context_length=$BUDGET — no change (idempotent)"
       rm -f "$ctmp"
     else
-      cp "$CONFIG" "$CONFIG.bak.$TS" && info "backed up → $CONFIG.bak.$TS"
+      backup_config
       mv "$ctmp" "$CONFIG"
       pass "config.yaml context_length set to $BUDGET (MODEL=$MODEL recorded)"
+    fi
+  fi
+  say
+
+  # 4. config.yaml compression: block ---------------------------------------
+  say "[4/4] config.yaml compression.enabled → $COMPRESSION_ENABLED"
+  if [ ! -f "$CONFIG" ]; then
+    fail "$CONFIG not found — skipping compression update"
+  else
+    local xtmp rc=0
+    xtmp="$(mktemp)"
+    rewrite_compression "$CONFIG" > "$xtmp" || rc=$?
+    if [ "$rc" -eq 3 ]; then
+      fail "no compression.enabled key found in $CONFIG — leaving file untouched"
+      rm -f "$xtmp"
+    elif [ "$DRY_RUN" -eq 1 ]; then
+      info "diff (current → updated):"
+      diff -u "$CONFIG" "$xtmp" | sed 's/^/    /' || true
+      rm -f "$xtmp"
+    elif diff -q "$CONFIG" "$xtmp" >/dev/null 2>&1; then
+      pass "config.yaml already at compression.enabled=$COMPRESSION_ENABLED — no change (idempotent)"
+      rm -f "$xtmp"
+    else
+      backup_config
+      mv "$xtmp" "$CONFIG"
+      pass "config.yaml compression.enabled set to $COMPRESSION_ENABLED"
     fi
   fi
   say
@@ -278,6 +342,7 @@ do_uninstall() {
   done
   say
   info "Note: config.yaml context_length left as-is (a backup exists if it was changed)."
+  info "Note: config.yaml compression.enabled left as-is — uninstall does not force it off."
   say
 }
 
@@ -300,6 +365,21 @@ verify() {
     fi
   else
     info "no settings.json to inspect"
+  fi
+
+  # Report the resulting compression.enabled value from the config.yaml block.
+  if [ -f "$CONFIG" ]; then
+    local comp_val
+    comp_val="$(awk '
+      /^compression:[[:space:]]*$/ { in_comp=1; next }
+      in_comp && /^[^[:space:]#]/ { in_comp=0 }
+      in_comp && /^[[:space:]]+enabled:[[:space:]]*/ { print $2; exit }
+    ' "$CONFIG")"
+    if [ -n "$comp_val" ]; then
+      pass "config.yaml compression.enabled = $comp_val"
+    else
+      info "no compression.enabled key found in $CONFIG"
+    fi
   fi
 
   if command -v hermes >/dev/null 2>&1; then
