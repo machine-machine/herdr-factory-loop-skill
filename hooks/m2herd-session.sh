@@ -4,8 +4,9 @@
 # When a session starts inside a repo that carries an .m2herd/ context fabric
 # (cwd or $M2HERD_DIR holds .m2herd/), inject a digest as additionalContext:
 # the overview.json goal/status/areas count plus the first 30 lines of
-# RESUME.md — so a resumed orchestrator starts already oriented on where the
-# work stands and what to do next.
+# RESUME.md, and (when the m2herd engine is on PATH) the one-line `m2herd next`
+# move — so a resumed orchestrator starts already oriented on where the work
+# stands and what to do next.
 #
 # Pure bash + jq. Same JSON envelope as herdr-context-session.sh. Silent-fail:
 # any problem exits 0 with no output so the hook never blocks a session start.
@@ -49,23 +50,26 @@ if [ -f "$M2/RESUME.md" ]; then
   RESUME="$(head -30 "$M2/RESUME.md" 2>/dev/null || true)"
 fi
 
-# Drift probe (contract amendment v1.1): if the m2herd engine is on PATH, run
-# a bounded `m2herd sync --check`; exit 3 means overview.json and the context/
-# tree disagree. Degrade silently when the binary is absent, hangs (killed at
-# ~3s), or exits 0/other — the probe must never delay or block the session.
-DRIFT=""
+# Next-move probe (contract amendment v1.2, supersedes the v1.1 drift nudge —
+# drift is case 1 of `next`): if the m2herd engine is on PATH, run a bounded
+# `m2herd next` and append its one-line "NEXT: ..." to the digest so every
+# wake-up carries orientation + the next move. Degrade silently when the
+# binary is absent, hangs (killed at ~3s), or produces nothing — the probe
+# must never delay or block the session.
+NEXT=""
 if command -v m2herd >/dev/null 2>&1; then
-  _rc=0
   if command -v timeout >/dev/null 2>&1; then
-    timeout 3 m2herd sync --check --dir "$ROOT" >/dev/null 2>&1 || _rc=$?
+    NEXT="$(timeout 3 m2herd next --dir "$ROOT" 2>/dev/null | head -3 || true)"
   else
-    m2herd sync --check --dir "$ROOT" >/dev/null 2>&1 & _pid=$!
-    ( sleep 3; kill "$_pid" 2>/dev/null ) & _watch=$!
-    wait "$_pid" 2>/dev/null; _rc=$?
-    kill "$_watch" 2>/dev/null; wait "$_watch" 2>/dev/null || true
-  fi
-  if [ "$_rc" -eq 3 ]; then
-    DRIFT="context drift detected — run \`m2herd sync\` to reconcile overview.json with the context/ tree."
+    _out="$(mktemp 2>/dev/null || true)"
+    if [ -n "$_out" ]; then
+      m2herd next --dir "$ROOT" >"$_out" 2>/dev/null & _pid=$!
+      ( sleep 3; kill "$_pid" 2>/dev/null ) & _watch=$!
+      wait "$_pid" 2>/dev/null || true
+      kill "$_watch" 2>/dev/null; wait "$_watch" 2>/dev/null || true
+      NEXT="$(head -3 "$_out" 2>/dev/null || true)"
+      rm -f "$_out" 2>/dev/null || true
+    fi
   fi
 fi
 
@@ -79,9 +83,9 @@ ${RESUME}"
 else
   MSG="${MSG} No RESUME.md yet — run 'm2herd.sh status' to orient."
 fi
-if [ -n "$DRIFT" ]; then
+if [ -n "$NEXT" ]; then
   MSG="${MSG}
-${DRIFT}"
+${NEXT}"
 fi
 
 # Emit the structured envelope. Typed fields let tests assert the contract
