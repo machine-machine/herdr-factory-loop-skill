@@ -418,20 +418,27 @@ render_areas() {
 }
 # desired vs observed: ONE `herdr agent list` query; mismatch marked "!"; degrades to "-"
 render_workers() {
-  local agents="" slice desired pane branch obs mark
+  local agents="" slice desired pane branch mode model tokens obs mark runner
   command -v herdr >/dev/null 2>&1 && agents="$(herdr agent list 2>/dev/null || true)"
   echo "WORKERS"
-  printf '  %-10s %-9s %-10s %s\n' "slice" "desired" "observed" "branch"
-  jq -r '(.workers//[])[] | [.slice, (.state//"?"), (.pane_id//""), (.branch//"-")] | join("\u001f")' "$(OV)" \
-  | while IFS=$'\x1f' read -r slice desired pane branch; do
-      obs="-"; mark=""
-      if [ -n "$agents" ]; then
+  printf '  %-10s %-9s %-10s %-14s %s\n' "slice" "desired" "observed" "runner" "branch"
+  jq -r '(.workers//[])[] | [.slice, (.state//"?"), (.pane_id//""), (.branch//"-"),
+         (.mode//"tui"), (.model//""), ((.tokens//"")|tostring)] | join("\u001f")' "$(OV)" \
+  | while IFS=$'\x1f' read -r slice desired pane branch mode model tokens; do
+      obs="-"; mark=""; runner="tui"
+      if [ "$mode" = "headless" ]; then
+        obs="headless"; runner="${model:-?}"
+        # humanize the spend column (12345 -> 12k)
+        if [ -n "$tokens" ]; then
+          if [ "$tokens" -ge 1000 ] 2>/dev/null; then runner="$runner $((tokens / 1000))k"; else runner="$runner ${tokens}t"; fi
+        fi
+      elif [ -n "$agents" ]; then
         obs="$(jq -r --arg p "$pane" '[.result.agents[]? | select(.pane_id==$p) | .agent_status][0] // "gone"' <<<"$agents")"
         case "$desired:$obs" in
           spawned:idle|spawned:gone|working:idle|working:gone|done:working|failed:working) mark=" !" ;;
         esac
       fi
-      printf '  %-10s %-9s %-10s %s\n' "$slice" "$desired" "$obs$mark" "$branch"
+      printf '  %-10s %-9s %-10s %-14s %s\n' "$slice" "$desired" "$obs$mark" "$runner" "$branch"
     done
 }
 

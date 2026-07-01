@@ -3,17 +3,21 @@
 #
 # Claude Code (Fable) is the MAIN orchestrator; .m2herd/ is the per-repo context
 # fabric. This script does the MECHANICAL herdr work: stand up the workspace shape
-# (exactly one orchestrator pane + one notes pane live-viewing NOTES.md), fan a
+# (exactly one orchestrator pane + one machineroom pane live-viewing NOTES.md), fan a
 # slice out to a worktree'd worker over the file protocol, and collect its report
 # back into .m2herd/dispatch/. Judgment (what to put in a task file, what to do
 # with a report) stays with the orchestrator.
 #
 # Usage:
-#   m2herd-up.sh up       [--repo P] [--goal "…"]   # ensure herdr workspace: ONE orchestrator pane (claude) + ONE notes pane; m2herd.sh init if missing
+#   m2herd-up.sh up       [--repo P] [--goal "…"]   # ensure herdr workspace: ONE orchestrator pane (claude) + ONE machineroom pane; m2herd.sh init if missing
 #   m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor]
-#                                                   # worktree wip/m2herd-<S> off BASE (default: current branch), spawn worker,
+#                         [--headless [--model M]]  # worktree wip/m2herd-<S> off BASE (default: current branch), spawn worker,
 #                                                   # file-protocol dispatch of .m2herd/dispatch/S.task.md, record in overview.json workers[]
-#   m2herd-up.sh collect  --slice S [--repo P]      # wait idle, copy worker report to dispatch/S.out.md, update workers[] state
+#                                                   # --headless: no pane/TUI — `claude -p --model M` (default sonnet) or `codex exec`
+#                                                   #   in the worktree via nohup; log → dispatch/S.log, answer → dispatch/S.out.md;
+#                                                   #   usage (tokens/cost) parsed into workers[] at collect. Cheap hands, Fable judgment.
+#   m2herd-up.sh collect  --slice S [--repo P]      # wait idle (pane) / exited (headless pid), keep/copy report to dispatch/S.out.md,
+#                                                   # update workers[] state (+tokens/cost for headless)
 #   m2herd-up.sh --dry-run <same args>              # print every herdr/git command instead of running it
 #
 # Binding herdr rules (from CONTRACT-m2herd.md): identify $SELF first and never
@@ -27,7 +31,7 @@ set -euo pipefail
 DRY_RUN=0
 while [ "${1:-}" = "--dry-run" ]; do DRY_RUN=1; shift; done
 CMD="${1:-help}"; shift || true
-REPO=""; GOAL=""; SLICE=""; BASE=""; AGENT="claude"
+REPO=""; GOAL=""; SLICE=""; BASE=""; AGENT="claude"; HEADLESS=0; MODEL=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO="$2"; shift 2 ;;
@@ -35,6 +39,8 @@ while [ $# -gt 0 ]; do
     --slice) SLICE="$2"; shift 2 ;;
     --base) BASE="$2"; shift 2 ;;
     --agent) AGENT="$2"; shift 2 ;;
+    --headless) HEADLESS=1; shift ;;
+    --model) MODEL="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) CMD="help"; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -108,23 +114,38 @@ worker_argv() {
 }
 
 # ---------- overview.json writers (always rewrite the whole file with jq) -----
-record_worker() { # record_worker <slice> <pane> <worktree> <branch> <state>
-  local slice="$1" pane="$2" wt="$3" branch="$4" state="$5" tmp
+record_worker() { # record_worker <slice> <pane> <worktree> <branch> <state> [mode] [model] [pid]
+  local slice="$1" pane="$2" wt="$3" branch="$4" state="$5" mode="${6:-tui}" model="${7:-}" pid="${8:-}" tmp
   if [ "$DRY_RUN" -eq 1 ]; then
-    plan "jq rewrite $OV: workers[] += {slice:\"$slice\", pane_id:\"$pane\", worktree:\"$wt\", branch:\"$branch\", state:\"$state\", task:\".m2herd/dispatch/$slice.task.md\", out:\".m2herd/dispatch/$slice.out.md\"}"
+    plan "jq rewrite $OV: workers[] += {slice:\"$slice\", pane_id:\"$pane\", mode:\"$mode\"${model:+, model:\"$model\"}${pid:+, pid:$pid}, worktree:\"$wt\", branch:\"$branch\", state:\"$state\", …}"
     return 0
   fi
   [ -f "$OV" ] || { echo "no overview.json at $OV (run: m2herd-up.sh up --repo $REPO)" >&2; exit 1; }
   tmp="$(mktemp)"
   jq --arg slice "$slice" --arg pane "$pane" --arg wt "$wt" --arg br "$branch" \
-     --arg st "$state" --arg ts "$(utc_now)" '
-    .workers = ((.workers // []) | map(select(.slice != $slice))) + [{
-      slice: $slice, pane_id: $pane, worktree: $wt, branch: $br, state: $st,
+     --arg st "$state" --arg ts "$(utc_now)" --arg mode "$mode" --arg model "$model" --arg pid "$pid" '
+    .workers = ((.workers // []) | map(select(.slice != $slice))) + [({
+      slice: $slice, pane_id: $pane, worktree: $wt, branch: $br, state: $st, mode: $mode,
       task: (".m2herd/dispatch/" + $slice + ".task.md"),
-      out:  (".m2herd/dispatch/" + $slice + ".out.md") }]
+      out:  (".m2herd/dispatch/" + $slice + ".out.md") }
+      + (if $model != "" then {model: $model} else {} end)
+      + (if $pid != "" then {pid: ($pid | tonumber)} else {} end))]
     | .updated_at = $ts
   ' "$OV" > "$tmp"
   mv "$tmp" "$OV"
+}
+
+set_worker_usage() { # set_worker_usage <slice> <output_tokens> <cost_usd>
+  local slice="$1" tok="$2" cost="$3" tmp
+  [ "$DRY_RUN" -eq 1 ] && { plan "jq rewrite $OV: workers[slice==$slice] += {tokens:$tok, cost_usd:$cost}"; return 0; }
+  [ -f "$OV" ] || return 0
+  tmp="$(mktemp)"
+  jq --arg s "$slice" --arg tok "$tok" --arg cost "$cost" '
+    .workers = ((.workers // []) | map(if .slice == $s then
+      . + (if $tok  != "" then {tokens:   ($tok  | tonumber)} else {} end)
+        + (if $cost != "" then {cost_usd: ($cost | tonumber)} else {} end)
+    else . end))
+  ' "$OV" > "$tmp" && mv "$tmp" "$OV"
 }
 
 set_worker_state() { # set_worker_state <slice> <state>
@@ -236,7 +257,7 @@ up() {
     log "! $n orchestrator panes found (want EXACTLY ONE) — keeping $orch; close extras by hand (never \$SELF)"
   fi
 
-  # 4. ONE notes pane live-viewing NOTES.md. Idempotency key: the tab label —
+  # 4. ONE machineroom pane live-viewing NOTES.md. Idempotency key: the tab label —
   #    a labeled tab survives restarts and is observable via `herdr tab list`.
   local viewer tab notes
   viewer="$(notes_viewer_cmd)"
@@ -245,7 +266,7 @@ up() {
   if [ -n "$tab" ]; then
     notes="$(herdr pane list --workspace "$ws" 2>/dev/null | jq -r --arg t "$tab" \
       '[.result.panes[] | select(.tab_id==$t)] | first | .pane_id // empty' 2>/dev/null || true)"
-    log "notes pane exists: ${notes:-<tab $tab, pane unresolved>} (viewer assumed running)"
+    log "machineroom pane exists: ${notes:-<tab $tab, pane unresolved>} (viewer assumed running)"
   elif [ "$DRY_RUN" -eq 1 ]; then
     plan "herdr tab create --workspace '$ws' --cwd '$REPO' --label '$NOTES_TAB_LABEL' --no-focus"
     plan "herdr pane run '<notes-pane>' '$viewer'"
@@ -256,13 +277,13 @@ up() {
     [ -n "$tab" ] || { echo "notes tab create failed" >&2; exit 1; }
     notes="$(herdr pane list --workspace "$ws" 2>/dev/null | jq -r --arg t "$tab" \
       '[.result.panes[] | select(.tab_id==$t)] | first | .pane_id // empty' 2>/dev/null || true)"
-    [ -n "$notes" ] || { echo "notes pane never appeared in pane list" >&2; exit 1; }
+    [ -n "$notes" ] || { echo "machineroom pane never appeared in pane list" >&2; exit 1; }
     if is_self "$notes"; then
-      log "! notes pane resolved to \$SELF ($notes) — refusing to touch it"
+      log "! machineroom pane resolved to \$SELF ($notes) — refusing to touch it"
     else
       sleep 1   # let the fresh pane's shell come up before typing into it
       herdr pane run "$notes" "$viewer" >/dev/null 2>&1 || true
-      log "notes pane started: $notes ($viewer)"
+      log "machineroom pane started: $notes ($viewer)"
     fi
   fi
 
@@ -283,6 +304,16 @@ dispatch() {
     else echo "no task file: $task — write the slice's task there first (file protocol)" >&2; exit 1; fi
   fi
 
+  if [ "$HEADLESS" -eq 1 ]; then
+    # verified 2026-07-02: `claude -p` works on the Max plan (usage JSON incl. costUSD);
+    # codex exec / opencode run are the non-Anthropic fallbacks. cursor has no headless mode.
+    case "$AGENT" in
+      claude|codex|opencode) : ;;
+      *) echo "--headless supports --agent claude|codex|opencode (cursor has no headless mode)" >&2; exit 2 ;;
+    esac
+    [ -n "$MODEL" ] || MODEL="sonnet"   # cheap hands by default; Fable stays the judge
+  fi
+
   local av bin flag; av="$(worker_argv "$AGENT")"; bin="${av%%$'\t'*}"; flag="${av##*$'\t'}"
   if [ "$DRY_RUN" -eq 0 ] && ! command -v "$bin" >/dev/null 2>&1; then
     echo "worker binary '$bin' not on PATH" >&2; exit 1
@@ -300,7 +331,54 @@ dispatch() {
     log "worktree: $wt ($branch off $BASE)"
   fi
 
-  # 2. spawn the worker — unique agent name, NO --split (stray-pane bug), no focus
+  # Confinement (learned the hard way: the first live headless worker followed the
+  # task file's absolute path back into the MAIN repo and committed the orchestrator's
+  # uncommitted work). The task is COPIED into the worktree and the pointer names the
+  # copy + an explicit "do all work here" line; only the report may leave the worktree.
+  copy_task_into_wt() { # copy_task_into_wt <wt> -> echoes worktree-local task path
+    local wtask="$1/TASK-m2herd-$SLICE.md" excl
+    # (plan → stderr: this function's stdout is captured by the caller)
+    if [ "$DRY_RUN" -eq 1 ]; then plan "cp '$task' '$wtask' (+ git-exclude it in the worktree)" >&2; else
+      cp "$task" "$wtask"
+      excl="$(git -C "$1" rev-parse --git-path info/exclude 2>/dev/null || true)"
+      [ -n "$excl" ] && { grep -qxF "TASK-m2herd-$SLICE.md" "$excl" 2>/dev/null || echo "TASK-m2herd-$SLICE.md" >> "$excl"; }
+    fi
+    printf '%s' "$wtask"
+  }
+  confinement_line() { # confinement_line <wt> <branch>
+    printf 'You are CONFINED to the worktree %s (branch %s): do ALL reads, edits, and the commit there and NOWHERE else — never follow paths into the main repo checkout.' "$1" "$2"
+  }
+
+  # 2a. HEADLESS spawn — no pane, no TUI: nohup'd one-shot in the worktree.
+  #     Prompt stays a one-line pointer (file protocol); the report lands in $out
+  #     by instruction, the runner's own stdout (usage JSON for claude) in $lg.
+  if [ "$HEADLESS" -eq 1 ]; then
+    local out="$REPO/.m2herd/dispatch/$SLICE.out.md" lg="$REPO/.m2herd/dispatch/$SLICE.log" hpid="" wtask
+    wtask="$(copy_task_into_wt "$wt")"
+    local hprompt="$(confinement_line "$wt" "$branch") Read $wtask and follow its instructions exactly. Write your complete report to $out when done (the report file is the ONLY thing you write outside the worktree)."
+    if [ "$DRY_RUN" -eq 1 ]; then
+      case "$AGENT" in
+        claude)   plan "cd '$wt' && nohup claude -p '<pointer>' --model '$MODEL' --dangerously-skip-permissions --output-format json > '$lg' 2>&1 &" ;;
+        codex)    plan "cd '$wt' && nohup codex exec --dangerously-bypass-approvals-and-sandbox '<pointer>' > '$lg' 2>&1 &" ;;
+        opencode) plan "cd '$wt' && nohup opencode run '<pointer>' > '$lg' 2>&1 &" ;;
+      esac
+      record_worker "$SLICE" "-" "$wt" "$branch" "spawned" "headless" "$MODEL" ""
+      log "dispatch: dry-run headless plan complete for $SLICE"
+      return 0
+    fi
+    case "$AGENT" in
+      claude)   ( cd "$wt" && nohup claude -p "$hprompt" --model "$MODEL" --dangerously-skip-permissions --output-format json > "$lg" 2>&1 & echo $! > "$lg.pid" ) ;;
+      codex)    ( cd "$wt" && nohup codex exec --dangerously-bypass-approvals-and-sandbox "$hprompt" > "$lg" 2>&1 & echo $! > "$lg.pid" ) ;;
+      opencode) ( cd "$wt" && nohup opencode run "$hprompt" > "$lg" 2>&1 & echo $! > "$lg.pid" ) ;;
+    esac
+    hpid="$(cat "$lg.pid" 2>/dev/null || true)"; rm -f "$lg.pid"
+    [ -n "$hpid" ] || { echo "headless spawn failed (no pid) — see $lg" >&2; exit 1; }
+    record_worker "$SLICE" "-" "$wt" "$branch" "spawned" "headless" "$MODEL" "$hpid"
+    log "dispatch: done — $SLICE headless ($AGENT/$MODEL, pid $hpid), log $lg"
+    return 0
+  fi
+
+  # 2b. TUI spawn — unique agent name, NO --split (stray-pane bug), no focus
   local wname="$AGENT-m2herd-$SLICE" pane
   if [ "$DRY_RUN" -eq 1 ]; then
     plan "herdr agent start '$wname' --cwd '$wt' --no-focus -- \"\$(command -v $bin)\" $flag"
@@ -315,8 +393,10 @@ dispatch() {
     sleep 2   # let the TUI boot before the pointer lands
   fi
 
-  # 3. file-protocol dispatch: one-line pointer, settle, Enter
-  submit_pointer "$pane" "Read $task and follow its instructions exactly."
+  # 3. file-protocol dispatch: one-line pointer, settle, Enter — same confinement
+  #    as headless: the worker reads the task COPY inside its own worktree.
+  local wtask2; wtask2="$(copy_task_into_wt "$wt")"
+  submit_pointer "$pane" "$(confinement_line "$wt" "$branch") Read $wtask2 and follow its instructions exactly."
 
   # 4. record in overview.json workers[]
   record_worker "$SLICE" "$pane" "$wt" "$branch" "spawned"
@@ -339,6 +419,38 @@ collect() {
   fi
 
   [ -f "$OV" ] || { echo "no overview.json at $OV" >&2; exit 1; }
+  local wmode wpid
+  wmode="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .mode // "tui"' "$OV")"
+
+  # HEADLESS collect: wait for the pid to exit, then keep/derive the report and
+  # parse usage (tokens / cost) from the runner's JSON log into workers[].
+  if [ "$wmode" = "headless" ]; then
+    wpid="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .pid // empty' "$OV")"
+    local lg="$REPO/.m2herd/dispatch/$SLICE.log" waited=0 max=$((WAIT_TIMEOUT / 1000))
+    if [ -n "$wpid" ]; then
+      log "collect: waiting for headless $SLICE (pid $wpid, max ${max}s)"
+      while kill -0 "$wpid" 2>/dev/null; do
+        sleep 5; waited=$((waited + 5))
+        if [ "$waited" -ge "$max" ]; then
+          echo "headless worker $SLICE (pid $wpid) still running after ${max}s" >&2
+          set_worker_state "$SLICE" "failed"; exit 1
+        fi
+      done
+    fi
+    if [ ! -s "$out" ] && [ -s "$lg" ]; then
+      # worker didn't write its report file — salvage the runner's .result text
+      jq -r '.result // empty' "$lg" > "$out" 2>/dev/null || true
+    fi
+    [ -s "$out" ] || { echo "headless worker $SLICE produced no report ($out empty; see $lg)" >&2; set_worker_state "$SLICE" "failed"; exit 1; }
+    local tok cost
+    tok="$(jq -r '[.modelUsage[]?.outputTokens] | add // empty' "$lg" 2>/dev/null || true)"
+    cost="$(jq -r '[.modelUsage[]?.costUSD] | add // empty' "$lg" 2>/dev/null || true)"
+    set_worker_state "$SLICE" "done"
+    set_worker_usage "$SLICE" "${tok:-}" "${cost:-}"
+    log "collect: done — $SLICE headless state=done${tok:+, ${tok} out-tokens}${cost:+, \$${cost}}, report at $out"
+    return 0
+  fi
+
   pane="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .pane_id // empty' "$OV")"
   [ -n "$pane" ] || { echo "slice '$SLICE' not in overview.json workers[] — dispatch it first" >&2; exit 1; }
   is_self "$pane" && { echo "worker pane for $SLICE is \$SELF ($pane) — refusing" >&2; exit 1; }

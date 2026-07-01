@@ -44,7 +44,7 @@ This skill teaches an agent how to:
 | 13 | Meta-orchestration (`fleet-loop.sh`) | Be the orchestrator of orchestrators: launch + oversee one orchestrator per mission (each driving its own herd), `/goal`-armed to self-drive — `fleet-control/` |
 | 14 | Dispatch nudge (hooks) | Claude Code `UserPromptSubmit` + Hermes `pre_llm_call` hooks that re-check "should this herd?" every turn, by default — proposes a plan, never auto-spawns |
 | 15 | Context budgeting & decomposer (Hermes) | keep the orchestrator within a token budget (default GLM-5.2/384k); decompose into budget-sized slice manifests; hooks offload context on demand |
-| 16 | m2herd — the Fable main-orchestrator context fabric | Claude Code (Fable) as the MAIN orchestrator: a per-repo, gitignored `.m2herd/` holds the context while the orchestrator holds pointers — note/refile/resume/sync/archive/gist via `m2herd`, a 1-orchestrator + 1-notes-pane workspace via `m2herd-up`, three Claude Code hooks as the heartbeat |
+| 16 | m2herd — the Fable main-orchestrator context fabric | Claude Code (Fable) as the MAIN orchestrator: a per-repo, gitignored `.m2herd/` holds the context while the orchestrator holds pointers — note/refile/resume/sync/archive/gist via `m2herd`, a 1-orchestrator + 1-machineroom-pane workspace via `m2herd-up`, three Claude Code hooks as the heartbeat |
 
 See [`skill/SKILL.md`](./skill/SKILL.md) for the full reference and
 [`skill/reference.md`](./skill/reference.md) for verbatim CLI/socket docs.

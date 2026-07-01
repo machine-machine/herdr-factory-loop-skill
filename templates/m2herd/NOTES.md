@@ -1,5 +1,5 @@
 <!--
-.m2herd/NOTES.md — the central notes file of the m2herd context fabric. A notes pane
+.m2herd/NOTES.md — the central notes file of the m2herd context fabric. The machineroom pane
 live-views this file (`watch -n 2 -t cat .m2herd/NOTES.md`).
 
 Append entries with:   m2herd.sh note "text"        → "- [<UTC ts>] text" lands below the marker
