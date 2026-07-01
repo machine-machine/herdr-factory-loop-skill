@@ -89,9 +89,10 @@ init() {
   resolve_dir
   local tmpl m2="$DIR/.m2herd"
   tmpl="$(tmpl_dir)" || { echo "templates/m2herd/ not found next to $0" >&2; exit 1; }
-  mkdir -p "$m2/context" "$m2/dispatch"
+  mkdir -p "$m2/context" "$m2/dispatch" "$m2/inbox"
   [ -f "$m2/RESUME.md" ] || cp "$tmpl/RESUME.md" "$m2/RESUME.md"
   [ -f "$m2/NOTES.md" ]  || cp "$tmpl/NOTES.md"  "$m2/NOTES.md"
+  [ -f "$m2/inbox/STEER.md" ] || cp "$tmpl/inbox/STEER.md" "$m2/inbox/STEER.md"
   if [ ! -f "$m2/overview.json" ]; then
     jq --arg g "$GOAL" --arg ts "$(ts)" '.goal=$g | .updated_at=$ts' "$tmpl/overview.json" > "$m2/overview.json"
   else
@@ -331,6 +332,9 @@ next_cmd() {
   if ! drift_report >/dev/null; then
     echo "NEXT: context drift — run: m2herd sync"; return 0
   fi
+  if [ -f "$m2/inbox/STEER.md" ] && has_ink "$(live_tail "$m2/inbox/STEER.md")"; then
+    echo "NEXT: drain steering — read .m2herd/inbox/STEER.md, act, then clear below the marker"; return 0
+  fi
   if [ -z "$(jq -r '.done_when // ""' "$(OV)")" ]; then
     echo "NEXT: coach the intent — set done_when + record open_questions (m2herd.sh has no opinion; you do)"; return 0
   fi
@@ -349,69 +353,119 @@ next_cmd() {
 }
 
 # ---------- dashboard: tier-1 TUI — a pure read-only renderer -----------------
-# One writer (the orchestrator), many watchers: this code path NEVER writes.
+# One writer (the orchestrator), many watchers: this code path NEVER writes state.
+# herdr READS (agent list) are allowed; herdr sends/closes are FORBIDDEN here.
 epoch_of() { date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || date -u -d "$1" +%s 2>/dev/null || echo 0; }
-age_of() { # humanize an ISO-8601 UTC timestamp → 42s / 3m / 7h / 4d
-  local e now d; e="$(epoch_of "${1:-}")"
-  [ "${e:-0}" -gt 0 ] || { echo "?"; return 0; }
-  now="$(date -u +%s)"; d=$((now - e)); [ "$d" -ge 0 ] || d=0
+age_secs() { # epoch → humanized 42s / 3m / 7h / 4d
+  local now d
+  [ "${1:-0}" -gt 0 ] || { echo "?"; return 0; }
+  now="$(date -u +%s)"; d=$((now - $1)); [ "$d" -ge 0 ] || d=0
   if   [ "$d" -lt 60 ];    then echo "${d}s"
   elif [ "$d" -lt 3600 ];  then echo "$((d/60))m"
   elif [ "$d" -lt 86400 ]; then echo "$((d/3600))h"
   else                          echo "$((d/86400))d"; fi
 }
+age_of() { age_secs "$(epoch_of "${1:-}")"; }
 
-dashboard() {
-  resolve_dir; need_init
-  local m2="$DIR/.m2herd" B="" D="" G="" Y="" R=""
-  if [ -t 1 ] && command -v tput >/dev/null 2>&1; then   # colors only on a tty; plain when piped
-    B="$(tput bold 2>/dev/null || true)"; D="$(tput dim 2>/dev/null || true)"
-    G="$(tput setaf 2 2>/dev/null || true)"; Y="$(tput setaf 3 2>/dev/null || true)"
-    R="$(tput sgr0 2>/dev/null || true)"
-  fi
-  # 1. header: goal • status • done_when • drift dot • humanized age
-  local goal st dw up dot
-  goal="$(jq -r 'if (.goal//"")=="" then "(none)" else .goal end' "$(OV)")"
-  st="$(jq -r '.status//"active"' "$(OV)")"
-  dw="$(jq -r 'if (.done_when//"")=="" then "(not coached)" else .done_when end' "$(OV)")"
-  up="$(jq -r '.updated_at//""' "$(OV)")"
-  if drift_report >/dev/null; then dot="${G}●${R}"; else dot="${Y}◐ drift${R}"; fi
-  printf '%sm2herd%s %s • %s • done: %s • %s • %s ago\n' "$B" "$R" "$goal" "$st" "$dw" "$dot" "$(age_of "$up")"
-  # 2. the self-prompt (same code path as `next`)
-  next_cmd
-  # 3. AREAS: staleness ages make rot visible; archived rendered dim, one line
-  echo
-  printf '%sAREAS%s\n' "$B" "$R"
+# budget row from the newest /tmp/claude-ctx-*.json bridge file; silent no-op when none
+budget_row() {
+  local f="" c pct budget mt filled bar
+  for c in $(ls -t /tmp/claude-ctx-*.json 2>/dev/null); do
+    if jq -e '.used_pct|numbers' "$c" >/dev/null 2>&1; then f="$c"; break; fi
+  done
+  [ -n "$f" ] || return 0
+  pct="$(jq -r '.used_pct' "$f")"; pct="${pct%.*}"; [ -n "$pct" ] || pct=0
+  budget="$(jq -r '.budget // 384000' "$f")"
+  filled=$((pct * 20 / 100)); [ "$filled" -le 20 ] || filled=20; [ "$filled" -ge 0 ] || filled=0
+  bar="$(printf '%*s' "$filled" '' | tr ' ' '█')$(printf '%*s' "$((20 - filled))" '' | tr ' ' '░')"
+  mt="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)"
+  printf 'budget:    %s %s%% of %s · updated %s ago\n' "$bar" "$pct" "$budget" "$(age_secs "$mt")"
+}
+
+# plain (uncolored) blocks so the side-by-side column merge pads correctly
+render_areas() {
   local names n astatus rel aage
+  echo "AREAS"
   names="$(jq -r '(.areas//[])[].name' "$(OV)")"
-  [ -n "$names" ] || echo "  (no areas yet)"
+  [ -n "$names" ] || { echo "  (no areas yet)"; return 0; }
   for n in $names; do
     astatus="$(jq -r --arg n "$n" '[.areas[]|select(.name==$n)|(.status//"active")][0]' "$(OV)")"
     rel="$(jq -r --arg n "$n" '[.areas[]|select(.name==$n)|(.related//[])|join(", ")][0] // ""' "$(OV)")"
-    aage="$(age_of "$(hdr_get "$m2/context/$n/context.md" updated)")"
+    aage="$(age_of "$(hdr_get "$DIR/.m2herd/context/$n/context.md" updated)")"
     if [ "$astatus" = "archived" ]; then
-      printf '  %s%-14s archived  %s%s\n' "$D" "$n" "$aage" "$R"
+      printf '  %-14s archived  %s\n' "$n" "$aage"
     else
       printf '  %-14s active    %-5s %s\n' "$n" "$aage" "${rel:+(related: $rel)}"
     fi
   done
-  # 4. WORKERS (only when non-empty)
-  if [ "$(jq -r '(.workers//[])|length' "$(OV)")" -gt 0 ]; then
-    echo
-    printf '%sWORKERS%s\n' "$B" "$R"
-    jq -r '(.workers//[])[] | "  " + .slice + "  [" + (.state//"?") + "]  " + (.branch//"-")' "$(OV)"
+}
+# desired vs observed: ONE `herdr agent list` query; mismatch marked "!"; degrades to "-"
+render_workers() {
+  local agents="" slice desired pane branch obs mark
+  command -v herdr >/dev/null 2>&1 && agents="$(herdr agent list 2>/dev/null || true)"
+  echo "WORKERS"
+  printf '  %-10s %-9s %-10s %s\n' "slice" "desired" "observed" "branch"
+  jq -r '(.workers//[])[] | [.slice, (.state//"?"), (.pane_id//""), (.branch//"-")] | join("\u001f")' "$(OV)" \
+  | while IFS=$'\x1f' read -r slice desired pane branch; do
+      obs="-"; mark=""
+      if [ -n "$agents" ]; then
+        obs="$(jq -r --arg p "$pane" '[.result.agents[]? | select(.pane_id==$p) | .agent_status][0] // "gone"' <<<"$agents")"
+        case "$desired:$obs" in
+          spawned:idle|spawned:gone|working:idle|working:gone|done:working|failed:working) mark=" !" ;;
+        esac
+      fi
+      printf '  %-10s %-9s %-10s %s\n' "$slice" "$desired" "$obs$mark" "$branch"
+    done
+}
+
+dashboard() {
+  resolve_dir; need_init
+  local m2="$DIR/.m2herd" B="" D="" G="" Y="" R="" cols=80
+  if [ -t 1 ] && command -v tput >/dev/null 2>&1; then   # colors only on a tty; plain when piped
+    B="$(tput bold 2>/dev/null || true)"; D="$(tput dim 2>/dev/null || true)"
+    G="$(tput setaf 2 2>/dev/null || true)"; Y="$(tput setaf 3 2>/dev/null || true)"
+    R="$(tput sgr0 2>/dev/null || true)"
+    cols="$(tput cols 2>/dev/null || echo 80)"
   fi
-  # 5. OPEN QUESTIONS (only when non-empty)
+  # header: m2herd · <repo> ── ● <status> · drift ✓|◐  + goal / done_when / budget rows
+  local goal st dw sdot dmark
+  goal="$(jq -r 'if (.goal//"")=="" then "(none)" else .goal end' "$(OV)")"
+  st="$(jq -r '.status//"active"' "$(OV)")"
+  dw="$(jq -r 'if (.done_when//"")=="" then "(not coached)" else .done_when end' "$(OV)")"
+  if drift_report >/dev/null; then dmark="${G}✓${R}"; else dmark="${Y}◐${R}"; fi
+  case "$st" in active) sdot="${G}●${R}" ;; paused) sdot="${Y}●${R}" ;; *) sdot="●" ;; esac
+  printf '%sm2herd%s · %s ── %s %s · drift %s\n' "$B" "$R" "$(basename "$DIR")" "$sdot" "$st" "$dmark"
+  printf 'goal:      %s\n' "$goal"
+  printf 'done_when: %s\n' "$dw"
+  budget_row
+  echo
+  # the self-prompt (same code path as `next`)
+  next_cmd
+  echo
+  # AREAS + WORKERS: side-by-side on a wide tty (>=100 cols), stacked otherwise
+  local ablock wblock=""
+  ablock="$(render_areas)"
+  if [ "$(jq -r '(.workers//[])|length' "$(OV)")" -gt 0 ]; then wblock="$(render_workers)"; fi
+  if [ -n "$wblock" ] && [ "$cols" -ge 100 ]; then
+    paste -d $'\t' <(printf '%s\n' "$ablock") <(printf '%s\n' "$wblock") \
+      | awk -F'\t' '{printf "%-52s %s\n", $1, $2}'
+  else
+    printf '%s\n' "$ablock"
+    if [ -n "$wblock" ]; then echo; printf '%s\n' "$wblock"; fi
+  fi
+  # OPEN QUESTIONS (only when non-empty)
   if [ "$(jq -r '(.open_questions//[])|length' "$(OV)")" -gt 0 ]; then
     echo
     printf '%sOPEN QUESTIONS%s\n' "$B" "$R"
     jq -r '(.open_questions//[])[] | "  - " + .' "$(OV)"
   fi
-  # 6. NOTES tail: last 5 content lines below the marker
+  # NOTES tail: last 5 content lines below the marker
   echo
   printf '%sNOTES%s (last 5)\n' "$B" "$R"
   local tail5; tail5="$(live_tail "$m2/NOTES.md" | awk 'NF' | tail -5)"
   if [ -n "$tail5" ]; then printf '%s\n' "$tail5" | sed 's/^/  /'; else echo "  (empty)"; fi
+  echo
+  printf '%sread-only · steering: .m2herd/inbox/STEER.md%s\n' "$D" "$R"
 }
 
 # ---------- selftest: tmpdir end-to-end ---------------------------------------
@@ -448,6 +502,13 @@ selftest() {
     fail "NOTES.md live section not reset after refile"
   fi
   grep -qxF '.m2herd/' "$td/.gitignore" || fail ".m2herd/ not gitignored"
+  [ -f "$td/.m2herd/inbox/STEER.md" ] || fail "init did not scaffold inbox/STEER.md"
+
+  # next STEER case: live steering outranks coach-intent (done_when is still empty here)
+  printf 'PAUSE everything please\n' >> "$td/.m2herd/inbox/STEER.md"
+  "$self" next --dir "$td" | grep -q '^NEXT: drain steering' || fail "next(steer): want drain-steering"
+  keep_head "$td/.m2herd/inbox/STEER.md" > "$td/.m2herd/inbox/STEER.md.new" \
+    && mv "$td/.m2herd/inbox/STEER.md.new" "$td/.m2herd/inbox/STEER.md"
 
   # next case 2: done_when empty → coach the intent
   "$self" next --dir "$td" | grep -q '^NEXT: coach the intent' || fail "next(2): want coach-the-intent"
@@ -509,6 +570,8 @@ selftest() {
   printf '%s\n' "$dash" | grep -q '^NEXT: ' || fail "dashboard missing the NEXT line"
   printf '%s\n' "$dash" | grep -q '^  demo .*active' || fail "dashboard missing the active area row"
   printf '%s\n' "$dash" | grep -q 'extra .*archived' || fail "dashboard missing the archived area row"
+  printf '%s\n' "$dash" | grep -q '^m2herd · .* · drift' || fail "dashboard missing the boxed header line"
+  printf '%s\n' "$dash" | grep -q '^read-only · steering: .m2herd/inbox/STEER.md$' || fail "dashboard missing the footer"
 
   echo "selftest: PASS"
 }
