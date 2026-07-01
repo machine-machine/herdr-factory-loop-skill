@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 1.6.1
+version: 1.7.0
 description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator). ALSO trigger for meta-orchestration — when the user wants to be the "meta-orchestrator" / "orchestrator of orchestrators", oversee or launch multiple orchestrators (each driving its own herd of workers) across several missions/repos, or drive a portfolio of parallel missions with /goal-based autonomy (fleet-loop.sh / fleet-control).
 ---
 
@@ -569,6 +569,53 @@ or escalate the rest to `stages/<stage>/review/` → collect finished missions �
 - Cross-mission merges to `main` / prod deploys are escalated to the human even when a single
   mission's orchestrator was authorized for its own scope (`_config/gate_policy.md`).
 
+### 14. Default-on dispatch nudge — hooks for Claude Code + Hermes
+
+§9.1–§13 tell *you* when to consider herding. §14 makes that check happen automatically, on
+every turn, so the user doesn't have to say "herdr" first — without ever removing the human
+confirmation gate before anything gets spawned.
+
+**What it is.** `hooks/herdr-dispatch-nudge.sh`, installed by `scripts/install.sh` and wired into:
+
+| Platform | Event | Registered in |
+|----------|-------|----------------|
+| Claude Code | `UserPromptSubmit` (fires every turn) | `~/.claude/settings.json` → `.hooks.UserPromptSubmit` |
+| Hermes | `pre_llm_call` (fires every turn — Hermes's `UserPromptSubmit` equivalent) | `~/.hermes/config.yaml` → `hooks.pre_llm_call` |
+| Cursor | — | not installed; Cursor has no shell-hook mechanism (see `shared/goal_support.md`) |
+
+Both events support context injection. The script discards its stdin payload and always returns
+the same short reminder — it does not parse the prompt or make any decision itself:
+
+> herdr: before starting multi-part or channel-relayed work, check whether it decomposes into
+> ≥2 independent slices (different files/services/features) — see the herdr skill Sections 9
+> (herd), 11 (SDD), 13 (meta-orchestration). If it does, propose a short plan (slices, base
+> branch, worker count/type) and get explicit user/channel confirmation BEFORE spawning any
+> herdr agent, worktree, or branch. Never auto-spawn workers without that confirmation. Trivial
+> or single-file asks: just do the work inline, no herd.
+
+**Why a hook and not a heuristic in the hook itself.** A deterministic script cannot judge
+decomposability — that's still the model's job, informed by §9.1–§13. The hook's only role is
+to make sure the model re-runs that judgment every turn instead of only when a user happens to
+say "herdr" or "spawn workers". The confirm-before-spawn rule (§9.1 step 7, §9.7) is unchanged
+and non-negotiable: this hook widens *when* the herd question gets asked, never *who* answers it.
+
+**Install.** On by default for claude/hermes targets:
+```bash
+./scripts/install.sh                 # installs skill + nudge hook for claude, hermes, cursor
+./scripts/install.sh --no-nudge-hook # skip the hook, skill only
+./scripts/install.sh --uninstall     # removes both the skill symlink and the hook registration
+```
+Idempotent (dedupes by command string) and non-destructive — a timestamped `.bak-<ts>` copy of
+`settings.json`/`config.yaml` is written before every edit. Requires `jq` (Claude) and
+[`yq`](https://github.com/mikefarah/yq) v4 (Hermes); if either is missing, the hook file is still
+symlinked in but registration is skipped with a warning (wire it up by hand from the table above).
+
+**Hermes non-interactive gotcha.** Hermes's shell-hook consent model prompts on first use and
+persists the decision — but non-interactive runs (gateway, cron, channel-driven work, exactly
+the §9 "intent arrives over a chat channel" case this hook is meant to help with) can't answer
+that prompt. Set one of `--accept-hooks`, `HERMES_ACCEPT_HOOKS=1`, or `hooks_auto_accept: true`
+in `config.yaml`, or the hook silently never fires there.
+
 ---
 
 ## Integrations
@@ -639,5 +686,6 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 | SDD factory loop | `/speckit.specify` → `/speckit.clarify` → `/speckit.plan` → `/speckit.tasks` → herd the `[P]` tasks (§11.2) → `/speckit.analyze` → converge vs `spec.md` → compound (§11) |
 | Meta-orchestrate | `scripts/fleet-loop.sh init\|tick\|run\|status` over a `templates/fleet-control/` workspace — one orchestrator per mission in `missions.tsv`, each `/goal`-armed to self-drive its herd; meta launches/oversees/converges (§13) |
 | Which orchestrator? | `cat ~/.config/herdr-factory/config.toml` |
+| Dispatch nudge (hooks) | `./scripts/install.sh` wires `hooks/herdr-dispatch-nudge.sh` into Claude's `UserPromptSubmit` + Hermes's `pre_llm_call` — a per-turn reminder to consider herding, never an auto-spawn (§14) |
 
 Full CLI + socket reference: [reference.md](reference.md).
