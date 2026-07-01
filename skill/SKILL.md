@@ -1,7 +1,7 @@
 ---
 name: herdr
-version: 1.9.0
-description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator). ALSO trigger for meta-orchestration — when the user wants to be the "meta-orchestrator" / "orchestrator of orchestrators", oversee or launch multiple orchestrators (each driving its own herd of workers) across several missions/repos, or drive a portfolio of parallel missions with /goal-based autonomy (fleet-loop.sh / fleet-control).
+version: 2.0.0
+description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator). ALSO trigger for meta-orchestration — when the user wants to be the "meta-orchestrator" / "orchestrator of orchestrators", oversee or launch multiple orchestrators (each driving its own herd of workers) across several missions/repos, or drive a portfolio of parallel missions with /goal-based autonomy (fleet-loop.sh / fleet-control). ALSO trigger for m2herd — the Claude Code (Fable) main-orchestrator context fabric — when the user mentions m2herd, .m2herd, "context fabric", wants to offload context into the repo folder (the folder holds the context, the orchestrator holds pointers), refile or archive notes/areas, push a project gist to fleet memory, or come back to a project via the resume file (RESUME.md).
 ---
 
 # herdr Skill
@@ -747,6 +747,163 @@ budget-aligned values (idempotent, backed up, touches only those keys, `--dry-ru
 tiers and the lossy-live / lossless-folder contract are documented as L3 reference in
 [`_config/budget_policy.md`](templates/herd-control/_config/budget_policy.md).
 
+### 16. m2herd — the Fable main-orchestrator context fabric
+
+§15 keeps a **Hermes** orchestrator inside a token budget over a `herd-control/` workspace.
+§16 is the Claude-Code-native superset of the §12/§15 herd-control concepts: **Claude Code
+(Fable) is the MAIN orchestrator**, and every repo it orchestrates carries a `.m2herd/`
+context fabric at the repo root (gitignored). The base doctrine is one line: **the folder
+holds the context, the orchestrator holds pointers.** The orchestrator keeps only the most
+important things in its live window and offloads everything else into `.m2herd/`, from which
+it can delegate any piece to herdr workers at will. The fabric is an **agentic loop — the
+machine prompts itself from its own state**. Its doctrine pillars:
+
+- **Living harness loop.** The folder is a living harness: the hooks are the heartbeat
+  (SessionStart orients, PostToolUse watches the budget, PreCompact refiles before compaction
+  eats notes), and **`m2herd next` is the pulse they inject** — every wake-up delivers
+  orientation AND the next move, derived mechanically from the folder's own state. **Drift is
+  an ERROR**: `m2herd.sh sync --check` exits **3** with a human-readable drift report when
+  `overview.json` and the `context/` tree disagree (missing areas, orphan entries); plain
+  `sync` repairs. Drift is case 1 of `next`, so a drifted fabric prompts its own repair.
+- **The orchestrator is also the INTENT COACH.** A fuzzy goal is not dispatchable. The
+  orchestrator's first job is to sharpen intent into `goal` + `done_when` + slices, recording
+  what it cannot resolve as `open_questions` instead of guessing. An empty `done_when` means
+  "intent not yet coached", and `next` refuses to move past it.
+- **Self-documentation.** Every refile IS the documentation act; nothing lives only in the
+  live window. Offloading context and documenting the project are the same motion.
+- **Memory tiers — division of labor.** `.m2herd/` is the PROJECT's working memory (files,
+  links, state — things you point workers at). AMS (memory.machinemachine.ai) is the FLEET's
+  recall (searchable gists, cross-project). `~/.claude` auto-memory is the orchestrator's own
+  lessons. `.m2herd` never tries to be a vector store; AMS never holds file trees.
+  `m2herd.sh gist [--push]` is the bridge between the tiers.
+- **Decay discipline.** Living ≠ hoarding. `m2herd.sh archive --area A` distills a done area
+  down to its header + a short summary while `deep/` stays lossless — the fabric stays small
+  enough to stay true.
+
+#### 16.1 The `.m2herd/` layout
+
+`m2herd.sh init` scaffolds this from `templates/m2herd/` (seed files carry a `<!-- marker -->`
+line separating template boilerplate from live content) and appends `.m2herd/` to the repo's
+`.gitignore` — both idempotent:
+
+```
+.m2herd/
+  overview.json               # central machine-readable index (goal, status, areas[], workers[])
+  RESUME.md                   # come-back file: where we are, in-flight work, next 3 commands
+  NOTES.md                    # central notes file (the notes pane live-views this)
+  context/<area>/context.md   # distilled per-area context; annotation header below
+  context/<area>/deep/        # lossless deep-dives (worker outputs, logs, transcripts)
+  dispatch/<slice>.task.md    # worker task files (§4 file protocol)
+  dispatch/<slice>.out.md     # worker answers
+```
+
+`overview.json` is the index the orchestrator navigates by: `goal`, `done_when` (the coached
+completion condition — `init --goal` seeds it empty, and empty means "intent not yet coached"),
+`open_questions[]` (what the intent coach could not resolve — recorded, never guessed),
+`status` (`active|paused|done`), `updated_at`, `areas[]` (`name`/`path`/`summary`/`related`,
+plus `status: "active"|"archived"`, default `"active"`), `workers[]` (slice → pane_id /
+worktree / branch / `state: spawned|working|done|failed` / task / out; may be `[]`), and
+`notes_file`/`resume_file` pointers. Writers always rewrite the whole file with jq — no sed
+patching. Every `context/<area>/context.md` opens with the annotation header so the
+orchestrator can hop between sibling areas without loading them:
+
+```
+---
+area: <name>
+related: [<other area names>]   # where to find the sibling pieces
+deep: ./deep/                   # lossless material for this area
+updated: <ISO-8601 UTC>
+---
+```
+
+#### 16.2 The engine — `scripts/m2herd.sh`
+
+Mechanical, idempotent bash (herd-loop.sh style); jq required. `--dir` defaults to `$PWD`.
+install.sh symlinks it onto PATH as `m2herd` (§16.5).
+
+```
+m2herd.sh init   [--dir P] [--goal "…"]   # scaffold .m2herd/ from templates/m2herd/, gitignore it
+m2herd.sh status [--dir P]                # render overview.json human-readably
+m2herd.sh note   [--dir P] "text"         # append "- [<UTC ts>] text" to NOTES.md
+m2herd.sh refile [--dir P] --area A       # create/refresh context/A/ (+header), move NOTES.md content below the marker into it, update overview.json
+m2herd.sh resume [--dir P]                # print RESUME.md + one line per area from overview.json
+m2herd.sh sync   [--dir P]                # regenerate overview.json areas[] from the context/ tree; refresh RESUME.md skeleton preserving hand-written notes
+m2herd.sh sync   [--dir P] --check        # drift detector: exit 3 + human-readable report when overview.json and context/ disagree; plain sync repairs
+m2herd.sh archive [--dir P] --area A      # decay: distill a done area's context.md to header + ≤10 summary lines (status: archived); deep/ stays lossless; overview.json entry gets "status":"archived"
+m2herd.sh gist   [--dir P] [--push]       # one-paragraph project gist (goal, status, one line per active area); --push pipes it to $M2HERD_GIST_CMD if set (the --llm pattern), else prints it with a note
+m2herd.sh next   [--dir P]                # self-prompting primitive: mechanical priority walk (NO LLM calls), prints exactly one line starting "NEXT: "
+m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync → status → resume (+ next cases); asserts schema fields with jq
+```
+
+`next` is the pulse of the agentic loop — it walks a fixed priority ladder and prints exactly
+one `NEXT: ` line, so the machine always knows its next move without an LLM in the loop:
+
+1. drift (`sync --check` logic fails) → `NEXT: context drift — run: m2herd sync`
+2. `done_when` empty → `NEXT: coach the intent — set done_when + record open_questions`
+3. loose content in NOTES.md below the marker → `NEXT: refile notes — run: m2herd refile --area <pick>`
+4. a `workers[]` entry `spawned|working` whose pane is gone/idle → `NEXT: collect worker <slice> — run: m2herd-up collect --slice <slice>`
+5. `open_questions` non-empty → `NEXT: resolve open question: <first>`
+6. otherwise → `NEXT: compare RESUME.md against goal/done_when and dispatch or finish`
+
+The daily loop: `note` whatever matters the moment it matters → `refile --area A` when a topic
+has gathered enough notes (this is the documentation act) → `resume` when you come back →
+`sync --check` when anything smells stale (exit 3 = drift; run `sync` to repair) →
+`archive --area A` when an area is done → `gist --push` to publish the project's one-paragraph
+state to fleet memory — or simply run `m2herd next` and do what it says. `status`/`resume`
+show archived areas as a one-line footer, not full entries.
+
+#### 16.3 The workspace — `scripts/m2herd-up.sh`
+
+The workspace shape is fixed: **exactly ONE orchestrator pane (claude) + ONE notes pane**
+live-viewing `NOTES.md` (`watch -n 2 -t cat .m2herd/NOTES.md` if `watch` exists, else a
+`while :; do clear; cat .m2herd/NOTES.md; sleep 2; done` bash loop). On PATH as `m2herd-up`.
+
+```
+m2herd-up.sh up       [--repo P] [--goal "…"]      # ensure herdr workspace for repo: the one-orchestrator + one-notes-pane shape; runs m2herd.sh init if missing
+m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor]
+                                                    # worktree wip/m2herd-<S> off BASE (default: current branch), spawn worker, file-protocol dispatch of .m2herd/dispatch/S.task.md, record in overview.json workers[]
+m2herd-up.sh collect  --slice S [--repo P]          # wait idle, copy worker report to dispatch/S.out.md, update workers[] state
+m2herd-up.sh --dry-run <same args>                  # print every herdr/git command instead of running it
+```
+
+It follows the binding herdr rules from this skill: identify `$SELF` first and never touch it
+(§2); after `agent start` RE-RESOLVE the pane by cwd from `herdr agent list` (the returned
+pane_id can be off by one); no `--split` (stray-pane bug); settle ~1s between `agent send` and
+Enter (§4).
+
+#### 16.4 The three Claude Code hooks
+
+The heartbeat of the living harness. All three key on `.m2herd/` presence in the cwd (or
+`$M2HERD_DIR`), silent-fail, never block, and call `command -v m2herd`, degrading silently
+when the engine isn't on PATH:
+
+| Hook | Event | What it does |
+|------|-------|--------------|
+| `hooks/m2herd-session.sh` | `SessionStart` | Injects a digest — overview.json goal/status/areas count + first 30 lines of RESUME.md — as `{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext}}`, then appends the output of `m2herd next` (when the binary exists; bounded ~3s; silent-fail): every wake-up = orientation + the next move. bash + jq, bounded stdin read, always exit 0. |
+| `hooks/m2herd-precompact.sh` | `PreCompact` | Injects `additionalContext` instructing the model to refresh RESUME.md + overview.json and refile loose NOTES.md content into `context/<area>/` BEFORE compaction proceeds — compaction never eats un-refiled notes. Keeps its own drift nudge (run `m2herd sync` when overview.json and context/ disagree). Never blocks (exit 0 always). |
+| `hooks/m2herd-budget.js` | `PostToolUse` | The §15 budget watcher, natively for Claude Code: same bridge file (`/tmp/claude-ctx-<session>.json`), same 60/75/85% thresholds, debounce, and traversal guard as `herdr-context-budget.js` — but keyed on `.m2herd/` presence, and the advisory tells the orchestrator to offload into `.m2herd/context/<area>/` + refresh RESUME.md. `hookEventName` is ALWAYS `"PostToolUse"`. Silent-fail. |
+
+#### 16.5 Install
+
+Part of the **claude** target of `scripts/install.sh` (on by default):
+
+```bash
+./scripts/install.sh --claude            # skill + nudge hook + the three m2herd hooks + PATH symlinks
+./scripts/install.sh --no-m2herd-hooks   # skip the m2herd hook registration (files still symlinked)
+./scripts/install.sh --uninstall         # removes hook entries, hook symlinks, and PATH symlinks
+```
+
+It symlinks the three hook files into `~/.claude/hooks/`, registers them in
+`~/.claude/settings.json` (`m2herd-session.sh` → `.hooks.SessionStart`,
+`m2herd-precompact.sh` → `.hooks.PreCompact`, `m2herd-budget.js` → `.hooks.PostToolUse` with
+matcher `Bash|Edit|Write|MultiEdit|Agent|Task`, all `timeout: 10`), and symlinks
+`scripts/m2herd.sh` → `~/.local/bin/m2herd` and `scripts/m2herd-up.sh` → `~/.local/bin/m2herd-up`.
+Idempotent — dedupe and uninstall are keyed on the hook FILENAME (not the full command string,
+which embeds a node path that changes across upgrades); a timestamped `.bak-<ts>` copy of
+`settings.json` is written before every edit; the `.js` hook is skipped with a warning when
+`node` is missing (the two bash hooks still register). `./scripts/onboard.sh` wires all of
+this in when the chosen orchestrator is claude (or `all`).
+
 ---
 
 ## Integrations
@@ -818,5 +975,6 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 | Meta-orchestrate | `scripts/fleet-loop.sh init\|tick\|run\|status` over a `templates/fleet-control/` workspace — one orchestrator per mission in `missions.tsv`, each `/goal`-armed to self-drive its herd; meta launches/oversees/converges (§13) |
 | Which orchestrator? | `cat ~/.config/herdr-factory/config.toml` |
 | Dispatch nudge (hooks) | `./scripts/install.sh` wires `hooks/herdr-dispatch-nudge.sh` into Claude's `UserPromptSubmit` + Hermes's `pre_llm_call` — a per-turn reminder to consider herding, never an auto-spawn (§14) |
+| m2herd context fabric | `m2herd init\|note\|refile\|resume\|sync --check\|archive\|gist --push\|next` over the repo's `.m2herd/`; `m2herd-up up\|dispatch\|collect` for the 1-orchestrator + 1-notes-pane workspace — folder holds the context, orchestrator holds pointers, `next` is the machine's own next move (§16) |
 
 Full CLI + socket reference: [reference.md](reference.md).

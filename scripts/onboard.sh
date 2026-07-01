@@ -160,6 +160,10 @@ step "3/6  Install the herdr skill for $ORCHESTRATOR"
 say "  Also wires up the dispatch-nudge hook (skill/SKILL.md §14): a per-turn"
 say "  reminder to consider fanning decomposable work out to herdr workers —"
 say "  it never spawns anything itself, only proposes; you still confirm."
+say "  For Claude Code the install also registers the three m2herd hooks"
+say "  (SessionStart / PreCompact / PostToolUse — skill/SKILL.md §16) and puts"
+say "  m2herd + m2herd-up on PATH (~/.local/bin), so the per-repo .m2herd/"
+say "  context fabric orients every session; skip with --no-m2herd-hooks."
 case "$ORCHESTRATOR" in
   claude) "$SCRIPT_DIR/install.sh" --local --claude ;;
   hermes) "$SCRIPT_DIR/install.sh" --local --hermes ;;

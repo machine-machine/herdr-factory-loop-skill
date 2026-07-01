@@ -4,6 +4,67 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.0.0] - 2026-07-02
+
+m2herd: the Fable main-orchestrator context fabric. **Claude Code (Fable) is the MAIN
+orchestrator**; every repo it orchestrates carries a gitignored `.m2herd/` at the repo root —
+the Claude-Code-native superset of the §12/§15 herd-control concepts. Doctrine: **the folder
+holds the context, the orchestrator holds pointers**, and the fabric is an **agentic loop —
+the machine prompts itself from its own state**. Pillars: the *living harness loop* (the hooks
+are the heartbeat, `m2herd next` is the pulse they inject; drift is an error — `sync --check`
+exits 3), the *intent coach* (a fuzzy goal is not dispatchable: sharpen it into `goal` +
+`done_when` + slices, record `open_questions` instead of guessing), *self-documentation*
+(every refile IS the documentation act; nothing lives only in the live window), *memory tiers*
+(`.m2herd/` = project working memory, AMS = fleet recall, `~/.claude` = the orchestrator's own
+lessons; `gist --push` is the bridge), and *decay discipline* (`archive --area`; living ≠
+hoarding). Built as a 4-slice herd against the pre-committed `CONTRACT-m2herd.md` (v1.2).
+
+### Added
+- **`scripts/m2herd.sh`** (slice A — the engine) — mechanical, idempotent bash over `.m2herd/`:
+  `init` (scaffold from `templates/m2herd/`, gitignore it), `status`, `note` (timestamped append
+  to NOTES.md), `refile --area A` (move loose notes below the marker into `context/A/` + update
+  `overview.json`), `resume` (RESUME.md + one line per area), `sync` (regenerate `areas[]` from
+  the `context/` tree; refresh the RESUME.md skeleton preserving hand-written notes) /
+  `sync --check` (drift report, exit 3), `archive --area A` (distill a done area to header +
+  ≤10 summary lines, `status: archived`; `deep/` stays lossless), `gist [--push]` (one-paragraph
+  project gist; `--push` pipes to `$M2HERD_GIST_CMD`), `next` (the self-prompting primitive: a
+  mechanical 6-case priority walk — drift → uncoached intent → loose notes → collectable worker →
+  first open question → compare RESUME vs goal/done_when — printing exactly one `NEXT: ` line,
+  no LLM calls), and `selftest` (tmpdir end-to-end with jq schema assertions, incl. `next` cases).
+  `overview.json` gains optional `done_when` (seeded empty by `init --goal` = "intent not yet
+  coached") and `open_questions[]`. `templates/m2herd/` ships the
+  `overview.json`/`RESUME.md`/`NOTES.md` seeds with a `<!-- marker -->` line separating
+  boilerplate from live content.
+- **The three Claude Code hooks** (slice B — the heartbeat), all keyed on `.m2herd/` presence,
+  silent-fail, never blocking: `hooks/m2herd-session.sh` (SessionStart: inject a digest —
+  overview.json goal/status/areas count + first 30 lines of RESUME.md — plus the output of
+  `m2herd next`, so every wake-up = orientation + the next move), `hooks/m2herd-precompact.sh`
+  (PreCompact: instruct the model to refresh RESUME.md/overview.json and refile loose NOTES.md
+  content into `context/<area>/` BEFORE compaction proceeds), `hooks/m2herd-budget.js`
+  (PostToolUse: the 60/75/85% bridge-file budget watcher adapted from `herdr-context-budget.js`,
+  advising offload into `.m2herd/context/<area>/` + RESUME.md refresh; envelope always
+  `PostToolUse`).
+- **`scripts/m2herd-up.sh`** (slice C — the workspace): `up` ensures the fixed workspace shape —
+  EXACTLY ONE orchestrator pane (claude) + ONE notes pane live-viewing NOTES.md (`watch -n 2 -t`,
+  bash-loop fallback) — and runs `m2herd.sh init` if missing; `dispatch --slice S` worktrees
+  `wip/m2herd-<S>`, spawns a worker (claude/codex/cursor), file-protocol-dispatches
+  `.m2herd/dispatch/S.task.md`, and records it in `overview.json workers[]`; `collect --slice S`
+  waits idle and lands the report in `dispatch/S.out.md`; `--dry-run` prints every herdr/git
+  command instead of running it.
+- **Docs + wiring** (slice D): `skill/SKILL.md` §16 (doctrine, layout, engine, workspace shape,
+  hooks, install) + cheat-sheet row + m2herd trigger phrases in the frontmatter; README
+  capability row 16 + repository-layout entries; `scripts/install.sh` registers the three m2herd
+  hooks for the **claude** target (`SessionStart`/`PreCompact`/`PostToolUse`, the `.js` with
+  matcher `Bash|Edit|Write|MultiEdit|Agent|Task`, all timeout 10) — dedupe AND uninstall keyed on
+  hook FILENAME, timestamped `.bak` before edits, `--no-m2herd-hooks` to skip, warn+skip the `.js`
+  when `node` is missing — and symlinks `scripts/m2herd.sh` → `~/.local/bin/m2herd` and
+  `scripts/m2herd-up.sh` → `~/.local/bin/m2herd-up` (idempotent; `--uninstall` removes) so any
+  repo can run the engine and the hooks can find it; `scripts/onboard.sh` step 3 notes the m2herd
+  hooks + PATH symlinks ship with the claude install.
+
+Major bump: the default claude install now registers three new hooks (SessionStart, PreCompact,
+PostToolUse) and adds two PATH symlinks — a behavior change to `install.sh`'s defaults.
+
 ## [1.9.0] - 2026-07-02
 
 ### Fixed (merge review)
