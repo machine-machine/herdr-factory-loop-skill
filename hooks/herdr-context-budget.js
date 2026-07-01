@@ -170,7 +170,7 @@ process.stdin.on('end', () => {
 
     const output = {
       hookSpecificOutput: {
-        hookEventName: process.env.GEMINI_API_KEY ? 'AfterTool' : 'PostToolUse',
+        hookEventName: 'PostToolUse',
         additionalContext: message
       }
     };

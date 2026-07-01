@@ -169,11 +169,18 @@ EOF
 # accept input at different times (claude shows a welcome screen, codex loads its model),
 # so we may need to (re)send the text, not just Enter. Re-sending to an idle worker is
 # safe: it just reads the same prompt file again.
+#
+# A TUI needs a beat to render the injected text into its input box. If the Enter races
+# the text it submits an empty line and the pointer is left sitting in the input box,
+# unsubmitted — the "typed but never sent" symptom. Settle between the text and the Enter.
+# Override the delay with SUBMIT_SETTLE (seconds) for slow machines.
+SUBMIT_SETTLE="${SUBMIT_SETTLE:-1}"
 submit_prompt() {
   local pane="$1" pf="$2"
   [ -n "$pane" ] && [ "$pane" != "-" ] && [ "$pane" != "DRYRUN" ] || return 0
   is_self "$pane" && return 0
   herdr agent send "$pane" "Read $pf and follow its instructions exactly." >/dev/null 2>&1 || true
+  sleep "$SUBMIT_SETTLE"
   herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
 }
 
@@ -254,7 +261,7 @@ digest_append() {
   [ -f "$digest" ] && grep -qxF "## $slice" "$digest" && return 0
   mkdir -p "$WS/_fleet"
   local summary; summary="$(digest_summary "$stage" "$slice")"
-  printf '## %s\n%s\n\n[deep-dive](output/%s.out)\n\n' "$slice" "$summary" "$slice" >> "$digest"
+  printf '## %s\n%s\n\n[deep-dive](../stages/%s/output/%s.out)\n\n' "$slice" "$summary" "$stage" "$slice" >> "$digest"
   log "digest += $slice"
 }
 
@@ -422,6 +429,8 @@ rotate() {
 
   herdr pane close "$old" >/dev/null 2>&1 || true
   log "closed old orchestrator (pane $old)"
+  # Record the new pane so the NEXT rotation retires it, not the stale (renumbered) old id.
+  printf '%s\n' "$new" > "$WS/_fleet/orchestrator"
   rm -f "$WS/_fleet/.needs_rotation"
   log "rotate: complete — new orchestrator $new, retired $old"
 }
@@ -447,6 +456,9 @@ run() {
         # Subshell contains rotate's `exit` on a REFUSE so a bad rotate can't kill the loop;
         # its filesystem/herdr side effects (spawn, close, clear .needs_rotation) still persist.
         if ( rotate ); then
+          # rotate recorded the new pane in _fleet/orchestrator; drop the stale --orchestrator
+          # override so the next rotation resolves from disk instead of the closed pane id.
+          ORCH=""
           rots=$((rots+1)); log "auto-rotate: rotated (#$rots); continuing loop"
         else
           log "auto-rotate: rotate refused/failed — yielding for human"; log "loop yields on: $st"; break

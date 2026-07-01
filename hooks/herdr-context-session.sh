@@ -12,8 +12,11 @@
 
 set -u
 
-# Read the (unused but contract-consistent) stdin JSON without hanging.
-read -r -t 5 _stdin <<<"$(cat 2>/dev/null || true)" 2>/dev/null || true
+# Read the (unused but contract-consistent) stdin JSON without hanging: a timed
+# read loop, so a host that never closes stdin costs at most 5s per silent read —
+# the previous $(cat) form blocked forever because cat ran before the timeout applied.
+_stdin=""
+while IFS= read -r -t 5 _line 2>/dev/null; do _stdin="${_stdin}${_line}"; done || true
 
 # jq is required for safe JSON encoding; without it, stay silent.
 command -v jq >/dev/null 2>&1 || exit 0

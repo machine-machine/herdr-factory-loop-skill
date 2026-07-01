@@ -42,7 +42,8 @@ This skill teaches an agent how to:
 | 11 | SDD factory loop (spec-kit × herdr) | Spec-driven development: spec → plan → tasks → herd implements `[P]` tasks → analyze → converge against the spec |
 | 12 | ICM-steered loop (`herd-loop.sh`) | Make one orchestrator a standing, disk-reconstructible reconciler over a `herd-control/` workspace (folder=desired, socket=observed) |
 | 13 | Meta-orchestration (`fleet-loop.sh`) | Be the orchestrator of orchestrators: launch + oversee one orchestrator per mission (each driving its own herd), `/goal`-armed to self-drive — `fleet-control/` |
-| 14 | Context budgeting & decomposer (Hermes) | keep the orchestrator within a token budget (default GLM-5.2/384k); decompose into budget-sized slice manifests; hooks offload context on demand |
+| 14 | Dispatch nudge (hooks) | Claude Code `UserPromptSubmit` + Hermes `pre_llm_call` hooks that re-check "should this herd?" every turn, by default — proposes a plan, never auto-spawns |
+| 15 | Context budgeting & decomposer (Hermes) | keep the orchestrator within a token budget (default GLM-5.2/384k); decompose into budget-sized slice manifests; hooks offload context on demand |
 
 See [`skill/SKILL.md`](./skill/SKILL.md) for the full reference and
 [`skill/reference.md`](./skill/reference.md) for verbatim CLI/socket docs.
@@ -82,7 +83,9 @@ curl -sSL https://raw.githubusercontent.com/machine-machine/herdr-factory-loop-s
 
 This will clone the repo and symlink the skill into the right location
 for Claude (`~/.claude/skills/herdr/`), Hermes (`~/.hermes/skills/herdr/`),
-and Cursor (`~/.cursor/skills/herdr/`).
+and Cursor (`~/.cursor/skills/herdr/`). For Claude and Hermes it also wires
+up the dispatch-nudge hook (SKILL.md §14) so herding gets (re-)considered
+every turn by default — pass `--no-nudge-hook` to skip it.
 
 ### Manual install
 
@@ -115,6 +118,8 @@ herdr-factory-loop-skill/
 ├── skill/
 │   ├── SKILL.md             ← the skill itself (loaded by the agent)
 │   └── reference.md         ← verbatim CLI & socket reference
+├── hooks/
+│   └── herdr-dispatch-nudge.sh  ← per-turn dispatch-nudge hook (SKILL.md §14)
 └── scripts/
     ├── onboard.sh           ← onboarding TUI: orchestrator choice + spec-kit + SDD loop
     ├── install.sh           ← one-line installer (see Install section)

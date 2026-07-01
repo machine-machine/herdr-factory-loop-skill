@@ -92,40 +92,50 @@ TS="$(date +%Y%m%d%H%M%S)"
 # ---------------------------------------------------------------------------
 merged_settings() {
   local src="$1"
+  # Dedup by hook FILENAME (not the full command string): the command embeds the
+  # absolute node path, which changes across nvm/node upgrades — exact-string keying
+  # would re-append a second live entry on every re-install after such a change.
   jq \
     --arg pcmd "$BUDGET_CMD" \
     --arg scmd "$SESSION_CMD" \
+    --arg pjs "$HOOK_JS" \
+    --arg ssh "$HOOK_SH" \
     '
     .hooks = (.hooks // {})
     | .hooks.PostToolUse = (.hooks.PostToolUse // [])
     | .hooks.SessionStart = (.hooks.SessionStart // [])
-    | (if ([.hooks.PostToolUse[].hooks[]?.command] | index($pcmd)) then .
+    | (if ([.hooks.PostToolUse[].hooks[]?.command // ""] | map(contains($pjs)) | any) then .
        else .hooks.PostToolUse += [{
          matcher: "Bash|Edit|Write|MultiEdit|Agent|Task",
          hooks: [{ type: "command", command: $pcmd, timeout: 10 }]
        }] end)
-    | (if ([.hooks.SessionStart[].hooks[]?.command] | index($scmd)) then .
+    | (if ([.hooks.SessionStart[].hooks[]?.command // ""] | map(contains($ssh)) | any) then .
        else .hooks.SessionStart += [{
-         hooks: [{ type: "command", command: $scmd }]
+         hooks: [{ type: "command", command: $scmd, timeout: 10 }]
        }] end)
     ' "$src"
 }
 
 # settings.json with our two entries stripped out (restore-safe uninstall).
+# Strips only OUR command (matched by hook filename) from each matcher group and
+# drops a group only when that leaves it empty — a group a user consolidated other
+# hooks into keeps theirs.
 stripped_settings() {
   local src="$1"
   jq \
-    --arg pcmd "$BUDGET_CMD" \
-    --arg scmd "$SESSION_CMD" \
+    --arg pjs "$HOOK_JS" \
+    --arg ssh "$HOOK_SH" \
     '
     .hooks = (.hooks // {})
     | (if .hooks.PostToolUse then
         .hooks.PostToolUse = [ .hooks.PostToolUse[]
-          | select(((.hooks // []) | map(.command) | index($pcmd)) | not) ]
+          | .hooks = [ (.hooks // [])[] | select(((.command // "") | contains($pjs)) | not) ]
+          | select((.hooks | length) > 0) ]
        else . end)
     | (if .hooks.SessionStart then
         .hooks.SessionStart = [ .hooks.SessionStart[]
-          | select(((.hooks // []) | map(.command) | index($scmd)) | not) ]
+          | .hooks = [ (.hooks // [])[] | select(((.command // "") | contains($ssh)) | not) ]
+          | select((.hooks | length) > 0) ]
        else . end)
     ' "$src"
 }
@@ -354,8 +364,8 @@ verify() {
   # settings.json contains (or, after uninstall, lacks) our entries?
   if [ -f "$SETTINGS" ]; then
     local has_p has_s
-    has_p="$(jq --arg c "$BUDGET_CMD" '[.hooks.PostToolUse[]?.hooks[]?.command] | index($c) != null' "$SETTINGS" 2>/dev/null || echo false)"
-    has_s="$(jq --arg c "$SESSION_CMD" '[.hooks.SessionStart[]?.hooks[]?.command] | index($c) != null' "$SETTINGS" 2>/dev/null || echo false)"
+    has_p="$(jq --arg c "$HOOK_JS" '[.hooks.PostToolUse[]?.hooks[]?.command // ""] | map(contains($c)) | any' "$SETTINGS" 2>/dev/null || echo false)"
+    has_s="$(jq --arg c "$HOOK_SH" '[.hooks.SessionStart[]?.hooks[]?.command // ""] | map(contains($c)) | any' "$SETTINGS" 2>/dev/null || echo false)"
     if [ "$UNINSTALL" -eq 1 ]; then
       [ "$has_p" = false ] && pass "PostToolUse entry removed" || fail "PostToolUse entry still present"
       [ "$has_s" = false ] && pass "SessionStart entry removed" || fail "SessionStart entry still present"

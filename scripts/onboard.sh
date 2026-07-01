@@ -157,6 +157,9 @@ fi
 # ---------- step 3: install the skill ------------------------------------------
 
 step "3/6  Install the herdr skill for $ORCHESTRATOR"
+say "  Also wires up the dispatch-nudge hook (skill/SKILL.md §14): a per-turn"
+say "  reminder to consider fanning decomposable work out to herdr workers —"
+say "  it never spawns anything itself, only proposes; you still confirm."
 case "$ORCHESTRATOR" in
   claude) "$SCRIPT_DIR/install.sh" --local --claude ;;
   hermes) "$SCRIPT_DIR/install.sh" --local --hermes ;;

@@ -4,9 +4,22 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [1.8.0] - 2026-07-01
+## [1.9.0] - 2026-07-02
 
-Dynamic compression: keep summaries in the live window, deep-dives in files. Builds on the v1.7.0
+### Fixed (merge review)
+- `herdr-context-budget.js` no longer flips its envelope to `AfterTool` when `GEMINI_API_KEY`
+  happens to be exported — always `PostToolUse`.
+- `herd-loop.sh rotate` records the new orchestrator pane in `_fleet/orchestrator` (and
+  `run --auto-rotate` drops its stale `--orchestrator` override), so a second rotation retires
+  the right pane instead of a renumbered stranger; digest deep-dive links now resolve from
+  `_fleet/` (`../stages/<stage>/output/<slice>.out`).
+- `herdr-context-session.sh` reads stdin with a real timeout (the old `$(cat)` blocked forever
+  if the host never closed stdin); its settings entry now carries `timeout: 10` too.
+- `install-hermes-context.sh` keys idempotence/uninstall on the hook filename, not the full
+  command with the absolute node path (nvm upgrades re-appended duplicates), and uninstall
+  strips only our command from a matcher group instead of deleting the whole group.
+
+Dynamic compression: keep summaries in the live window, deep-dives in files. Builds on the v1.8.0
 budget layer with a strict division of labor — Hermes compresses the live window lossily, the folder
 holds the lossless deep-dives, and a rolling digest + session-rotation bridge the two.
 
@@ -32,7 +45,7 @@ holds the lossless deep-dives, and a rolling digest + session-rotation bridge th
   `~/.hermes/config.yaml` `compression:` block (`enabled`, `threshold` 0.5, `target_ratio` 0.2,
   `protect_first_n`/`protect_last_n`) to budget-aligned values. Backs up config, touches only those keys,
   idempotent, `--dry-run` diffs. Documents the lossy-live / lossless-folder contract.
-- **`skill/SKILL.md` §14.5 (Dynamic compression)** — the division of labor (Hermes compresses the live
+- **`skill/SKILL.md` §15.5 (Dynamic compression)** — the division of labor (Hermes compresses the live
   window lossily; the folder holds lossless deep-dives; the rolling `_fleet/digest.md` stores per-slice
   summaries while the full `.out` is the deep-dive; session-rotation on CRITICAL reboots the orchestrator
   from the pointer/digest), plus the `summarize`/`compact` and `--compression` wiring.
@@ -40,7 +53,7 @@ holds the lossless deep-dives, and a rolling digest + session-rotation bridge th
   our hook advises at 60/75/85% and signals rotation at CRITICAL), the digest/deep-dive convention, and
   the `_fleet/.needs_rotation` rotation signal file.
 
-## [1.7.0] - 2026-07-01
+## [1.8.0] - 2026-07-02
 
 Context budgeting: keep the orchestrator inside a token budget — the folder holds the context,
 the orchestrator holds pointers.
@@ -71,9 +84,45 @@ the orchestrator holds pointers.
   offload doctrine; budget awareness added as a global `AGENT.md` constraint. `herd-loop.sh` `init`
   writes `MODEL`/`BUDGET` (with `--model`/`--budget` overrides) and `gen_prompt` points each worker
   at its slice `context.md` instead of hard-coding a file list.
-- **`skill/SKILL.md` §14 (Context budgeting & the decomposer)** — the budget setting and resolution
+- **`skill/SKILL.md` §15 (Context budgeting & the decomposer)** — the budget setting and resolution
   order, the `context-budget.sh` decomposer and its budget-sized slice manifests, the two Hermes
   hooks and the offload doctrine, and the self-installer + onboarding wiring.
+
+## [1.7.0] - 2026-07-01
+
+Default-on dispatch nudge: hooks for Claude Code and Hermes that re-check "should this herd?"
+every turn, so the fleet gets considered without the user having to say "herdr" first — the
+model still proposes a plan and gets explicit confirmation before anything is spawned.
+
+### Added
+- **`hooks/herdr-dispatch-nudge.sh`** — a single script wired into Claude Code's
+  `UserPromptSubmit` hook and Hermes's `pre_llm_call` shell hook (its documented
+  `UserPromptSubmit` equivalent). Fires every turn, discards its input, and always returns the
+  same short reminder to check §9/§11/§13 applicability and get confirmation before spawning —
+  it never parses the prompt or decides anything itself; that judgment stays with the model.
+- **`skill/SKILL.md` §14 (Default-on dispatch nudge)** — documents the hook, why it can't embed
+  the decomposability judgment itself, the install/uninstall flow, and the Hermes non-interactive
+  consent gotcha (`--accept-hooks` / `HERMES_ACCEPT_HOOKS=1` / `hooks_auto_accept: true`), which
+  matters most for exactly the channel-driven case §9 is built for.
+- **`scripts/install.sh`** — installs and idempotently registers the hook by default for
+  `claude`/`hermes` targets (`--no-nudge-hook` to skip; `--uninstall` cleanly removes the
+  registration and symlink). Requires `jq` (Claude) / `yq` v4 (Hermes) for registration; degrades
+  to "hook file installed, not wired up" with a warning if either is missing. Takes a
+  timestamped `.bak-<ts>` copy of `settings.json`/`config.yaml` before every edit. Cursor is
+  skipped (no shell-hook mechanism).
+- **`scripts/onboard.sh`** — step 3 now notes that the nudge hook is part of the default install.
+
+## [1.6.1] - 2026-06-19
+
+### Fixed
+- **Dispatch race — prompt typed but never submitted.** `submit_prompt` (herd-loop.sh) and
+  the orchestrator dispatch sites (fleet-loop.sh) fired `agent send` and `pane send-keys Enter`
+  back-to-back. A TUI (claude/codex) needs a beat to render injected text into its input box;
+  the Enter raced the text, submitted an empty line, and left the prompt sitting in the input
+  unsubmitted. Now settle between the text and the Enter (`SUBMIT_SETTLE`, default 1s) — and in
+  fleet-loop.sh the three paired sites are unified behind a single `submit_pane` helper.
+- Docs (SKILL.md, reference.md): the dispatch examples, the `send ≠ submit` gotcha, and the
+  cheat-sheet now teach the settle-before-Enter step.
 
 ## [1.6.0] - 2026-06-19
 

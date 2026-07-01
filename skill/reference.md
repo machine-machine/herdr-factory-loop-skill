@@ -127,7 +127,7 @@ herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-s
 herdr agent list
 herdr agent get    <target>
 herdr agent read   <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]
-herdr agent send   <target> <text>             # literal text (no Enter)
+herdr agent send   <target> <text>             # literal text (no Enter); settle ~1s before send-keys Enter
 herdr agent rename <target> <name>|--clear
 herdr agent focus  <target>
 herdr agent wait   <target> --status idle|working|blocked|unknown [--timeout MS]

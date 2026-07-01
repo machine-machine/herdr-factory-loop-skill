@@ -123,6 +123,21 @@ observe() {
 
 is_self() { [ "$1" = "$(cat "$WS/_fleet/self" 2>/dev/null)" ]; }
 
+# Send literal text to a TUI pane, then submit. A TUI (claude/codex) needs a beat to
+# render injected text into its input box; if the Enter races the text it submits an
+# empty line and the typed prompt is left sitting in the input, unsubmitted. Settle
+# between the two. Override the delay with SUBMIT_SETTLE (seconds) in fleet.conf for
+# slow machines. The reconcile/continue nudge re-sends next tick if it still didn't take.
+SUBMIT_SETTLE="${SUBMIT_SETTLE:-1}"
+submit_pane() {
+  local pane="$1" text="$2"
+  [ -n "$pane" ] && [ "$pane" != "-" ] && [ "$pane" != "DRYRUN" ] || return 0
+  is_self "$pane" && return 0
+  herdr agent send "$pane" "$text" >/dev/null 2>&1 || true
+  sleep "$SUBMIT_SETTLE"
+  herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
+}
+
 # ---------- inbox / steering (same vocabulary as herd-loop.sh) ----------------
 STEER_HEADER='<!--
 inbox/STEER.md — live steering channel (Layer 4). Edit below the marker to steer the meta-loop.
@@ -183,8 +198,7 @@ arm_goal() {
   [ -n "$pane" ] && [ "$pane" != "-" ] && [ "$pane" != "DRYRUN" ] || return 0
   is_self "$pane" && return 0
   if goal_supported "$agent"; then
-    herdr agent send "$pane" "/goal $cond" >/dev/null 2>&1 || true
-    herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
+    submit_pane "$pane" "/goal $cond"
     return 0
   fi
   return 1
@@ -194,8 +208,7 @@ bootstrap_orchestrator() {
   local pane="$1" brief="$2"
   [ -n "$pane" ] && [ "$pane" != "-" ] && [ "$pane" != "DRYRUN" ] || return 0
   is_self "$pane" && return 0
-  herdr agent send "$pane" "Read $brief and follow it exactly. You are the orchestrator for this mission." >/dev/null 2>&1 || true
-  herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
+  submit_pane "$pane" "Read $brief and follow it exactly. You are the orchestrator for this mission."
 }
 
 launch_mission() {
@@ -246,8 +259,7 @@ nudge_orchestrator() {
   local mission="$1" pane="$2" herd_ws="$3"
   [ -n "$pane" ] && [ "$pane" != "-" ] && [ "$pane" != "DRYRUN" ] || return 0
   is_self "$pane" && return 0
-  herdr agent send "$pane" "Continue your mission: drive $HERD_LOOP run --ws $herd_ws until your 'Done when' holds. Read goals/$mission.md if you've lost context." >/dev/null 2>&1 || true
-  herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
+  submit_pane "$pane" "Continue your mission: drive $HERD_LOOP run --ws $herd_ws until your 'Done when' holds. Read goals/$mission.md if you've lost context."
 }
 
 collect_mission() {
