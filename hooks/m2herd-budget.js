@@ -61,10 +61,17 @@ process.stdin.on('end', () => {
     if (!rootDir) process.exit(0);
     const m2Dir = path.join(rootDir, '.m2herd');
 
+    // The statusline writer uses literal /tmp (see contract + context-budget.sh);
+    // os.tmpdir() is $TMPDIR (/var/folders/…) on macOS, so check /tmp FIRST and
+    // keep os.tmpdir() as the fallback.
     const tmpDir = os.tmpdir();
-    const metricsPath = path.join(tmpDir, `claude-ctx-${sessionId}.json`);
+    const candidates = [
+      path.join('/tmp', `claude-ctx-${sessionId}.json`),
+      path.join(tmpDir, `claude-ctx-${sessionId}.json`)
+    ];
+    const metricsPath = candidates.find(p => { try { return fs.existsSync(p); } catch (e) { return false; } });
     // No bridge file → subagent / fresh session, nothing to measure.
-    if (!fs.existsSync(metricsPath)) process.exit(0);
+    if (!metricsPath) process.exit(0);
 
     const metrics = JSON.parse(fs.readFileSync(metricsPath, 'utf8'));
     const now = Math.floor(Date.now() / 1000);

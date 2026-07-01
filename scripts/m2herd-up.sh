@@ -41,7 +41,17 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve through symlinks ($0 may be ~/.local/bin/m2herd-up → scripts/m2herd-up.sh);
+# macOS has no readlink -f, so walk the link chain by hand.
+self_path() {
+  local p="$0" l
+  while [ -L "$p" ]; do
+    l="$(readlink "$p")"
+    case "$l" in /*) p="$l" ;; *) p="$(dirname "$p")/$l" ;; esac
+  done
+  printf '%s' "$p"
+}
+SCRIPT_DIR="$(cd "$(dirname "$(self_path)")" && pwd)"
 NOTES_TAB_LABEL="m2herd-notes"
 SUBMIT_SETTLE="${SUBMIT_SETTLE:-1}"                 # settle between `agent send` and Enter
 WAIT_TIMEOUT="${M2HERD_WAIT_TIMEOUT:-1800000}"      # collect: ms to wait for worker idle
@@ -162,13 +172,18 @@ up() {
 
   # 1. .m2herd/ context fabric — scaffold via the engine if missing
   if [ ! -d "$REPO/.m2herd" ]; then
-    local init="$SCRIPT_DIR/m2herd.sh" initargs="init --dir \"$REPO\""
-    [ -n "$GOAL" ] && initargs="$initargs --goal \"$GOAL\""
+    # No eval: the goal is free text and must never hit a shell parser.
+    local init="$SCRIPT_DIR/m2herd.sh"
+    [ -x "$init" ] || init="$(command -v m2herd || true)"
     if [ "$DRY_RUN" -eq 1 ]; then
-      plan "$init $initargs"
+      plan "${init:-m2herd} init --dir '$REPO'${GOAL:+ --goal '<goal>'}"
     else
-      [ -x "$init" ] || { echo "no .m2herd/ and $init not found/executable — need slice A's engine" >&2; exit 1; }
-      eval "\"$init\" $initargs"
+      [ -n "$init" ] && [ -x "$init" ] || { echo "no .m2herd/ and no m2herd engine found (scripts/m2herd.sh or on PATH) — need slice A's engine" >&2; exit 1; }
+      if [ -n "$GOAL" ]; then
+        "$init" init --dir "$REPO" --goal "$GOAL"
+      else
+        "$init" init --dir "$REPO"
+      fi
     fi
   else
     log ".m2herd/ present — skipping init"
