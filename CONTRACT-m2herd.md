@@ -83,7 +83,7 @@ state, no writes, ever. Composes, in order:
 Plain ASCII + tput colors when a tty (degrade to plain when piped). Add a dashboard smoke to
 selftest (runs against the tmpdir fixture, asserts NEXT line + area row present).
 
-**Notes pane (slice C).** The notes pane command becomes:
+**Machineroom pane (slice C).** The machineroom pane command becomes:
 `watch -n 2 -t "m2herd dashboard"` when `command -v m2herd` AND watch exist; else the
 existing NOTES.md viewer fallback chain. The pane is a WATCHER, never a writer.
 
@@ -123,7 +123,7 @@ steering contract: TUI keys (tier 3) APPEND to STEER.md; the orchestrator drains
 .m2herd/
   overview.json               # central machine-readable index — schema below
   RESUME.md                   # come-back file: where we are, in-flight work, next 3 commands
-  NOTES.md                    # central notes file (the notes pane live-views this)
+  NOTES.md                    # central notes file (the machineroom pane live-views this)
   context/<area>/context.md   # distilled per-area context; annotation header below
   context/<area>/deep/        # lossless deep-dives (worker outputs, logs, transcripts)
   dispatch/<slice>.task.md    # worker task files (file protocol)
@@ -181,7 +181,7 @@ m2herd.sh selftest                        # tmpdir end-to-end: init → note →
 
 ### scripts/m2herd-up.sh — workspace bootstrap + dispatch (slice C)
 ```
-m2herd-up.sh up       [--repo P] [--goal "…"]      # ensure herdr workspace for repo: EXACTLY ONE orchestrator pane (claude) + ONE notes pane running the live viewer; runs m2herd.sh init if missing
+m2herd-up.sh up       [--repo P] [--goal "…"]      # ensure herdr workspace for repo: EXACTLY ONE orchestrator pane (claude) + ONE machineroom pane running the live viewer; runs m2herd.sh init if missing
 m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor]
                                                     # worktree wip/m2herd-<S> off BASE (default: current branch), spawn worker, file-protocol dispatch of .m2herd/dispatch/S.task.md, record in overview.json workers[]
 m2herd-up.sh collect  --slice S [--repo P]          # wait idle, copy worker report to dispatch/S.out.md, update workers[] state
@@ -213,7 +213,7 @@ Each hook slice ships a smoke: pipe a sample payload + empty stdin + garbage std
 
 ### docs + wiring (slice D)
 - `skill/SKILL.md`: version → **2.0.0**; new **§16 "m2herd — the Fable main-orchestrator context fabric"**
-  documenting doctrine, layout, engine, workspace shape (1 orchestrator pane + 1 notes pane), hooks,
+  documenting doctrine, layout, engine, workspace shape (1 orchestrator pane + 1 machineroom pane), hooks,
   install; cheat-sheet row. Do NOT renumber existing sections.
 - `README.md`: capabilities row 16; structure tree entries for the new files.
 - `CHANGELOG.md`: `## [2.0.0] - 2026-07-02` entry.

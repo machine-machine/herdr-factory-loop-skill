@@ -4,6 +4,20 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.2.0] - 2026-07-02
+
+### Added
+- **Headless worker tier** — `m2herd-up dispatch --headless [--model M]`: no pane, no TUI —
+  `claude -p` (default sonnet; verified on the Max plan), `codex exec`, or `opencode run`
+  nohup'd in the worktree. Log (usage JSON) → `dispatch/<S>.log`, report → `dispatch/<S>.out.md`
+  (salvaged from the log's `.result` when missing); `collect` waits on the pid and parses
+  `outputTokens`/`costUSD` into `workers[]` (new `mode`/`model`/`pid`/`tokens`/`cost_usd` fields).
+- **Dashboard runner column** — WORKERS shows tui vs headless runner + humanized spend
+  (`sonnet 12k`).
+- **Model-tier policy (SKILL.md §16.3)** — Fable = judgment only (intent, contract, converge);
+  sonnet = standard slices + reviews; haiku/codex = mechanical edits. Headless is the default
+  for anything that doesn't need mid-flight steering.
+
 ## [2.1.0] - 2026-07-02
 
 ### Added

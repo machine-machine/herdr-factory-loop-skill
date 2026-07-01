@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 2.1.0
+version: 2.2.0
 description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator). ALSO trigger for meta-orchestration — when the user wants to be the "meta-orchestrator" / "orchestrator of orchestrators", oversee or launch multiple orchestrators (each driving its own herd of workers) across several missions/repos, or drive a portfolio of parallel missions with /goal-based autonomy (fleet-loop.sh / fleet-control). ALSO trigger for m2herd — the Claude Code (Fable) main-orchestrator context fabric — when the user mentions m2herd, .m2herd, "context fabric", wants to offload context into the repo folder (the folder holds the context, the orchestrator holds pointers), refile or archive notes/areas, push a project gist to fleet memory, or come back to a project via the resume file (RESUME.md).
 ---
 
@@ -796,7 +796,7 @@ line separating template boilerplate from live content) and appends `.m2herd/` t
 .m2herd/
   overview.json               # central machine-readable index (goal, status, areas[], workers[])
   RESUME.md                   # come-back file: where we are, in-flight work, next 3 commands
-  NOTES.md                    # central notes file (the notes pane live-views this)
+  NOTES.md                    # central notes file (the machineroom pane live-views this)
   context/<area>/context.md   # distilled per-area context; annotation header below
   context/<area>/deep/        # lossless deep-dives (worker outputs, logs, transcripts)
   dispatch/<slice>.task.md    # worker task files (§4 file protocol)
@@ -902,10 +902,10 @@ in the dashboard header. Fallbacks when `m2herd` is absent: `watch -n 2 -t cat
 The pane is a WATCHER, never a writer. On PATH as `m2herd-up`.
 
 ```
-m2herd-up.sh up       [--repo P] [--goal "…"]      # ensure herdr workspace for repo: the one-orchestrator + one-notes-pane shape; runs m2herd.sh init if missing
+m2herd-up.sh up       [--repo P] [--goal "…"]      # ensure herdr workspace for repo: the one-orchestrator + one-machineroom shape; runs m2herd.sh init if missing
 m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor]
-                                                    # worktree wip/m2herd-<S> off BASE (default: current branch), spawn worker, file-protocol dispatch of .m2herd/dispatch/S.task.md, record in overview.json workers[]
-m2herd-up.sh collect  --slice S [--repo P]          # wait idle, copy worker report to dispatch/S.out.md, update workers[] state
+                      [--headless [--model M]]      # worktree wip/m2herd-<S> off BASE (default: current branch), spawn worker, file-protocol dispatch of .m2herd/dispatch/S.task.md, record in overview.json workers[]
+m2herd-up.sh collect  --slice S [--repo P]          # wait idle (pane) / exited (headless pid), keep/copy report to dispatch/S.out.md, update workers[] state (+tokens/cost)
 m2herd-up.sh --dry-run <same args>                  # print every herdr/git command instead of running it
 ```
 
@@ -913,6 +913,22 @@ It follows the binding herdr rules from this skill: identify `$SELF` first and n
 (§2); after `agent start` RE-RESOLVE the pane by cwd from `herdr agent list` (the returned
 pane_id can be off by one); no `--split` (stray-pane bug); settle ~1s between `agent send` and
 Enter (§4).
+
+**Headless dispatch — cheap hands, Fable judgment.** `dispatch --headless [--model M]` skips
+the pane entirely: `claude -p <pointer> --model M --dangerously-skip-permissions
+--output-format json` (default model **sonnet**; verified working on the Max plan) — or
+`codex exec` / `opencode run` via `--agent` — nohup'd in the worktree. The runner's stdout
+(usage JSON) lands in `dispatch/<S>.log`, the report in `dispatch/<S>.out.md` by instruction
+(salvaged from the log's `.result` if the worker forgot). `collect` waits on the **pid**, not
+a pane, and parses `outputTokens`/`costUSD` into `workers[]`; the dashboard WORKERS table
+shows the runner + humanized spend (`sonnet 12k`). Cursor has no headless mode.
+
+**Model-tier policy.** The orchestrator (Fable) spends tokens on *judgment only*: intent
+coaching, contract writing, converge decisions, reviews of last resort. Everything else is
+delegated down-tier: **sonnet** for standard implementation slices and review fan-outs,
+**haiku / codex exec** for mechanical work (renames, doc sweeps, refiles, format fixes).
+Default reviewers to sonnet explicitly. TUI panes are for slices that need mid-flight
+steering; headless is the default for everything else.
 
 #### 16.4 The three Claude Code hooks
 
