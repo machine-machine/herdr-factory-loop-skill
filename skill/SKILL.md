@@ -769,6 +769,11 @@ machine prompts itself from its own state**. Its doctrine pillars:
   orchestrator's first job is to sharpen intent into `goal` + `done_when` + slices, recording
   what it cannot resolve as `open_questions` instead of guessing. An empty `done_when` means
   "intent not yet coached", and `next` refuses to move past it.
+- **Read-only dashboard — one writer, many watchers.** The orchestrator is the only writer;
+  every other pane is a watcher. `m2herd dashboard` is a pure renderer over existing state —
+  no new state, no writes, ever — and it displays the same self-prompt the machine injects
+  into itself (the `NEXT:` line is rendered from the same code path as `next`). Any future
+  interactive tier may add navigation, never editing (roadmap in §16.2).
 - **Self-documentation.** Every refile IS the documentation act; nothing lives only in the
   live window. Offloading context and documenting the project are the same motion.
 - **Memory tiers — division of labor.** `.m2herd/` is the PROJECT's working memory (files,
@@ -832,7 +837,8 @@ m2herd.sh sync   [--dir P] --check        # drift detector: exit 3 + human-reada
 m2herd.sh archive [--dir P] --area A      # decay: distill a done area's context.md to header + ≤10 summary lines (status: archived); deep/ stays lossless; overview.json entry gets "status":"archived"
 m2herd.sh gist   [--dir P] [--push]       # one-paragraph project gist (goal, status, one line per active area); --push pipes it to $M2HERD_GIST_CMD if set (the --llm pattern), else prints it with a note
 m2herd.sh next   [--dir P]                # self-prompting primitive: mechanical priority walk (NO LLM calls), prints exactly one line starting "NEXT: "
-m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync → status → resume (+ next cases); asserts schema fields with jq
+m2herd.sh dashboard [--dir P]             # read-only tier-1 TUI: a pure renderer over existing state — no new state, no writes, ever
+m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync → status → resume (+ next cases, dashboard smoke); asserts schema fields with jq
 ```
 
 `next` is the pulse of the agentic loop — it walks a fixed priority ladder and prints exactly
@@ -845,18 +851,34 @@ one `NEXT: ` line, so the machine always knows its next move without an LLM in t
 5. `open_questions` non-empty → `NEXT: resolve open question: <first>`
 6. otherwise → `NEXT: compare RESUME.md against goal/done_when and dispatch or finish`
 
+`dashboard` composes, in order: a header (goal • status • done_when • drift dot — `●` clean /
+`◐ drift`, from the `sync --check` logic — • humanized age of `updated_at`, e.g. 3m/7h/4d);
+the `NEXT:` line (same code path as `next` — the dashboard displays the same self-prompt the
+machine injects into itself); the AREAS table (name, active/archived status, per-area age from
+each context.md `updated:` header, related links — archived areas rendered dim on one line;
+**staleness ages make rot visible**: decay discipline, rendered); the WORKERS table (slice,
+state, branch) when `workers[]` is non-empty; the OPEN QUESTIONS list when non-empty; and the
+last 5 content lines of NOTES.md below the marker. Plain ASCII with tput colors on a tty,
+degrading to plain when piped. Tier roadmap (roadmap only — not built): tier 2 adds an
+fswatch-triggered repaint; tier 3 a bubbletea/textual TUI with navigation — navigation yes,
+editing no. The only input concession any tier may ever make is a keypress that opens a
+STEER.md-style inbox file: steering goes through the loop, never directly into the state files.
+
 The daily loop: `note` whatever matters the moment it matters → `refile --area A` when a topic
 has gathered enough notes (this is the documentation act) → `resume` when you come back →
 `sync --check` when anything smells stale (exit 3 = drift; run `sync` to repair) →
 `archive --area A` when an area is done → `gist --push` to publish the project's one-paragraph
-state to fleet memory — or simply run `m2herd next` and do what it says. `status`/`resume`
-show archived areas as a one-line footer, not full entries.
+state to fleet memory — or simply run `m2herd next` and do what it says, with `dashboard` open
+in the watcher pane. `status`/`resume` show archived areas as a one-line footer, not full
+entries.
 
 #### 16.3 The workspace — `scripts/m2herd-up.sh`
 
-The workspace shape is fixed: **exactly ONE orchestrator pane (claude) + ONE notes pane**
-live-viewing `NOTES.md` (`watch -n 2 -t cat .m2herd/NOTES.md` if `watch` exists, else a
-`while :; do clear; cat .m2herd/NOTES.md; sleep 2; done` bash loop). On PATH as `m2herd-up`.
+The workspace shape is fixed: **exactly ONE orchestrator pane (claude) + ONE notes pane**.
+The notes pane runs `watch -n 2 -t "m2herd dashboard"` when both `m2herd` and `watch` exist;
+else it falls back to the NOTES.md viewer chain (`watch -n 2 -t cat .m2herd/NOTES.md` if
+`watch` exists, else a `while :; do clear; cat .m2herd/NOTES.md; sleep 2; done` bash loop).
+The pane is a WATCHER, never a writer. On PATH as `m2herd-up`.
 
 ```
 m2herd-up.sh up       [--repo P] [--goal "…"]      # ensure herdr workspace for repo: the one-orchestrator + one-notes-pane shape; runs m2herd.sh init if missing
@@ -975,6 +997,6 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 | Meta-orchestrate | `scripts/fleet-loop.sh init\|tick\|run\|status` over a `templates/fleet-control/` workspace — one orchestrator per mission in `missions.tsv`, each `/goal`-armed to self-drive its herd; meta launches/oversees/converges (§13) |
 | Which orchestrator? | `cat ~/.config/herdr-factory/config.toml` |
 | Dispatch nudge (hooks) | `./scripts/install.sh` wires `hooks/herdr-dispatch-nudge.sh` into Claude's `UserPromptSubmit` + Hermes's `pre_llm_call` — a per-turn reminder to consider herding, never an auto-spawn (§14) |
-| m2herd context fabric | `m2herd init\|note\|refile\|resume\|sync --check\|archive\|gist --push\|next` over the repo's `.m2herd/`; `m2herd-up up\|dispatch\|collect` for the 1-orchestrator + 1-notes-pane workspace — folder holds the context, orchestrator holds pointers, `next` is the machine's own next move (§16) |
+| m2herd context fabric | `m2herd init\|note\|refile\|resume\|sync --check\|archive\|gist --push\|next\|dashboard` over the repo's `.m2herd/`; `m2herd-up up\|dispatch\|collect` for the 1-orchestrator + 1-watcher-pane workspace (`watch -n 2 -t "m2herd dashboard"`) — folder holds the context, orchestrator holds pointers, `next` is the machine's own next move, the dashboard is read-only (§16) |
 
 Full CLI + socket reference: [reference.md](reference.md).

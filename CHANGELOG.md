@@ -30,7 +30,13 @@ hoarding). Built as a 4-slice herd against the pre-committed `CONTRACT-m2herd.md
   project gist; `--push` pipes to `$M2HERD_GIST_CMD`), `next` (the self-prompting primitive: a
   mechanical 6-case priority walk — drift → uncoached intent → loose notes → collectable worker →
   first open question → compare RESUME vs goal/done_when — printing exactly one `NEXT: ` line,
-  no LLM calls), and `selftest` (tmpdir end-to-end with jq schema assertions, incl. `next` cases).
+  no LLM calls), `dashboard` (read-only tier-1 TUI — a pure renderer over existing state, no
+  writes ever: header with drift dot + humanized ages, the `NEXT:` line from the same code path
+  as `next`, AREAS with staleness ages that make rot visible, WORKERS, OPEN QUESTIONS, NOTES
+  tail; tput colors on a tty, plain when piped; one writer, many watchers — future tiers may
+  add fswatch repaint (2) or bubbletea/textual navigation (3), never editing; the only input
+  concession is a keypress opening a STEER-style inbox file), and `selftest` (tmpdir end-to-end
+  with jq schema assertions, incl. `next` cases and a dashboard smoke).
   `overview.json` gains optional `done_when` (seeded empty by `init --goal` = "intent not yet
   coached") and `open_questions[]`. `templates/m2herd/` ships the
   `overview.json`/`RESUME.md`/`NOTES.md` seeds with a `<!-- marker -->` line separating
@@ -45,8 +51,9 @@ hoarding). Built as a 4-slice herd against the pre-committed `CONTRACT-m2herd.md
   advising offload into `.m2herd/context/<area>/` + RESUME.md refresh; envelope always
   `PostToolUse`).
 - **`scripts/m2herd-up.sh`** (slice C — the workspace): `up` ensures the fixed workspace shape —
-  EXACTLY ONE orchestrator pane (claude) + ONE notes pane live-viewing NOTES.md (`watch -n 2 -t`,
-  bash-loop fallback) — and runs `m2herd.sh init` if missing; `dispatch --slice S` worktrees
+  EXACTLY ONE orchestrator pane (claude) + ONE watcher pane running `watch -n 2 -t "m2herd
+  dashboard"` when `m2herd` and `watch` exist (NOTES.md viewer fallback chain otherwise; the
+  pane watches, never writes) — and runs `m2herd.sh init` if missing; `dispatch --slice S` worktrees
   `wip/m2herd-<S>`, spawns a worker (claude/codex/cursor), file-protocol-dispatches
   `.m2herd/dispatch/S.task.md`, and records it in `overview.json workers[]`; `collect --slice S`
   waits idle and lands the report in `dispatch/S.out.md`; `--dry-run` prints every herdr/git
