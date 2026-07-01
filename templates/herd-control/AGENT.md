@@ -34,6 +34,9 @@ one stage at a time, with the whole state reconstructible from this folder alone
 - Mechanical work (worktree create, snapshot, merge, lint) → `scripts/herd-loop.sh`, not your judgment.
 - Destructive worker prompts (force-push, secret access, deleting branches, writes to `main`)
   → escalate to `inbox/`/review, never auto-approve. See `_config/approval_policy.md`.
+- Stay within the **context budget** (`herd.conf` `BUDGET`, default GLM-5.2/384k). Hold working knowledge as
+  file links in the folder, not in live context; when the budget hook spills `_fleet/context_pointer.md`,
+  drop raw history and reload from it. See `_config/budget_policy.md`.
 
 ## Default operating mode
 

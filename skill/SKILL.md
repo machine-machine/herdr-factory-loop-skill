@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 1.7.0
+version: 1.9.0
 description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator). ALSO trigger for meta-orchestration — when the user wants to be the "meta-orchestrator" / "orchestrator of orchestrators", oversee or launch multiple orchestrators (each driving its own herd of workers) across several missions/repos, or drive a portfolio of parallel missions with /goal-based autonomy (fleet-loop.sh / fleet-control).
 ---
 
@@ -615,6 +615,137 @@ persists the decision — but non-interactive runs (gateway, cron, channel-drive
 the §9 "intent arrives over a chat channel" case this hook is meant to help with) can't answer
 that prompt. Set one of `--accept-hooks`, `HERMES_ACCEPT_HOOKS=1`, or `hooks_auto_accept: true`
 in `config.yaml`, or the hook silently never fires there.
+
+### 15. Context budgeting & the decomposer
+
+§12 makes the folder the orchestrator's state; §13 stacks a tier above it. Both assume the
+orchestrator's **live context window** can hold identity + router + active contract + `_fleet` +
+declared inputs. On a long run that assumption breaks: spec/plan/tasks, worker outputs, ledger
+state, and screen reads accumulate until the model truncates and starts dropping constraints and
+file links. §15 adds a **context-budget layer** to the ICM factory so the orchestrator (typically
+Hermes) **stays within a known token budget** and **holds its working knowledge as file links in
+the folder** rather than in live context. The doctrine is one line: **the folder holds the
+context, the orchestrator holds pointers.** It extends the §12 model — the folder is still desired
+state — with a budget the loop and the hooks both respect.
+
+#### 15.1 The budget setting
+
+Every workspace declares a model and a token budget in `herd.conf`, defaulting to **GLM-5.2** with
+a **384000**-token window. `herd-loop.sh init` writes `MODEL=GLM-5.2` and `BUDGET=384000` (override
+with `--model NAME` / `--budget N`). The decomposer and both hooks resolve the budget in the same
+order, so live detection can refine the default without editing every file:
+
+```
+herd.conf MODEL/BUDGET  →  ~/.hermes/config.yaml model.context_length  →  default GLM-5.2 / 384000
+```
+
+`scripts/context-budget.sh detect --ws WS` prints the resolved `MODEL`, `BUDGET`, and `SOURCE=`
+(so the resolution is debuggable), machine-readable as `KEY=VALUE` lines.
+
+#### 15.2 The decomposer — `scripts/context-budget.sh`
+
+The engine is a mechanical, idempotent bash tool (same style as `herd-loop.sh`) with four
+subcommands:
+
+```bash
+scripts/context-budget.sh detect  --ws WS                       # MODEL / BUDGET / SOURCE
+scripts/context-budget.sh status  --ws WS                       # live usage vs budget (bridge file)
+scripts/context-budget.sh plan    --ws WS --intent FILE [--fraction 0.25]
+scripts/context-budget.sh pointer --ws WS --stage S --slice X
+```
+
+`plan` is the decomposer proper. It reads the intent's declared slices (or the `[P]` rows of
+`stages/03_tasks/output/tasks.md`) and, for each slice, writes a **per-slice context manifest** at
+`stages/<stage>/context/<slice>.md`. The manifest is **links only** — relative file paths with a
+one-line purpose each, never inlined bodies (inlining is exactly what fills the window). Each
+manifest carries a byte/token-estimate header (`tokens ≈ ceil(bytes / 4)`, matching
+`hermes prompt-size`) and is sized to fit a fraction of the budget — **default `BUDGET × 0.25`**.
+An oversized slice is **flagged (`fits: NO`), not silently emitted**, so decomposition failures
+surface instead of hiding. `status` reads the live bridge file
+(`/tmp/claude-ctx-<session>.json`) to report `USED_PCT` / `REMAINING_PCT` against `BUDGET`;
+`pointer` regenerates one slice's manifest after a §12.3 `RESCOPE` or an edit. `herd-loop.sh
+gen_prompt` then points each worker at its manifest ("Read your context manifest: <path>") instead
+of hard-coding a file list into the prompt — the §11.2/§9.2 dispatch pattern, but the context is a
+pointer, not a payload.
+
+#### 15.3 The Hermes hooks — awareness + restructure on demand
+
+Two hooks keep a running orchestrator inside the budget without a human watching the gauge:
+
+- **`hooks/herdr-context-budget.js`** — a Hermes **PostToolUse** hook (Node, modeled on
+  `gsd-context-monitor.js`: stdin JSON → `{hookSpecificOutput:{additionalContext}}`, stdin timeout
+  guard, silent-fail, `session_id` path-traversal guard). It reads the live bridge file plus the
+  resolved `BUDGET` and, when usage crosses **WARNING 60% / HIGH 75% / CRITICAL 85%** (debounced,
+  severity-escalation bypasses the debounce), injects an advisory telling the orchestrator to
+  offload. On **HIGH/CRITICAL** it also **spills** a compact `_fleet/context_pointer.md` — active
+  stage, a short ledger digest, and links to each slice's distilled `context.md` — so the
+  orchestrator can drop raw history and reload its working set from the pointer. The spill is
+  idempotent (one per threshold crossing). It never blocks a tool.
+- **`hooks/herdr-context-session.sh`** — a **SessionStart** hook (bash, modeled on
+  `gsd-session-state.sh`). When the cwd (or `$HERD_WS`) has a `herd.conf`, it prints an
+  `additionalContext` line stating `MODEL`/`BUDGET` and surfaces `_fleet/context_pointer.md` if one
+  exists — so a resumed or re-spawned orchestrator starts already inside its budget and already
+  pointed at the folder's distilled context.
+
+This is the offload doctrine in motion: the hooks watch usage, the decomposer's manifests are the
+distilled context on disk, and the spill re-points the orchestrator at the folder the moment the
+window gets tight. Thresholds and the offload doctrine are documented as L3 reference in
+[`_config/budget_policy.md`](templates/herd-control/_config/budget_policy.md); the budget-awareness
+constraint is also a global bullet in `AGENT.md` so it loads every tick.
+
+#### 15.4 Self-installer & onboarding
+
+`scripts/install-hermes-context.sh` wires the hooks into `~/.hermes/`: it copies
+`hooks/*.{js,sh}` into `~/.hermes/hooks/` (chmod +x), `jq`-merges a PostToolUse entry (for the
+budget hook) and a SessionStart entry (for the session hook) into `~/.hermes/settings.json` keyed
+by command string (re-running adds nothing), sets the GLM-5.2 / 384k default in
+`~/.hermes/config.yaml`, and verifies with `hermes hooks doctor`. It **backs up** `settings.json`
+and `config.yaml` before touching them, only edits `context_length` (never rewrites the file), and
+supports `--dry-run` and `--uninstall`. Onboarding (§11.0) runs it automatically when the chosen
+orchestrator is `hermes` or `all`, and `scripts/install.sh --hermes` runs it too — so a Hermes
+factory gets the budget layer wired without a separate step.
+
+#### 15.5 Dynamic compression — lossy live window, lossless folder
+
+§15.1–14.4 make the orchestrator budget-*aware* and spill a state pointer. §15.5 adds true
+**dynamic compression** on top, with a strict **division of labor** — nothing summarizes the same
+bytes twice, and no summary is ever the only copy:
+
+- **Hermes' native compressor compresses the LIVE window, lossily.** Its `~/.hermes/config.yaml`
+  `compression:` block (`enabled: true`, `threshold: 0.5` — compress at 50% of the window;
+  `target_ratio: 0.2` — down to 20%; `protect_first_n` / `protect_last_n` — keep the head and the
+  recent tail verbatim) replaces raw history with LLM summaries in place. This is on by default; we
+  only *tune* it to the budget — we do **not** replace it with our own live-window summarizer.
+- **The folder holds the lossless deep-dives.** Worker outputs (`stages/*/output/<slice>.out`) and
+  the slice manifests (`stages/*/context/<slice>.md`) stay on disk in full, so after Hermes lossily
+  compresses the window the orchestrator can reload the *exact* content from the folder. Lossy in
+  the window, lossless on disk.
+- **The rolling `_fleet/digest.md` bridges the two.** `herd-loop.sh collect_slice` runs
+  `context-budget.sh summarize` on each finished worker's `.out` (its final "what I did / how I
+  verified" report if present, else a head+tail heuristic — never a full-body copy, ≤6 lines) and
+  appends `## <slice>` + that summary + a link back to `output/<slice>.out` to `_fleet/digest.md`
+  (append-once per slice, idempotent). The **digest is the summary; the `.out` is the deep-dive** —
+  the orchestrator reads the digest to stay oriented and follows the link only when it needs the
+  full text. `context-budget.sh compact` regenerates `_fleet/context_pointer.md` as a rolling
+  narrative (active stage + the digest + slice `context.md` links, links only) instead of a bare
+  state digest.
+- **Session-rotation on CRITICAL reboots the orchestrator from the pointer/digest.** When usage
+  crosses **CRITICAL 85%**, the §15.3 hook also drops a `_fleet/.needs_rotation` sentinel; the
+  `herd-loop.sh run` loop detects it and yields `STATUS: NEEDS_ROTATION` rather than looping on a
+  full window. `herd-loop.sh rotate --ws WS` then starts a fresh orchestrator agent, sends it
+  "resume from `_fleet/context_pointer.md` + `digest.md`" (the SessionStart hook orients it),
+  retires the old pane, and clears the sentinel — enforced reorg by restart. It **refuses to close
+  `$SELF`, the new pane, or an empty/unknown pane id**, and `--dry-run` prints the plan while
+  spawning and closing nothing. To make rotation **automatic**, run the loop with
+  `herd-loop.sh run --auto-rotate --orchestrator PANE [--max-rotations 5]`: on `NEEDS_ROTATION` it
+  rotates in place and keeps ticking (capped against runaway; a refused rotate is contained and the
+  loop yields to a human instead of crashing). Without `--auto-rotate` the loop yields as above.
+
+Wiring: `context-budget.sh summarize|compact` produce the distilled summaries;
+`install-hermes-context.sh --compression on|off` tunes (or disables) the `compression:` block to
+budget-aligned values (idempotent, backed up, touches only those keys, `--dry-run` diffs). The
+tiers and the lossy-live / lossless-folder contract are documented as L3 reference in
+[`_config/budget_policy.md`](templates/herd-control/_config/budget_policy.md).
 
 ---
 

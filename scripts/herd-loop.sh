@@ -14,9 +14,11 @@
 #   herd-loop.sh init --ws DIR --repo PATH [--base main] [--feature DIR] [--worker codex]
 #   herd-loop.sh tick     [--ws DIR] [--dry-run]      # one reconciliation pass
 #   herd-loop.sh run      [--ws DIR] [--interval 10] [--max-ticks 0] [--dry-run]
+#                         [--auto-rotate [--orchestrator PANE] [--max-rotations 5]]  # self-rotate on CRITICAL
 #   herd-loop.sh observe  [--ws DIR]                  # snapshot fleet → _fleet/
 #   herd-loop.sh status   [--ws DIR]                  # human-readable rollup
 #   herd-loop.sh advance  [--ws DIR]                  # move active stage → its handoff
+#   herd-loop.sh rotate   [--ws DIR] [--orchestrator PANE] [--dry-run]  # retire+restart orchestrator
 #
 # Workspace is found via --ws, $HERD_WS, or the current dir (must contain AGENT.md).
 # Idempotent. Safe to re-run. Reads herd.conf + stage CONTEXT.md; never bare `herdr`.
@@ -26,7 +28,9 @@ set -euo pipefail
 # ---------- arg parsing ------------------------------------------------------
 CMD="${1:-help}"; shift || true
 WS=""; REPO=""; BASE="main"; FEATURE=""; WORKER_DEFAULT="codex"
-INTERVAL=10; MAX_TICKS=0; DRY_RUN=0
+MODEL="GLM-5.2"; BUDGET="384000"          # context-budget layer defaults (GLM-5.2 / 384k)
+INTERVAL=10; MAX_TICKS=0; DRY_RUN=0; ORCH=""
+AUTO_ROTATE=0; MAX_ROTATIONS=5            # run --auto-rotate: rotate on CRITICAL, capped
 while [ $# -gt 0 ]; do
   case "$1" in
     --ws) WS="$2"; shift 2 ;;
@@ -34,9 +38,14 @@ while [ $# -gt 0 ]; do
     --base) BASE="$2"; shift 2 ;;
     --feature) FEATURE="$2"; shift 2 ;;
     --worker) WORKER_DEFAULT="$2"; shift 2 ;;
+    --model) MODEL="$2"; shift 2 ;;
+    --budget) BUDGET="$2"; shift 2 ;;
     --interval) INTERVAL="$2"; shift 2 ;;
     --max-ticks) MAX_TICKS="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
+    --orchestrator) ORCH="$2"; shift 2 ;;
+    --auto-rotate) AUTO_ROTATE=1; shift ;;
+    --max-rotations) MAX_ROTATIONS="$2"; shift 2 ;;
     -h|--help) CMD="help"; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -134,12 +143,17 @@ gen_prompt() {
   local out="$WS/stages/$stage/prompts/$slice.md"
   mkdir -p "$WS/stages/$stage/prompts"
   [ -f "$out" ] && { echo "$out"; return; }
+  # context-budget layer: if a budget-sized manifest exists for this slice, point the
+  # worker at it (links only, sized to fit the budget) instead of the full stage inputs.
+  local ctx="$WS/stages/$stage/context/$slice.md" ctxline=""
+  [ -f "$ctx" ] && ctxline="  0. $ctx   (YOUR CONTEXT MANIFEST — load exactly these links, nothing more)
+"
   cat > "$out" <<EOF
 You are one worker in an ICM-steered herd. Scope: **$slice only** — do not touch files
 outside this slice. Repo: $wt (worktree, branch wip/$stage/$slice).
 
 Read first, in order (load only these):
-  1. $WS/AGENT.md                          (orchestrator charter — your context)
+$ctxline  1. $WS/AGENT.md                          (orchestrator charter — your context)
   2. $WS/stages/01_spec/output/spec.md      (WHAT + acceptance criteria)
   3. $WS/stages/02_plan/output/plan.md      (HOW — stack, structure, contracts)
   4. $WS/stages/03_tasks/output/tasks.md    (your task: the row matching $slice)
@@ -228,6 +242,29 @@ worker_done() {
   [ "${n:-0}" -gt 0 ]
 }
 
+# ---------- rolling digest: store summaries, keep deep-dives in files ---------
+# A short per-slice summary of the worker's output, distilled by context-budget.sh
+# summarize when present; else a 1-line note. The full .out stays on disk (deep-dive).
+digest_summary() {
+  local stage="$1" slice="$2" cb summary=""
+  cb="$(dirname "$0")/context-budget.sh"
+  if [ -x "$cb" ] && grep -q 'summarize)' "$cb" 2>/dev/null; then
+    summary="$("$cb" summarize --ws "$WS" --stage "$stage" --slice "$slice" 2>/dev/null || true)"
+  fi
+  [ -n "$summary" ] || summary="(worker $slice finished — see deep-dive)"
+  printf '%s' "$summary"
+}
+# Append `## <slice>` + summary + deep-dive link to _fleet/digest.md. Idempotent:
+# skip if a `## <slice>` section already exists (append-once per slice).
+digest_append() {
+  local stage="$1" slice="$2" digest="$WS/_fleet/digest.md"
+  [ -f "$digest" ] && grep -qxF "## $slice" "$digest" && return 0
+  mkdir -p "$WS/_fleet"
+  local summary; summary="$(digest_summary "$stage" "$slice")"
+  printf '## %s\n%s\n\n[deep-dive](../stages/%s/output/%s.out)\n\n' "$slice" "$summary" "$stage" "$slice" >> "$digest"
+  log "digest += $slice"
+}
+
 # ---------- collect a finished worker ----------------------------------------
 collect_slice() {
   local stage="$1" slice="$2" pane="$3"
@@ -238,6 +275,7 @@ collect_slice() {
   [ -s "$out" ] || herdr agent read "$pane" --source recent-unwrapped --lines 300 > "$out" 2>/dev/null || true
   ledger_set "$slice" 7 "yes"
   log "collected $slice → stages/$stage/output/$slice.out"
+  digest_append "$stage" "$slice"
 }
 
 # ---------- tick: one reconciliation pass ------------------------------------
@@ -249,6 +287,9 @@ tick() {
   observe || { echo "STATUS: ERROR (cannot observe fleet)"; return 1; }
   drain_inbox
   if [ -f "$WS/_fleet/paused" ]; then echo "STATUS: PAUSED"; return 0; fi
+  # CRITICAL context crossing (set by the budget hook): don't silently loop — yield so
+  # the orchestrator (or `herd-loop.sh rotate`) can reboot the session from the pointer.
+  if [ -f "$WS/_fleet/.needs_rotation" ]; then echo "STATUS: NEEDS_ROTATION"; return 0; fi
 
   local stage ctx mode gate deliverable
   stage="$(active)"; ctx="$(ctx_file)"
@@ -326,14 +367,102 @@ advance() {
   echo "$handoff" > "$WS/_fleet/active_stage"; log "advanced $stage → $handoff"
 }
 
+# ---------- rotate: retire the old orchestrator, boot a fresh one -------------
+# Enforced context reorg by restart: start a new hermes orchestrator that boots from
+# the spilled pointer + digest, then close the old pane. REFUSES to close an empty pane,
+# $SELF (the loop's own pane), or the freshly-started pane. --dry-run spawns/closes nothing.
+rotate() {
+  resolve_ws
+  REPO="$(conf_get REPO)"
+  observe >/dev/null 2>&1 || true            # refresh _fleet/self
+  local self; self="$(cat "$WS/_fleet/self" 2>/dev/null || true)"
+  # old orchestrator pane: --orchestrator wins, else _fleet/orchestrator on disk.
+  local old="$ORCH"
+  [ -n "$old" ] || old="$(cat "$WS/_fleet/orchestrator" 2>/dev/null || true)"
+
+  # --- refuse before touching anything -----------------------------------------
+  if [ -z "$old" ]; then
+    echo "rotate: REFUSING — no old orchestrator pane (pass --orchestrator PANE or write $WS/_fleet/orchestrator)" >&2
+    exit 2
+  fi
+  if [ -n "$self" ] && [ "$old" = "$self" ]; then
+    echo "rotate: REFUSING — orchestrator pane ($old) is \$SELF, the loop's own pane" >&2
+    exit 2
+  fi
+  local hermes; hermes="$(command -v hermes || true)"
+  if [ -z "$hermes" ]; then echo "rotate: REFUSING — hermes not on PATH" >&2; exit 2; fi
+
+  log "rotate plan:"
+  log "  old orchestrator pane : $old"
+  log "  repo                  : ${REPO:-<unset>}"
+  log "  start new             : herdr agent start hermes --cwd \"$REPO\" --no-focus -- \"$hermes\""
+  log "  resume pointer        : $WS/_fleet/context_pointer.md + $WS/_fleet/digest.md"
+
+  if [ "$DRY_RUN" -eq 1 ]; then
+    log "  [dry-run] would send the resume pointer to the new pane"
+    log "  [dry-run] would poll (a few tries) until the new pane is listed"
+    log "  [dry-run] would: herdr pane close $old"
+    log "  [dry-run] would clear $WS/_fleet/.needs_rotation"
+    log "rotate: dry-run complete — spawned/closed nothing"
+    return 0
+  fi
+
+  local new; new="$(herdr agent start hermes --cwd "$REPO" --no-focus -- "$hermes" 2>/dev/null | jq -r '.result.agent.pane_id')"
+  if [ -z "$new" ] || [ "$new" = "null" ]; then echo "rotate: agent start failed" >&2; exit 1; fi
+  if [ "$new" = "$old" ]; then
+    echo "rotate: REFUSING — new pane ($new) equals old pane; not closing anything" >&2
+    exit 1
+  fi
+  log "started new orchestrator (pane $new)"
+  herdr agent send "$new" "You are the herd orchestrator; resume from $WS/_fleet/context_pointer.md and $WS/_fleet/digest.md and continue the loop." >/dev/null 2>&1 || true
+
+  # poll (a few tries) until the new pane is actually listed before retiring the old one.
+  local i listed=0
+  for i in 1 2 3 4 5; do
+    if herdr agent list 2>/dev/null | jq -e --arg p "$new" '.result.agents[]|select(.pane_id==$p)' >/dev/null 2>&1; then listed=1; break; fi
+    sleep 1
+  done
+  if [ "$listed" -ne 1 ]; then
+    echo "rotate: new pane $new never appeared in agent list — NOT closing old pane $old" >&2
+    exit 1
+  fi
+
+  herdr pane close "$old" >/dev/null 2>&1 || true
+  log "closed old orchestrator (pane $old)"
+  # Record the new pane so the NEXT rotation retires it, not the stale (renumbered) old id.
+  printf '%s\n' "$new" > "$WS/_fleet/orchestrator"
+  rm -f "$WS/_fleet/.needs_rotation"
+  log "rotate: complete — new orchestrator $new, retired $old"
+}
+
 # ---------- run: standing loop -----------------------------------------------
 run() {
   resolve_ws
-  local n=0
+  # --auto-rotate needs to know which pane the orchestrator is; warn early if it can't.
+  if [ "$AUTO_ROTATE" -eq 1 ] && [ -z "$ORCH" ] && [ ! -f "$WS/_fleet/orchestrator" ]; then
+    log "! --auto-rotate set but no orchestrator pane known (pass --orchestrator PANE or write $WS/_fleet/orchestrator); rotations will refuse and the loop will yield instead"
+  fi
+  local n=0 rots=0
   while true; do
     local out; out="$(tick || true)"; printf '%s\n' "$out"
     local st="${out##*STATUS: }"
     case "$st" in
+      NEEDS_ROTATION)
+        if [ "$AUTO_ROTATE" -ne 1 ]; then log "loop yields on: $st"; break; fi
+        if [ "$MAX_ROTATIONS" -gt 0 ] && [ "$rots" -ge "$MAX_ROTATIONS" ]; then
+          log "auto-rotate: cap ($MAX_ROTATIONS) reached — yielding for human"; log "loop yields on: $st"; break
+        fi
+        log "auto-rotate: NEEDS_ROTATION → rotating (#$((rots+1)))"
+        # Subshell contains rotate's `exit` on a REFUSE so a bad rotate can't kill the loop;
+        # its filesystem/herdr side effects (spawn, close, clear .needs_rotation) still persist.
+        if ( rotate ); then
+          # rotate recorded the new pane in _fleet/orchestrator; drop the stale --orchestrator
+          # override so the next rotation resolves from disk instead of the closed pane id.
+          ORCH=""
+          rots=$((rots+1)); log "auto-rotate: rotated (#$rots); continuing loop"
+        else
+          log "auto-rotate: rotate refused/failed — yielding for human"; log "loop yields on: $st"; break
+        fi ;;
       DONE|NEEDS_REVIEW|AWAITING_SOLO|STAGE_COMPLETE|PAUSED|ERROR*) log "loop yields on: $st"; break ;;
     esac
     n=$((n+1)); [ "$MAX_TICKS" -gt 0 ] && [ "$n" -ge "$MAX_TICKS" ] && { log "max-ticks reached"; break; }
@@ -354,6 +483,9 @@ REPO=$REPO
 BASE=$BASE
 FEATURE=$FEATURE
 WORKER_DEFAULT=$WORKER_DEFAULT
+# context-budget layer (see _config/budget_policy.md, scripts/context-budget.sh)
+MODEL=$MODEL
+BUDGET=$BUDGET
 EOF
   echo "01_spec" > "$WS/_fleet/active_stage"
   ledger_init
@@ -377,6 +509,7 @@ case "$CMD" in
   tick)    tick ;;
   run)     run ;;
   advance) advance ;;
+  rotate)  rotate ;;
   status)  status ;;
-  help|*)  sed -n '2,33p' "$0" ;;
+  help|*)  sed -n '2,24p' "$0" ;;
 esac

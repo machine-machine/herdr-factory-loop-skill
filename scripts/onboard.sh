@@ -166,6 +166,12 @@ case "$ORCHESTRATOR" in
   cursor) "$SCRIPT_DIR/install.sh" --local --cursor ;;
   all)    "$SCRIPT_DIR/install.sh" --local ;;
 esac
+# install.sh runs install-hermes-context.sh for hermes/all — the context-budget
+# hooks (default GLM-5.2 / 384k) keep the Hermes orchestrator within budget.
+case "$ORCHESTRATOR" in
+  hermes|all) command -v hermes >/dev/null 2>&1 && hermes hooks doctor >/dev/null 2>&1 \
+                && ok "Hermes context-budget hooks active (see 'hermes hooks list')" || true ;;
+esac
 
 # ---------- step 4: spec-kit CLI ------------------------------------------------
 

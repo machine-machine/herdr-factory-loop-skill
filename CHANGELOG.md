@@ -4,6 +4,90 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.9.0] - 2026-07-02
+
+### Fixed (merge review)
+- `herdr-context-budget.js` no longer flips its envelope to `AfterTool` when `GEMINI_API_KEY`
+  happens to be exported — always `PostToolUse`.
+- `herd-loop.sh rotate` records the new orchestrator pane in `_fleet/orchestrator` (and
+  `run --auto-rotate` drops its stale `--orchestrator` override), so a second rotation retires
+  the right pane instead of a renumbered stranger; digest deep-dive links now resolve from
+  `_fleet/` (`../stages/<stage>/output/<slice>.out`).
+- `herdr-context-session.sh` reads stdin with a real timeout (the old `$(cat)` blocked forever
+  if the host never closed stdin); its settings entry now carries `timeout: 10` too.
+- `install-hermes-context.sh` keys idempotence/uninstall on the hook filename, not the full
+  command with the absolute node path (nvm upgrades re-appended duplicates), and uninstall
+  strips only our command from a matcher group instead of deleting the whole group.
+
+Dynamic compression: keep summaries in the live window, deep-dives in files. Builds on the v1.8.0
+budget layer with a strict division of labor — Hermes compresses the live window lossily, the folder
+holds the lossless deep-dives, and a rolling digest + session-rotation bridge the two.
+
+### Added
+- **`context-budget.sh summarize` + `compact`** — `summarize --ws WS --stage S --slice X` distills one
+  worker's `output/<slice>.out` to a ≤6-line summary (its final "what I did / how I verified" report if
+  present, else a head+tail heuristic — never a full-body copy; `--llm "CMD"` pipes the `.out` through
+  CMD instead). `compact --ws WS` regenerates `_fleet/context_pointer.md` as a rolling narrative — active
+  stage + the digest + slice `context.md` links, links only.
+- **Rolling `_fleet/digest.md`** — `herd-loop.sh collect_slice` now summarizes each finished worker's
+  result and appends `## <slice>` + the summary + a link to `output/<slice>.out` (append-once per slice,
+  idempotent). The digest is the summary; the full `.out` remains the on-disk deep-dive.
+- **Session-rotation on CRITICAL** — the `herdr-context-budget.js` hook drops a `_fleet/.needs_rotation`
+  sentinel when usage crosses **CRITICAL 85%** (once per crossing); `herd-loop.sh run` detects it and
+  emits `STATUS: NEEDS_ROTATION` instead of looping on a saturated window. New `herd-loop.sh rotate --ws WS`
+  starts a fresh orchestrator that boots from `_fleet/context_pointer.md` + `digest.md` (via the
+  SessionStart hook), retires the old pane, and clears the sentinel — enforced reorg by restart. Refuses
+  to close `$SELF`, the new pane, or an empty/unknown pane id; `--dry-run` prints the plan and spawns/closes
+  nothing. Opt-in **`herd-loop.sh run --auto-rotate [--orchestrator PANE] [--max-rotations 5]`** rotates
+  automatically on `NEEDS_ROTATION` and keeps ticking (capped; a refused rotate is contained so it can't
+  crash the loop).
+- **Hermes-compressor wiring** — `install-hermes-context.sh --compression on|off` tunes (or disables) the
+  `~/.hermes/config.yaml` `compression:` block (`enabled`, `threshold` 0.5, `target_ratio` 0.2,
+  `protect_first_n`/`protect_last_n`) to budget-aligned values. Backs up config, touches only those keys,
+  idempotent, `--dry-run` diffs. Documents the lossy-live / lossless-folder contract.
+- **`skill/SKILL.md` §15.5 (Dynamic compression)** — the division of labor (Hermes compresses the live
+  window lossily; the folder holds lossless deep-dives; the rolling `_fleet/digest.md` stores per-slice
+  summaries while the full `.out` is the deep-dive; session-rotation on CRITICAL reboots the orchestrator
+  from the pointer/digest), plus the `summarize`/`compact` and `--compression` wiring.
+- **`templates/herd-control/_config/budget_policy.md`** — compression tiers (Hermes compresses at 50%;
+  our hook advises at 60/75/85% and signals rotation at CRITICAL), the digest/deep-dive convention, and
+  the `_fleet/.needs_rotation` rotation signal file.
+
+## [1.8.0] - 2026-07-02
+
+Context budgeting: keep the orchestrator inside a token budget — the folder holds the context,
+the orchestrator holds pointers.
+
+### Added
+- **`scripts/context-budget.sh`** — the decomposer/budget engine (`detect`/`status`/`plan`/
+  `pointer`). `detect` resolves `MODEL`/`BUDGET` in order (`herd.conf` → `~/.hermes/config.yaml`
+  `model.context_length` → default **GLM-5.2 / 384000**) and prints `SOURCE=`. `status` reads the
+  live bridge file (`/tmp/claude-ctx-<session>.json`) for usage vs budget. `plan` splits an intent
+  into slices and writes a per-slice context manifest at `stages/<stage>/context/<slice>.md` — file
+  **links only**, with a byte/token-estimate header, each sized to fit a budget fraction (default
+  `BUDGET × 0.25`); oversized slices are flagged (`fits: NO`), not silently emitted. `pointer`
+  regenerates one slice's manifest after a RESCOPE/edit.
+- **`hooks/herdr-context-budget.js`** — a Hermes **PostToolUse** hook (awareness + restructure on
+  demand). Reads the bridge file + `BUDGET`; on **WARNING 60% / HIGH 75% / CRITICAL 85%** (debounced;
+  severity escalation bypasses the debounce) it injects an offload advisory, and on HIGH/CRITICAL
+  spills a compact `_fleet/context_pointer.md` (active stage, ledger digest, links to each slice's
+  distilled `context.md`) so the orchestrator can drop raw history and reload from the pointer.
+  Idempotent spill, silent-fail, `session_id` path-traversal guard, never blocks a tool.
+- **`hooks/herdr-context-session.sh`** — a **SessionStart** hook that surfaces `MODEL`/`BUDGET` and
+  any existing `_fleet/context_pointer.md`, so a resumed orchestrator starts inside its budget.
+- **`scripts/install-hermes-context.sh`** — self-installer for `~/.hermes/`: copies the hooks,
+  `jq`-merges their PostToolUse/SessionStart declarations into `settings.json` (keyed by command
+  string → idempotent), sets the GLM-5.2/384k default in `config.yaml`, and verifies with
+  `hermes hooks doctor`. Backs up config before editing; `--dry-run` / `--uninstall` supported.
+  Onboarding (§11.0) and `install.sh --hermes` run it automatically for the Hermes orchestrator.
+- **`templates/herd-control/_config/budget_policy.md`** — L3 reference for the thresholds and the
+  offload doctrine; budget awareness added as a global `AGENT.md` constraint. `herd-loop.sh` `init`
+  writes `MODEL`/`BUDGET` (with `--model`/`--budget` overrides) and `gen_prompt` points each worker
+  at its slice `context.md` instead of hard-coding a file list.
+- **`skill/SKILL.md` §15 (Context budgeting & the decomposer)** — the budget setting and resolution
+  order, the `context-budget.sh` decomposer and its budget-sized slice manifests, the two Hermes
+  hooks and the offload doctrine, and the self-installer + onboarding wiring.
+
 ## [1.7.0] - 2026-07-01
 
 Default-on dispatch nudge: hooks for Claude Code and Hermes that re-check "should this herd?"
