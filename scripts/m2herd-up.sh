@@ -331,12 +331,30 @@ dispatch() {
     log "worktree: $wt ($branch off $BASE)"
   fi
 
+  # Confinement (learned the hard way: the first live headless worker followed the
+  # task file's absolute path back into the MAIN repo and committed the orchestrator's
+  # uncommitted work). The task is COPIED into the worktree and the pointer names the
+  # copy + an explicit "do all work here" line; only the report may leave the worktree.
+  copy_task_into_wt() { # copy_task_into_wt <wt> -> echoes worktree-local task path
+    local wtask="$1/TASK-m2herd-$SLICE.md" excl
+    if [ "$DRY_RUN" -eq 1 ]; then plan "cp '$task' '$wtask' (+ git-exclude it in the worktree)"; else
+      cp "$task" "$wtask"
+      excl="$(git -C "$1" rev-parse --git-path info/exclude 2>/dev/null || true)"
+      [ -n "$excl" ] && { grep -qxF "TASK-m2herd-$SLICE.md" "$excl" 2>/dev/null || echo "TASK-m2herd-$SLICE.md" >> "$excl"; }
+    fi
+    printf '%s' "$wtask"
+  }
+  confinement_line() { # confinement_line <wt> <branch>
+    printf 'You are CONFINED to the worktree %s (branch %s): do ALL reads, edits, and the commit there and NOWHERE else — never follow paths into the main repo checkout.' "$1" "$2"
+  }
+
   # 2a. HEADLESS spawn — no pane, no TUI: nohup'd one-shot in the worktree.
   #     Prompt stays a one-line pointer (file protocol); the report lands in $out
   #     by instruction, the runner's own stdout (usage JSON for claude) in $lg.
   if [ "$HEADLESS" -eq 1 ]; then
-    local out="$REPO/.m2herd/dispatch/$SLICE.out.md" lg="$REPO/.m2herd/dispatch/$SLICE.log" hpid=""
-    local hprompt="Read $task and follow its instructions exactly. Write your complete report to $out when done."
+    local out="$REPO/.m2herd/dispatch/$SLICE.out.md" lg="$REPO/.m2herd/dispatch/$SLICE.log" hpid="" wtask
+    wtask="$(copy_task_into_wt "$wt")"
+    local hprompt="$(confinement_line "$wt" "$branch") Read $wtask and follow its instructions exactly. Write your complete report to $out when done (the report file is the ONLY thing you write outside the worktree)."
     if [ "$DRY_RUN" -eq 1 ]; then
       case "$AGENT" in
         claude)   plan "cd '$wt' && nohup claude -p '<pointer>' --model '$MODEL' --dangerously-skip-permissions --output-format json > '$lg' 2>&1 &" ;;
@@ -374,8 +392,10 @@ dispatch() {
     sleep 2   # let the TUI boot before the pointer lands
   fi
 
-  # 3. file-protocol dispatch: one-line pointer, settle, Enter
-  submit_pointer "$pane" "Read $task and follow its instructions exactly."
+  # 3. file-protocol dispatch: one-line pointer, settle, Enter — same confinement
+  #    as headless: the worker reads the task COPY inside its own worktree.
+  local wtask2; wtask2="$(copy_task_into_wt "$wt")"
+  submit_pointer "$pane" "$(confinement_line "$wt" "$branch") Read $wtask2 and follow its instructions exactly."
 
   # 4. record in overview.json workers[]
   record_worker "$SLICE" "$pane" "$wt" "$branch" "spawned"

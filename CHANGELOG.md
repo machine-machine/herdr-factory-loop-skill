@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [2.2.0] - 2026-07-02
 
+### Fixed
+- **Worker confinement.** The first live headless worker followed the task file's absolute
+  path back into the main repo and committed the orchestrator's uncommitted work. dispatch
+  (both TUI and headless) now COPIES the task into the worktree (git-excluded), and the
+  pointer prompt opens with an explicit confinement line — only the report file may leave
+  the worktree.
+
 ### Added
 - **Headless worker tier** — `m2herd-up dispatch --headless [--model M]`: no pane, no TUI —
   `claude -p` (default sonnet; verified on the Max plan), `codex exec`, or `opencode run`
