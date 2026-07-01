@@ -4,6 +4,40 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.8.0] - 2026-07-01
+
+Dynamic compression: keep summaries in the live window, deep-dives in files. Builds on the v1.7.0
+budget layer with a strict division of labor — Hermes compresses the live window lossily, the folder
+holds the lossless deep-dives, and a rolling digest + session-rotation bridge the two.
+
+### Added
+- **`context-budget.sh summarize` + `compact`** — `summarize --ws WS --stage S --slice X` distills one
+  worker's `output/<slice>.out` to a ≤6-line summary (its final "what I did / how I verified" report if
+  present, else a head+tail heuristic — never a full-body copy; `--llm "CMD"` pipes the `.out` through
+  CMD instead). `compact --ws WS` regenerates `_fleet/context_pointer.md` as a rolling narrative — active
+  stage + the digest + slice `context.md` links, links only.
+- **Rolling `_fleet/digest.md`** — `herd-loop.sh collect_slice` now summarizes each finished worker's
+  result and appends `## <slice>` + the summary + a link to `output/<slice>.out` (append-once per slice,
+  idempotent). The digest is the summary; the full `.out` remains the on-disk deep-dive.
+- **Session-rotation on CRITICAL** — the `herdr-context-budget.js` hook drops a `_fleet/.needs_rotation`
+  sentinel when usage crosses **CRITICAL 85%** (once per crossing); `herd-loop.sh run` detects it and
+  emits `STATUS: NEEDS_ROTATION` instead of looping on a saturated window. New `herd-loop.sh rotate --ws WS`
+  starts a fresh orchestrator that boots from `_fleet/context_pointer.md` + `digest.md` (via the
+  SessionStart hook), retires the old pane, and clears the sentinel — enforced reorg by restart. Refuses
+  to close `$SELF`, the new pane, or an empty/unknown pane id; `--dry-run` prints the plan and spawns/closes
+  nothing.
+- **Hermes-compressor wiring** — `install-hermes-context.sh --compression on|off` tunes (or disables) the
+  `~/.hermes/config.yaml` `compression:` block (`enabled`, `threshold` 0.5, `target_ratio` 0.2,
+  `protect_first_n`/`protect_last_n`) to budget-aligned values. Backs up config, touches only those keys,
+  idempotent, `--dry-run` diffs. Documents the lossy-live / lossless-folder contract.
+- **`skill/SKILL.md` §14.5 (Dynamic compression)** — the division of labor (Hermes compresses the live
+  window lossily; the folder holds lossless deep-dives; the rolling `_fleet/digest.md` stores per-slice
+  summaries while the full `.out` is the deep-dive; session-rotation on CRITICAL reboots the orchestrator
+  from the pointer/digest), plus the `summarize`/`compact` and `--compression` wiring.
+- **`templates/herd-control/_config/budget_policy.md`** — compression tiers (Hermes compresses at 50%;
+  our hook advises at 60/75/85% and signals rotation at CRITICAL), the digest/deep-dive convention, and
+  the `_fleet/.needs_rotation` rotation signal file.
+
 ## [1.7.0] - 2026-07-01
 
 Context budgeting: keep the orchestrator inside a token budget — the folder holds the context,
