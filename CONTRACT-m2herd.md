@@ -94,6 +94,29 @@ only, NOT built now) may add navigation, never editing; the only input concessio
 ever make is a keypress that opens an inbox file (STEER.md-style) — steering goes through
 the loop, never directly into the state files.
 
+## Amendment v1.4 — dashboard layout, observed fleet column, STEER inbox
+
+**Layout (slice A).** dashboard renders the reference mock: boxed header line
+`m2herd · <repo-basename> ── ● <status> · drift ✓|◐`, then `goal` / `done_when` /
+`budget` rows (budget: newest `/tmp/claude-ctx-*.json` bridge file if any — bar + "N% of
+BUDGET" + "updated <age> ago"; omit row when none), then NEXT, then AREAS and WORKERS
+**side-by-side** when the tty is ≥100 cols (stacked otherwise), then OPEN QUESTIONS,
+NOTES tail, and a static footer: `read-only · steering: .m2herd/inbox/STEER.md`.
+
+**Observed fleet column (slice A).** When `herdr` is on PATH, dashboard queries
+`herdr agent list` ONCE and the WORKERS table shows desired (workers[].state) AND observed
+(pane agent_status) — mismatch marked `!`. Silent degrade to desired-only without herdr.
+Dashboard remains read-only: herdr READS are allowed, herdr writes/sends are FORBIDDEN here.
+
+**STEER inbox (slice A + B).** `init` also scaffolds `.m2herd/inbox/STEER.md` (boilerplate +
+marker, STEER.md pattern). `next` gains a case between drift and coach-intent:
+non-empty content below the marker → `NEXT: drain steering — read .m2herd/inbox/STEER.md,
+act, then clear below the marker`. (Slice B: no change — session hook already injects next.)
+
+**Docs (slice D).** Document the layout, the desired-vs-observed workers column, and the
+steering contract: TUI keys (tier 3) APPEND to STEER.md; the orchestrator drains it via
+`next`; a watcher pane never runs herdr mutations directly.
+
 ## .m2herd/ layout (created by `m2herd.sh init`)
 
 ```
