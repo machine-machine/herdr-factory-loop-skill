@@ -4,6 +4,41 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [1.7.0] - 2026-07-01
+
+Context budgeting: keep the orchestrator inside a token budget — the folder holds the context,
+the orchestrator holds pointers.
+
+### Added
+- **`scripts/context-budget.sh`** — the decomposer/budget engine (`detect`/`status`/`plan`/
+  `pointer`). `detect` resolves `MODEL`/`BUDGET` in order (`herd.conf` → `~/.hermes/config.yaml`
+  `model.context_length` → default **GLM-5.2 / 384000**) and prints `SOURCE=`. `status` reads the
+  live bridge file (`/tmp/claude-ctx-<session>.json`) for usage vs budget. `plan` splits an intent
+  into slices and writes a per-slice context manifest at `stages/<stage>/context/<slice>.md` — file
+  **links only**, with a byte/token-estimate header, each sized to fit a budget fraction (default
+  `BUDGET × 0.25`); oversized slices are flagged (`fits: NO`), not silently emitted. `pointer`
+  regenerates one slice's manifest after a RESCOPE/edit.
+- **`hooks/herdr-context-budget.js`** — a Hermes **PostToolUse** hook (awareness + restructure on
+  demand). Reads the bridge file + `BUDGET`; on **WARNING 60% / HIGH 75% / CRITICAL 85%** (debounced;
+  severity escalation bypasses the debounce) it injects an offload advisory, and on HIGH/CRITICAL
+  spills a compact `_fleet/context_pointer.md` (active stage, ledger digest, links to each slice's
+  distilled `context.md`) so the orchestrator can drop raw history and reload from the pointer.
+  Idempotent spill, silent-fail, `session_id` path-traversal guard, never blocks a tool.
+- **`hooks/herdr-context-session.sh`** — a **SessionStart** hook that surfaces `MODEL`/`BUDGET` and
+  any existing `_fleet/context_pointer.md`, so a resumed orchestrator starts inside its budget.
+- **`scripts/install-hermes-context.sh`** — self-installer for `~/.hermes/`: copies the hooks,
+  `jq`-merges their PostToolUse/SessionStart declarations into `settings.json` (keyed by command
+  string → idempotent), sets the GLM-5.2/384k default in `config.yaml`, and verifies with
+  `hermes hooks doctor`. Backs up config before editing; `--dry-run` / `--uninstall` supported.
+  Onboarding (§11.0) and `install.sh --hermes` run it automatically for the Hermes orchestrator.
+- **`templates/herd-control/_config/budget_policy.md`** — L3 reference for the thresholds and the
+  offload doctrine; budget awareness added as a global `AGENT.md` constraint. `herd-loop.sh` `init`
+  writes `MODEL`/`BUDGET` (with `--model`/`--budget` overrides) and `gen_prompt` points each worker
+  at its slice `context.md` instead of hard-coding a file list.
+- **`skill/SKILL.md` §14 (Context budgeting & the decomposer)** — the budget setting and resolution
+  order, the `context-budget.sh` decomposer and its budget-sized slice manifests, the two Hermes
+  hooks and the offload doctrine, and the self-installer + onboarding wiring.
+
 ## [1.6.0] - 2026-06-19
 
 Meta-orchestration: the orchestrator of orchestrators. A tier above §12 — launch and oversee

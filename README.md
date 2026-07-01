@@ -42,6 +42,7 @@ This skill teaches an agent how to:
 | 11 | SDD factory loop (spec-kit × herdr) | Spec-driven development: spec → plan → tasks → herd implements `[P]` tasks → analyze → converge against the spec |
 | 12 | ICM-steered loop (`herd-loop.sh`) | Make one orchestrator a standing, disk-reconstructible reconciler over a `herd-control/` workspace (folder=desired, socket=observed) |
 | 13 | Meta-orchestration (`fleet-loop.sh`) | Be the orchestrator of orchestrators: launch + oversee one orchestrator per mission (each driving its own herd), `/goal`-armed to self-drive — `fleet-control/` |
+| 14 | Context budgeting & decomposer (Hermes) | keep the orchestrator within a token budget (default GLM-5.2/384k); decompose into budget-sized slice manifests; hooks offload context on demand |
 
 See [`skill/SKILL.md`](./skill/SKILL.md) for the full reference and
 [`skill/reference.md`](./skill/reference.md) for verbatim CLI/socket docs.
