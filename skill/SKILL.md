@@ -773,7 +773,8 @@ machine prompts itself from its own state**. Its doctrine pillars:
   every other pane is a watcher. `m2herd dashboard` is a pure renderer over existing state —
   no new state, no writes, ever — and it displays the same self-prompt the machine injects
   into itself (the `NEXT:` line is rendered from the same code path as `next`). Any future
-  interactive tier may add navigation, never editing (roadmap in §16.2).
+  interactive tier may add navigation, never editing — watchers steer only by appending to
+  `.m2herd/inbox/STEER.md`, which the orchestrator drains through the loop (§16.2).
 - **Self-documentation.** Every refile IS the documentation act; nothing lives only in the
   live window. Offloading context and documenting the project are the same motion.
 - **Memory tiers — division of labor.** `.m2herd/` is the PROJECT's working memory (files,
@@ -800,6 +801,7 @@ line separating template boilerplate from live content) and appends `.m2herd/` t
   context/<area>/deep/        # lossless deep-dives (worker outputs, logs, transcripts)
   dispatch/<slice>.task.md    # worker task files (§4 file protocol)
   dispatch/<slice>.out.md     # worker answers
+  inbox/STEER.md              # steering inbox: watchers/TUI keys APPEND below the marker; the orchestrator drains it via `next`
 ```
 
 `overview.json` is the index the orchestrator navigates by: `goal`, `done_when` (the coached
@@ -845,24 +847,40 @@ m2herd.sh selftest                        # tmpdir end-to-end: init → note →
 one `NEXT: ` line, so the machine always knows its next move without an LLM in the loop:
 
 1. drift (`sync --check` logic fails) → `NEXT: context drift — run: m2herd sync`
-2. `done_when` empty → `NEXT: coach the intent — set done_when + record open_questions`
-3. loose content in NOTES.md below the marker → `NEXT: refile notes — run: m2herd refile --area <pick>`
-4. a `workers[]` entry `spawned|working` whose pane is gone/idle → `NEXT: collect worker <slice> — run: m2herd-up collect --slice <slice>`
-5. `open_questions` non-empty → `NEXT: resolve open question: <first>`
-6. otherwise → `NEXT: compare RESUME.md against goal/done_when and dispatch or finish`
+2. non-empty content below the `inbox/STEER.md` marker → `NEXT: drain steering — read .m2herd/inbox/STEER.md, act, then clear below the marker`
+3. `done_when` empty → `NEXT: coach the intent — set done_when + record open_questions`
+4. loose content in NOTES.md below the marker → `NEXT: refile notes — run: m2herd refile --area <pick>`
+5. a `workers[]` entry `spawned|working` whose pane is gone/idle → `NEXT: collect worker <slice> — run: m2herd-up collect --slice <slice>`
+6. `open_questions` non-empty → `NEXT: resolve open question: <first>`
+7. otherwise → `NEXT: compare RESUME.md against goal/done_when and dispatch or finish`
 
-`dashboard` composes, in order: a header (goal • status • done_when • drift dot — `●` clean /
-`◐ drift`, from the `sync --check` logic — • humanized age of `updated_at`, e.g. 3m/7h/4d);
-the `NEXT:` line (same code path as `next` — the dashboard displays the same self-prompt the
-machine injects into itself); the AREAS table (name, active/archived status, per-area age from
-each context.md `updated:` header, related links — archived areas rendered dim on one line;
-**staleness ages make rot visible**: decay discipline, rendered); the WORKERS table (slice,
-state, branch) when `workers[]` is non-empty; the OPEN QUESTIONS list when non-empty; and the
-last 5 content lines of NOTES.md below the marker. Plain ASCII with tput colors on a tty,
-degrading to plain when piped. Tier roadmap (roadmap only — not built): tier 2 adds an
+`dashboard` renders the reference layout, top to bottom: a boxed header line —
+`m2herd · <repo-basename> ── ● <status> · drift ✓|◐` (the drift dot from the `sync --check`
+logic) — then `goal` / `done_when` / `budget` rows (the budget row reads the newest
+`/tmp/claude-ctx-*.json` bridge file: usage bar + "N% of BUDGET" + "updated <age> ago";
+omitted when no bridge file exists); the `NEXT:` line (same code path as `next` — the
+dashboard displays the same self-prompt the machine injects into itself); the AREAS and
+WORKERS tables **side-by-side** when the tty is ≥100 columns, stacked otherwise; the OPEN
+QUESTIONS list when non-empty; the last 5 content lines of NOTES.md below the marker; and a
+static footer: `read-only · steering: .m2herd/inbox/STEER.md`. AREAS shows name,
+active/archived status, per-area age from each context.md `updated:` header, and related
+links — archived areas rendered dim on one line; **staleness ages make rot visible**: decay
+discipline, rendered. WORKERS (when `workers[]` is non-empty) shows slice, branch, and
+**desired vs observed** state: when `herdr` is on PATH the dashboard queries
+`herdr agent list` ONCE per render and sets the desired `workers[].state` beside the observed
+pane `agent_status`, marking mismatches with `!`; without herdr it degrades silently to
+desired-only. herdr READS are allowed in a watcher pane; herdr writes/sends (`agent send`,
+`pane send-keys`, spawns, closes) are FORBIDDEN there — the dashboard stays a renderer even
+when it looks at the live fleet. Plain ASCII with tput colors on a tty, degrading to plain
+when piped.
+
+**Steering goes through the loop.** `init` also scaffolds `.m2herd/inbox/STEER.md`
+(boilerplate + a `<!-- marker -->` line, the STEER.md pattern). Anything that wants to steer
+the orchestrator — a human, a tier-3 TUI keypress — APPENDS below the marker; the orchestrator
+drains it via `next`'s drain-steering case (read, act, clear below the marker). Nothing steers
+by editing the state files directly. Tier roadmap (roadmap only — not built): tier 2 adds an
 fswatch-triggered repaint; tier 3 a bubbletea/textual TUI with navigation — navigation yes,
-editing no. The only input concession any tier may ever make is a keypress that opens a
-STEER.md-style inbox file: steering goes through the loop, never directly into the state files.
+editing no; its keys' only write is the STEER.md append above.
 
 The daily loop: `note` whatever matters the moment it matters → `refile --area A` when a topic
 has gathered enough notes (this is the documentation act) → `resume` when you come back →

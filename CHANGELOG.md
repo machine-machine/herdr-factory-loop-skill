@@ -28,15 +28,22 @@ hoarding). Built as a 4-slice herd against the pre-committed `CONTRACT-m2herd.md
   `sync --check` (drift report, exit 3), `archive --area A` (distill a done area to header +
   ≤10 summary lines, `status: archived`; `deep/` stays lossless), `gist [--push]` (one-paragraph
   project gist; `--push` pipes to `$M2HERD_GIST_CMD`), `next` (the self-prompting primitive: a
-  mechanical 6-case priority walk — drift → uncoached intent → loose notes → collectable worker →
-  first open question → compare RESUME vs goal/done_when — printing exactly one `NEXT: ` line,
-  no LLM calls), `dashboard` (read-only tier-1 TUI — a pure renderer over existing state, no
-  writes ever: header with drift dot + humanized ages, the `NEXT:` line from the same code path
-  as `next`, AREAS with staleness ages that make rot visible, WORKERS, OPEN QUESTIONS, NOTES
-  tail; tput colors on a tty, plain when piped; one writer, many watchers — future tiers may
-  add fswatch repaint (2) or bubbletea/textual navigation (3), never editing; the only input
-  concession is a keypress opening a STEER-style inbox file), and `selftest` (tmpdir end-to-end
-  with jq schema assertions, incl. `next` cases and a dashboard smoke).
+  mechanical 7-case priority walk — drift → drain steering (`.m2herd/inbox/STEER.md` content
+  below the marker) → uncoached intent → loose notes → collectable worker → first open question →
+  compare RESUME vs goal/done_when — printing exactly one `NEXT: ` line, no LLM calls),
+  `dashboard` (read-only tier-1 TUI — a pure renderer over existing state, no writes ever: boxed
+  header `m2herd · <repo> ── ● <status> · drift ✓|◐`, goal/done_when/budget rows (budget from the
+  newest `/tmp/claude-ctx-*.json` bridge file; omitted when none), the `NEXT:` line from the same
+  code path as `next`, AREAS and WORKERS side-by-side on a ≥100-col tty (stacked otherwise) with
+  staleness ages that make rot visible and a desired-vs-observed workers column — one
+  `herdr agent list` read per render, mismatches marked `!`, silent degrade without herdr; herdr
+  reads allowed in a watcher pane, herdr mutations forbidden — OPEN QUESTIONS, NOTES tail, and a
+  `read-only · steering: .m2herd/inbox/STEER.md` footer; tput colors on a tty, plain when piped;
+  one writer, many watchers — future tiers may add fswatch repaint (2) or bubbletea/textual
+  navigation (3), never editing; TUI keys' only write is an APPEND below the STEER.md marker,
+  drained by the orchestrator via `next`), and `selftest` (tmpdir end-to-end with jq schema
+  assertions, incl. `next` cases and a dashboard smoke). `init` also scaffolds
+  `.m2herd/inbox/STEER.md` (boilerplate + marker).
   `overview.json` gains optional `done_when` (seeded empty by `init --goal` = "intent not yet
   coached") and `open_questions[]`. `templates/m2herd/` ships the
   `overview.json`/`RESUME.md`/`NOTES.md` seeds with a `<!-- marker -->` line separating
