@@ -68,6 +68,32 @@ loop — hooks are the heartbeat, `next` is the pulse it injects, the orchestrat
 intent before dispatching, and the machine prompts itself from its own state. Document
 `next`, `done_when`/`open_questions`.
 
+## Amendment v1.3 — the dashboard (tier-1 TUI, read-only)
+
+**`m2herd.sh dashboard [--dir P]` (slice A).** A pure RENDERER over existing state — no new
+state, no writes, ever. Composes, in order:
+1. header: goal • status • done_when • drift dot (`●` clean / `◐ drift` from the sync --check
+   logic) • humanized age of updated_at (3m/7h/4d)
+2. the `NEXT:` line (same code path as `next`)
+3. AREAS table: name, status (active/archived), age from each context.md header `updated:`,
+   related links — archived rendered dim/one-line; staleness ages make rot VISIBLE
+4. WORKERS table (slice, state, branch) when workers[] non-empty
+5. OPEN QUESTIONS list when non-empty
+6. NOTES tail: last 5 content lines below the marker
+Plain ASCII + tput colors when a tty (degrade to plain when piped). Add a dashboard smoke to
+selftest (runs against the tmpdir fixture, asserts NEXT line + area row present).
+
+**Notes pane (slice C).** The notes pane command becomes:
+`watch -n 2 -t "m2herd dashboard"` when `command -v m2herd` AND watch exist; else the
+existing NOTES.md viewer fallback chain. The pane is a WATCHER, never a writer.
+
+**Read-only doctrine (slice D, §16).** One writer (the orchestrator), many watchers. The
+dashboard displays the same self-prompt the machine injects into itself. Any future
+interactive tier (fswatch repaint = tier 2; bubbletea/textual navigation = tier 3 — roadmap
+only, NOT built now) may add navigation, never editing; the only input concession a TUI may
+ever make is a keypress that opens an inbox file (STEER.md-style) — steering goes through
+the loop, never directly into the state files.
+
 ## .m2herd/ layout (created by `m2herd.sh init`)
 
 ```
