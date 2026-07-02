@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 2.2.0
+version: 2.3.0
 description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator). ALSO trigger for meta-orchestration — when the user wants to be the "meta-orchestrator" / "orchestrator of orchestrators", oversee or launch multiple orchestrators (each driving its own herd of workers) across several missions/repos, or drive a portfolio of parallel missions with /goal-based autonomy (fleet-loop.sh / fleet-control). ALSO trigger for m2herd — the Claude Code (Fable) main-orchestrator context fabric — when the user mentions m2herd, .m2herd, "context fabric", wants to offload context into the repo folder (the folder holds the context, the orchestrator holds pointers), refile or archive notes/areas, push a project gist to fleet memory, or come back to a project via the resume file (RESUME.md).
 ---
 
@@ -922,6 +922,17 @@ the pane entirely: `claude -p <pointer> --model M --dangerously-skip-permissions
 (salvaged from the log's `.result` if the worker forgot). `collect` waits on the **pid**, not
 a pane, and parses `outputTokens`/`costUSD` into `workers[]`; the dashboard WORKERS table
 shows the runner + humanized spend (`sonnet 12k`). Cursor has no headless mode.
+
+**Auto-kick — the fabric wakes its own orchestrator.** `m2herd next` gains a case (after
+drift/steering, before intent coaching): fabric present + herdr reachable + no machineroom
+tab watching this repo → `NEXT: bring up the machineroom — run: m2herd-up up --room-only`.
+The SessionStart hook injects that line plus the ORCHESTRATOR MANDATE: a Claude Code session
+starting in a fabric repo is told it IS the main orchestrator and that NEXT housekeeping
+(room up, sync, refile) is pre-authorized on its first turn — while spawning workers,
+worktrees, or branches still requires explicit user confirmation. `up --room-only` ensures
+workspace + machineroom but NEVER spawns an orchestrator pane: the session executing it is
+the orchestrator (a hook-nudged session must never spawn a second one next to itself).
+Hooks still never spawn anything — the hook talks, the model acts, the human keeps the gate.
 
 **Model-tier policy.** The orchestrator (Fable) spends tokens on *judgment only*: intent
 coaching, contract writing, converge decisions, reviews of last resort. Everything else is

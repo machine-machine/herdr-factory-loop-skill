@@ -88,6 +88,15 @@ if [ -n "$NEXT" ]; then
 ${NEXT}"
 fi
 
+# The orchestrator mandate — this is what makes a Claude Code session "kick off"
+# the fabric on its own: housekeeping is pre-authorized, delegation is not.
+MSG="${MSG}
+You are the m2herd MAIN ORCHESTRATOR for this repo. On your first turn, perform the
+NEXT housekeeping above without being asked (bring up the machineroom via
+'m2herd-up up --room-only', run 'm2herd sync', refile notes) alongside the user's
+request. Spawning WORKERS, worktrees, or branches still requires explicit user
+confirmation — housekeeping is pre-authorized, delegation is not."
+
 # Emit the structured envelope. Typed fields let tests assert the contract
 # without grepping the prose.
 jq -cn \
