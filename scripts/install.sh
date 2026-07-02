@@ -290,6 +290,25 @@ install_m2herd_bins() {
     chmod +x "$src" 2>/dev/null || true
     echo "[claude] linked $link -> $src"
   done
+
+  # m2herd-tui: pick the prebuilt for this OS/arch (Go, static). Absent prebuilt
+  # is fine — `m2herd dashboard --watch` falls back to the bash renderer.
+  local os arch tui_src tui_link="$bin_dir/m2herd-tui"
+  if [ "$uninstall" -eq 1 ]; then
+    [ -L "$tui_link" ] && rm "$tui_link" && echo "[claude] removed bin symlink $tui_link"
+    return 0
+  fi
+  os="$(uname -s | tr '[:upper:]' '[:lower:]')"
+  arch="$(uname -m)"; case "$arch" in x86_64) arch=amd64 ;; aarch64) arch=arm64 ;; esac
+  tui_src="$SCRIPTS_SRC_DIR/../prebuilt/m2herd-tui-$os-$arch"
+  if [ -f "$tui_src" ]; then
+    [ -L "$tui_link" ] || [ -e "$tui_link" ] && rm -f "$tui_link"
+    ln -s "$tui_src" "$tui_link"
+    chmod +x "$tui_src" 2>/dev/null || true
+    echo "[claude] linked $tui_link -> $tui_src"
+  else
+    echo "[claude] note: no prebuilt m2herd-tui for $os-$arch — dashboard --watch will use the bash renderer"
+  fi
 }
 
 # --- Hermes: register in ~/.hermes/config.yaml hooks.pre_llm_call (the

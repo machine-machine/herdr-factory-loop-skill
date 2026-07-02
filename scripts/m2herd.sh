@@ -745,7 +745,13 @@ case "$CMD" in
   archive)  archive ;;
   gist)     gist_cmd ;;
   next)      next_cmd ;;
-  dashboard) if [ "$WATCH" -eq 1 ]; then dashboard_watch; else dashboard; fi ;;
+  dashboard)
+    # Tier-3 chain: --watch prefers the Go TUI (m2herd-tui, bubbletea) when installed —
+    # correct Unicode widths + adaptive colors on any terminal. M2HERD_NO_TUI=1 forces
+    # the bash fallback; the one-shot render (no --watch) always stays bash (hook/CI-safe).
+    if [ "$WATCH" -eq 1 ] && [ "${M2HERD_NO_TUI:-}" != "1" ] && command -v m2herd-tui >/dev/null 2>&1; then
+      exec m2herd-tui --dir "$DIR"
+    elif [ "$WATCH" -eq 1 ]; then dashboard_watch; else dashboard; fi ;;
   self-update) self_update_cmd ;;
   selftest)  selftest ;;
   help|*)    sed -n '2,28p' "$0" ;;
