@@ -396,6 +396,10 @@ next_cmd() {
 # One writer (the orchestrator), many watchers: this code path NEVER writes state.
 # herdr READS (agent list) are allowed; herdr sends/closes are FORBIDDEN here.
 epoch_of() { date -j -u -f '%Y-%m-%dT%H:%M:%SZ' "$1" +%s 2>/dev/null || date -u -d "$1" +%s 2>/dev/null || echo 0; }
+# GNU first, BSD fallback. GNU `stat -f` SUCCEEDS with a filesystem dump and GNU
+# `date -r` means file-mtime, so the naive BSD-first || chains break on Linux.
+file_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+fmt_epoch()  { date -d "@$1" "+$2" 2>/dev/null || date -r "$1" "+$2" 2>/dev/null || true; }
 age_secs() { # epoch → humanized 42s / 3m / 7h / 4d
   local now d
   [ "${1:-0}" -gt 0 ] || { echo "?"; return 0; }
@@ -418,7 +422,8 @@ budget_row() {
   budget="$(jq -r '.budget // 384000' "$f")"
   filled=$((pct * 20 / 100)); [ "$filled" -le 20 ] || filled=20; [ "$filled" -ge 0 ] || filled=0
   bar="$(printf '%*s' "$filled" '' | tr ' ' '█')$(printf '%*s' "$((20 - filled))" '' | tr ' ' '░')"
-  mt="$(stat -f %m "$f" 2>/dev/null || stat -c %Y "$f" 2>/dev/null || echo 0)"
+  mt="$(file_mtime "$f")"
+  case "$mt" in ''|*[!0-9]*) mt=0 ;; esac   # never let a stat surprise reach the integer tests
   printf 'budget:    %s %s%% of %s · updated %s ago\n' "$bar" "$pct" "$budget" "$(age_secs "$mt")"
 }
 
@@ -508,7 +513,8 @@ update_row() {
   read -r word n when < "$UPDATE_CACHE" 2>/dev/null || return 0
   [ "$word" = "behind" ] || return 0
   now="$(date -u +%s)"
-  age="$(( now - $(date -u -j -f %Y-%m-%dT%H:%M:%SZ "$when" +%s 2>/dev/null || echo "$now") ))"
+  age="$(( now - $(epoch_of "$when") ))"
+  [ "$age" -le "$now" ] || age=0   # epoch_of returns 0 on parse failure → treat as fresh-unknown
   [ "$age" -lt 86400 ] || return 0
   printf 'update:    %s%s commit(s) behind — run: m2herd self-update%s\n' "$Y" "$n" "$R"
 }
@@ -604,9 +610,9 @@ dashboard() {
       case "$line" in
         "- ["*Z"]"*)
           iso="${line#- [}"; iso="${iso%%]*}"; rest="${line#*\] }"
-          ep="$(date -j -u -f %Y-%m-%dT%H:%M:%SZ "$iso" +%s 2>/dev/null || true)"
-          if [ -n "$ep" ]; then
-            if [ "$(date -r "$ep" +%Y-%m-%d)" = "$today" ]; then hum="$(date -r "$ep" +%H:%M)"; else hum="$(date -r "$ep" '+%b %-d %H:%M')"; fi
+          ep="$(epoch_of "$iso")"
+          if [ "${ep:-0}" -gt 0 ] 2>/dev/null; then
+            if [ "$(fmt_epoch "$ep" %Y-%m-%d)" = "$today" ]; then hum="$(fmt_epoch "$ep" %H:%M)"; else hum="$(fmt_epoch "$ep" '%b %-d %H:%M')"; fi
             printf '  - %s[%s]%s %s\n' "$D" "$hum" "$R" "$rest"
           else printf '  %s\n' "$line"; fi ;;
         *) printf '  %s\n' "$line" ;;

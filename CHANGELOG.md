@@ -4,6 +4,15 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.3.1] - 2026-07-02
+
+### Fixed
+- **Linux portability in the dashboard.** GNU `stat -f` *succeeds* (filesystem dump) and GNU
+  `date -r` means file-mtime, so the BSD-first fallback chains broke on Linux: the budget row
+  spilled a filesystem dump into the dashboard and line-401-style integer tests failed. New
+  portable helpers (`file_mtime`, `fmt_epoch`, GNU-first) + a numeric guard before every
+  integer test; NOTES human dates and the update row now render on both platforms.
+
 ## [2.3.0] - 2026-07-02
 
 ### Added
