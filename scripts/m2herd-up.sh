@@ -9,7 +9,10 @@
 # with a report) stays with the orchestrator.
 #
 # Usage:
-#   m2herd-up.sh up       [--repo P] [--goal "…"]   # ensure herdr workspace: ONE orchestrator pane (claude) + ONE machineroom pane; m2herd.sh init if missing
+#   m2herd-up.sh up       [--repo P] [--goal "…"] [--room-only]
+#                                                   # ensure herdr workspace: ONE orchestrator pane (claude) + ONE machineroom pane; m2herd.sh init if missing
+#                                                   # --room-only: workspace + machineroom ONLY, never spawn an orchestrator — for the
+#                                                   #   auto-kick path where the calling Claude Code session IS the orchestrator
 #   m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor]
 #                         [--headless [--model M]]  # worktree wip/m2herd-<S> off BASE (default: current branch), spawn worker,
 #                                                   # file-protocol dispatch of .m2herd/dispatch/S.task.md, record in overview.json workers[]
@@ -31,7 +34,7 @@ set -euo pipefail
 DRY_RUN=0
 while [ "${1:-}" = "--dry-run" ]; do DRY_RUN=1; shift; done
 CMD="${1:-help}"; shift || true
-REPO=""; GOAL=""; SLICE=""; BASE=""; AGENT="claude"; HEADLESS=0; MODEL=""
+REPO=""; GOAL=""; SLICE=""; BASE=""; AGENT="claude"; HEADLESS=0; MODEL=""; ROOM_ONLY=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO="$2"; shift 2 ;;
@@ -40,6 +43,7 @@ while [ $# -gt 0 ]; do
     --base) BASE="$2"; shift 2 ;;
     --agent) AGENT="$2"; shift 2 ;;
     --headless) HEADLESS=1; shift ;;
+    --room-only) ROOM_ONLY=1; shift ;;
     --model) MODEL="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) CMD="help"; shift ;;
@@ -232,7 +236,15 @@ up() {
 
   # 3. EXACTLY ONE orchestrator pane (claude). Idempotent: spawn only when none
   #    exists; never close extras (one could be $SELF mid-work) — warn instead.
+  #    --room-only skips this entirely: the SESSION RUNNING THIS COMMAND is the
+  #    orchestrator (the auto-kick path — a hook-nudged Claude Code session must
+  #    never spawn a second orchestrator next to itself).
   local orch_name="m2herd-orch-$(basename "$REPO")" orch n
+  if [ "$ROOM_ONLY" -eq 1 ]; then
+    orch="(this session)"
+    log "room-only: skipping orchestrator ensure — the calling session is the orchestrator"
+    n=1
+  else
   orch="$(herdr agent list 2>/dev/null | jq -r --arg c "$REPO" --arg n "$orch_name" \
     '[.result.agents[] | select(.cwd==$c and ((.name // "")==$n or (.name // "")=="claude"))] | map(.pane_id) | join("\n")' 2>/dev/null || true)"
   n="$(printf '%s' "$orch" | grep -c . || true)"
@@ -256,6 +268,7 @@ up() {
     orch="$(printf '%s' "$orch" | head -1)"
     log "! $n orchestrator panes found (want EXACTLY ONE) — keeping $orch; close extras by hand (never \$SELF)"
   fi
+  fi   # end --room-only guard
 
   # 4. ONE machineroom pane live-viewing NOTES.md. Idempotency key: the tab label —
   #    a labeled tab survives restarts and is observable via `herdr tab list`.

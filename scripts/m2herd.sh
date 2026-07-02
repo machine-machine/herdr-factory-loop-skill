@@ -342,6 +342,26 @@ stale_worker() {
     done
 }
 
+# Is a machineroom tab (label machineroom, or pre-rename m2herd-notes) watching
+# THIS repo? "Watching" = one of the tab's panes is cwd'd inside $DIR. Degrades
+# to "yes" (suppressing the nudge) when herdr is absent/unreachable, and can be
+# forced off with M2HERD_SKIP_ROOM_CHECK=1 (selftest runs in rooms-less tmpdirs).
+machineroom_watching() {
+  [ "${M2HERD_SKIP_ROOM_CHECK:-}" = "1" ] && return 0
+  command -v herdr >/dev/null 2>&1 || return 0
+  local tabs panes
+  tabs="$(herdr tab list 2>/dev/null | jq -r '[.result.tabs[]? | select((.label//"")=="machineroom" or (.label//"")=="m2herd-notes") | .tab_id] | join(" ")' 2>/dev/null || true)"
+  [ -n "$tabs" ] || { herdr status >/dev/null 2>&1 || return 0; return 1; }   # server down → suppress; up + no tabs → nudge
+  local t
+  for t in $tabs; do
+    if herdr pane list 2>/dev/null | jq -e --arg t "$t" --arg d "$DIR" \
+        '[.result.panes[]? | select(.tab_id==$t and ((.cwd//"") | startswith($d)))] | length > 0' >/dev/null 2>&1; then
+      return 0
+    fi
+  done
+  return 1
+}
+
 # mechanical priority walk — NO LLM, exactly one "NEXT: " line
 next_cmd() {
   resolve_dir; need_init
@@ -351,6 +371,9 @@ next_cmd() {
   fi
   if [ -f "$m2/inbox/STEER.md" ] && has_ink "$(live_tail "$m2/inbox/STEER.md")"; then
     echo "NEXT: drain steering — read .m2herd/inbox/STEER.md, act, then clear below the marker"; return 0
+  fi
+  if ! machineroom_watching; then
+    echo "NEXT: bring up the machineroom — run: m2herd-up up --room-only --repo $DIR"; return 0
   fi
   if [ -z "$(jq -r '.done_when // ""' "$(OV)")" ]; then
     echo "NEXT: coach the intent — set done_when + record open_questions (m2herd.sh has no opinion; you do)"; return 0
@@ -597,6 +620,9 @@ dashboard() {
 # ---------- selftest: tmpdir end-to-end ---------------------------------------
 selftest() {
   need_jq
+  # tmpdir fixtures have no machineroom; suppress the room nudge so the other
+  # next-cases stay assertable (the room case is verified live, not here).
+  export M2HERD_SKIP_ROOM_CHECK=1
   local self td ov rc
   self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
   td="$(mktemp -d)"; trap "rm -rf '$td'" EXIT

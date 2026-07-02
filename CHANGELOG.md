@@ -4,6 +4,17 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.3.0] - 2026-07-02
+
+### Added
+- **Auto-kick** — `m2herd next` case: no machineroom tab watching the repo (herdr reachable)
+  → `NEXT: bring up the machineroom — run: m2herd-up up --room-only`; suppressed when herdr
+  is absent/down or `M2HERD_SKIP_ROOM_CHECK=1`. The SessionStart hook now also injects the
+  ORCHESTRATOR MANDATE: NEXT housekeeping (room/sync/refile) is pre-authorized on the first
+  turn; worker/worktree/branch spawns still require explicit confirmation.
+- **`m2herd-up up --room-only`** — workspace + machineroom only, never an orchestrator pane
+  (the auto-kick path: the calling session IS the orchestrator).
+
 ## [2.2.0] - 2026-07-02
 
 ### Fixed
