@@ -4,6 +4,16 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.4.0] - 2026-07-02
+
+### Added
+- **`m2herd-tui` (tier 3, Go)** — bubbletea+lipgloss dashboard: correct Unicode cell widths
+  (fixes the Linux column shear), adaptive colors, rounded border, `r`/`s`/`q` keys, `--once`
+  testable render. Static prebuilts committed for darwin-arm64 / linux-amd64 / linux-arm64;
+  install.sh symlinks the platform binary; `dashboard --watch` execs it when present
+  (bash renderer remains the fallback and the hook/CI path). Built by a headless sonnet
+  worker for $4.86.
+
 ## [2.3.1] - 2026-07-02
 
 ### Fixed
