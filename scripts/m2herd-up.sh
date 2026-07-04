@@ -74,6 +74,35 @@ do_or_echo() { if [ "$DRY_RUN" -eq 1 ]; then plan "$*"; else eval "$@"; fi; }
 need()       { command -v "$1" >/dev/null 2>&1 || { echo "required tool not on PATH: $1" >&2; exit 1; }; }
 utc_now()    { date -u +%Y-%m-%dT%H:%M:%SZ; }
 
+# Are we running inside a herdr-managed pane? Walk the ancestor process chain
+# (bounded ~25 hops) and match any ancestor command name containing "herdr".
+# Deliberately does NOT trust HERDR_* env vars — those are user-settable outside
+# herdr. `ps -o ppid=/-o comm=` behaves the same on macOS and Linux.
+inside_herdr() {
+  local pid=$$ hops=0 comm ppid
+  while [ "$hops" -lt 25 ]; do
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null || true)"
+    case "$comm" in *herdr*) return 0 ;; esac
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    [ -n "$ppid" ] || break
+    [ "$ppid" -le 1 ] 2>/dev/null && break
+    pid="$ppid"; hops=$((hops + 1))
+  done
+  return 1
+}
+
+# Loud, tty-gated warning that we are NOT inside herdr: panes we spawn land in a
+# herdr session nobody is looking at. WARNING only — never aborts, never changes
+# behavior. Colorized (yellow/bold via tput) only when stderr is a real tty.
+warn_not_in_herdr() { # warn_not_in_herdr [extra-suffix]
+  local extra="${1:-}" c1="" c0=""
+  if [ -t 2 ] && command -v tput >/dev/null 2>&1; then
+    c1="$(tput bold 2>/dev/null || true)$(tput setaf 3 2>/dev/null || true)"
+    c0="$(tput sgr0 2>/dev/null || true)"
+  fi
+  printf '%s\n' "${c1}⚠  not running inside herdr — panes will spawn in a herdr session you are not viewing; attach with \`herdr\` to see them${extra}${c0}" >&2
+}
+
 # ---------- repo / self resolution -------------------------------------------
 resolve_repo() {
   [ -n "$REPO" ] || REPO="$PWD"
@@ -101,6 +130,42 @@ resolve_pane_by_cwd() { # resolve_pane_by_cwd <cwd> [name] -> pane_id (retries; 
     fi
     [ -n "$pane" ] || pane="$(herdr agent list 2>/dev/null | jq -r --arg c "$cwd" \
       '[.result.agents[] | select(.cwd==$c)] | last | .pane_id // empty' 2>/dev/null || true)"
+    [ -n "$pane" ] && break
+    sleep 1
+  done
+  printf '%s' "$pane"
+}
+
+# Resolve the orchestrator's pane the SAME way up() does: an agent cwd'd at $REPO
+# whose name is m2herd-orch-<basename> (or a bare "claude"). Empty if unresolved
+# (no workspace, up never ran, fleet unreachable) — callers fall back gracefully.
+resolve_orch_pane() { # -> pane_id
+  local orch_name="m2herd-orch-$(basename "$REPO")"
+  herdr agent list 2>/dev/null | jq -r --arg c "$REPO" --arg n "$orch_name" \
+    '[.result.agents[] | select(.cwd==$c and ((.name // "")==$n or (.name // "")=="claude"))] | first | .pane_id // empty' 2>/dev/null || true
+}
+
+# tab_id that owns a given pane (from `herdr pane list`). Empty if not found.
+pane_tab_id() { # pane_tab_id <pane_id> -> tab_id
+  herdr pane list 2>/dev/null | jq -r --arg p "$1" \
+    '[.result.panes[] | select(.pane_id==$p)] | first | .tab_id // empty' 2>/dev/null || true
+}
+
+# Worker panes living in <tab> — every pane in the tab that is neither the
+# orchestrator nor $SELF, in the order `pane list` returns them (the LAST one is
+# the split target for the next worker).
+worker_panes_in_tab() { # worker_panes_in_tab <tab_id> <orch_pane> -> pane ids, one per line
+  herdr pane list 2>/dev/null | jq -r --arg t "$1" --arg o "$2" --arg s "$SELF" \
+    '[.result.panes[] | select(.tab_id==$t and .pane_id!=$o and .pane_id!=$s)] | .[].pane_id' 2>/dev/null || true
+}
+
+# Resolve a freshly-split pane by cwd from `herdr pane list` (retries; the list
+# can lag the split). A slice's worktree path is unique, so cwd pins the pane.
+resolve_pane_by_cwd_panes() { # resolve_pane_by_cwd_panes <cwd> -> pane_id
+  local cwd="$1" i pane=""
+  for i in 1 2 3 4 5; do
+    pane="$(herdr pane list 2>/dev/null | jq -r --arg c "$cwd" \
+      '[.result.panes[] | select(.cwd==$c)] | last | .pane_id // empty' 2>/dev/null || true)"
     [ -n "$pane" ] && break
     sleep 1
   done
@@ -196,6 +261,7 @@ notes_viewer_cmd() {
 up() {
   resolve_repo; resolve_self
   log "up: repo=$REPO (self pane: ${SELF:-<unknown>})"
+  inside_herdr || warn_not_in_herdr
 
   # 1. .m2herd/ context fabric — scaffold via the engine if missing
   if [ ! -d "$REPO/.m2herd" ]; then
@@ -218,6 +284,12 @@ up() {
 
   # 2. herdr workspace for the repo — reuse the one already holding a pane cwd'd
   #    at the repo, else create (idempotency key: a pane whose cwd == repo).
+  #    Probe the server FIRST: workspace/pane calls all go over the socket, and a
+  #    dead server otherwise surfaces only as the cryptic "workspace create failed".
+  if [ "$DRY_RUN" -eq 0 ] && ! herdr status server 2>/dev/null | grep -q '^status: running'; then
+    echo "herdr server is not running — start herdr first (run \`herdr\`), then re-run m2herd-up up" >&2
+    exit 1
+  fi
   local ws
   ws="$(herdr pane list 2>/dev/null | jq -r --arg c "$REPO" \
     '[.result.panes[] | select(.cwd==$c)] | first | .workspace_id // empty' 2>/dev/null || true)"
@@ -391,19 +463,66 @@ dispatch() {
     return 0
   fi
 
-  # 2b. TUI spawn — unique agent name, NO --split (stray-pane bug), no focus
-  local wname="$AGENT-m2herd-$SLICE" pane
-  if [ "$DRY_RUN" -eq 1 ]; then
-    plan "herdr agent start '$wname' --cwd '$wt' --no-focus -- \"\$(command -v $bin)\" $flag"
-    plan "re-resolve worker pane by cwd from 'herdr agent list' (returned pane_id can be off by one)"
-    pane="PANE-DRYRUN"
+  # 2b. TUI spawn — place the worker pane BESIDE the orchestrator. The orchestrator
+  #     owns the LEFT 50% of its tab (NEVER touched); every worker lives in the
+  #     RIGHT 50% and subdivides it: 1 worker → right 50%; 2 → top-right 25% +
+  #     bottom-right 25%; each further worker halves the LAST worker pane. We drive
+  #     this with `herdr pane split` — NOT `agent start --split` (stray-pane bug).
+  inside_herdr || warn_not_in_herdr " …or use --headless"
+  local wname="$AGENT-m2herd-$SLICE" pane runcmd="$bin${flag:+ $flag}"
+  local orch_pane orch_tab last_worker split_pane split_dir
+  orch_pane="$(resolve_orch_pane)"
+  orch_tab=""
+  [ -n "$orch_pane" ] && orch_tab="$(pane_tab_id "$orch_pane")"
+
+  if [ -z "$orch_pane" ] || [ -z "$orch_tab" ]; then
+    # FALLBACK: orchestrator pane unresolvable (up never ran, not in a workspace,
+    # room-only session name mismatch, fleet unreachable) — use the ORIGINAL
+    # `agent start --no-focus` path unchanged, with a log line saying why.
+    log "! orchestrator pane unresolved (pane='${orch_pane:-}' tab='${orch_tab:-}') — falling back to 'agent start --no-focus'"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      plan "herdr agent start '$wname' --cwd '$wt' --no-focus -- \"\$(command -v $bin)\" $flag"
+      plan "re-resolve worker pane by cwd from 'herdr agent list' (returned pane_id can be off by one)"
+      pane="PANE-DRYRUN"
+    else
+      herdr agent start "$wname" --cwd "$wt" --no-focus -- "$(command -v "$bin")" $flag >/dev/null 2>&1 || true
+      pane="$(resolve_pane_by_cwd "$wt" "$wname")"
+      [ -n "$pane" ] || { echo "worker pane never appeared in agent list (cwd $wt)" >&2; exit 1; }
+      is_self "$pane" && { echo "resolved worker pane is \$SELF ($pane) — refusing" >&2; exit 1; }
+      log "worker spawned (fallback): pane $pane ($wname)"
+      sleep 2   # let the TUI boot before the pointer lands
+    fi
   else
-    herdr agent start "$wname" --cwd "$wt" --no-focus -- "$(command -v "$bin")" $flag >/dev/null 2>&1 || true
-    pane="$(resolve_pane_by_cwd "$wt" "$wname")"
-    [ -n "$pane" ] || { echo "worker pane never appeared in agent list (cwd $wt)" >&2; exit 1; }
-    is_self "$pane" && { echo "resolved worker pane is \$SELF ($pane) — refusing" >&2; exit 1; }
-    log "worker spawned: pane $pane ($wname)"
-    sleep 2   # let the TUI boot before the pointer lands
+    # Split target: the LAST existing worker (split DOWN, halving the right column)
+    # or, when there are none, the orchestrator itself (split RIGHT into 50/50).
+    last_worker="$(worker_panes_in_tab "$orch_tab" "$orch_pane" | tail -1)"
+    if [ -n "$last_worker" ]; then split_pane="$last_worker"; split_dir="down"
+    else                           split_pane="$orch_pane";  split_dir="right"; fi
+    is_self "$split_pane" && { echo "split target resolved to \$SELF ($split_pane) — refusing" >&2; exit 1; }
+    local split_note="${last_worker:+last worker $last_worker}"; split_note="${split_note:-no workers yet}"
+    if [ "$DRY_RUN" -eq 1 ]; then
+      plan "herdr pane split '$split_pane' --direction $split_dir --ratio 0.5 --cwd '$wt' --no-focus   # orch=$orch_pane tab=$orch_tab, $split_note"
+      plan "resolve NEW worker pane by cwd '$wt' from 'herdr pane list' (retry; list can lag)"
+      plan "sleep 1   # let the new pane's shell come up"
+      plan "herdr pane run '<new-pane>' '$runcmd'   # submits command + Enter"
+      plan "re-resolve worker agent by cwd from 'herdr agent list' before record"
+      pane="PANE-DRYRUN"
+    else
+      herdr pane split "$split_pane" --direction "$split_dir" --ratio 0.5 --cwd "$wt" --no-focus >/dev/null 2>&1 || true
+      pane="$(resolve_pane_by_cwd_panes "$wt")"
+      [ -n "$pane" ] || { echo "new worker pane never appeared in pane list (cwd $wt)" >&2; exit 1; }
+      is_self "$pane" && { echo "resolved worker pane is \$SELF ($pane) — refusing" >&2; exit 1; }
+      log "worker pane split beside orchestrator: $pane (split $split_pane --direction $split_dir @0.5)"
+      sleep 1   # let the fresh pane's shell come up before we launch the worker
+      herdr pane run "$pane" "$runcmd" >/dev/null 2>&1 || true
+      # re-resolve the agent by cwd (agent registration can lag the pane); keep the
+      # settle/submit_pointer flow below unchanged. Fall back to the split pane_id.
+      local apane; apane="$(resolve_pane_by_cwd "$wt")"
+      [ -n "$apane" ] && pane="$apane"
+      is_self "$pane" && { echo "resolved worker pane is \$SELF ($pane) — refusing" >&2; exit 1; }
+      log "worker started in pane $pane (cwd $wt)"
+      sleep 2   # let the TUI boot before the pointer lands
+    fi
   fi
 
   # 3. file-protocol dispatch: one-line pointer, settle, Enter — same confinement
