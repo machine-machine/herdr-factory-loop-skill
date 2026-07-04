@@ -8,6 +8,8 @@
 # stays with the orchestrator.
 #
 # Usage:
+#   m2herd.sh boot    [--dir P] [--goal "…"]  # recommended entry point: init (if needed) + sync + resume + next
+#                                             #   git-repo preflight: prints a colorful (non-fatal) warning if --dir is not a git repo
 #   m2herd.sh init    [--dir P] [--goal "…"]  # scaffold .m2herd/ from templates/m2herd/, gitignore it
 #   m2herd.sh status  [--dir P]               # render overview.json human-readably
 #   m2herd.sh note    [--dir P] "text"        # append "- [<UTC ts>] text" to NOTES.md
@@ -392,6 +394,30 @@ next_cmd() {
   echo "NEXT: compare RESUME.md against goal/done_when and dispatch or finish"
 }
 
+# ---------- boot: single-command entry point ----------------------------------
+# init (if needed) + sync + resume + next, with a git-repo preflight. Worker
+# dispatch relies on git worktrees/branches, so a non-git --dir gets a loud
+# (but non-fatal) heads-up here — same tput-on-tty-else-plain pattern as dashboard.
+boot() {
+  resolve_dir
+  local B="" Y="" R=""
+  if { [ -t 1 ] || [ "${M2HERD_FORCE_TTY:-}" = "1" ]; } && command -v tput >/dev/null 2>&1; then
+    B="$(tput bold 2>/dev/null || true)"; Y="$(tput setaf 3 2>/dev/null || true)"; R="$(tput sgr0 2>/dev/null || true)"
+  fi
+  if ! git -C "$DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    printf '%s⚠ WARNING: %s is not a git repository%s\n' "$B$Y" "$DIR" "$R" >&2
+    printf '%sm2herd worker dispatch relies on git worktrees/branches — run `git init` first.%s\n' "$B$Y" "$R" >&2
+  fi
+  if [ -f "$(OV)" ]; then
+    log "boot: .m2herd/ already present at $DIR/.m2herd — skipping init"
+  else
+    init
+  fi
+  sync_cmd
+  resume_cmd
+  next_cmd
+}
+
 # ---------- dashboard: tier-1 TUI — a pure read-only renderer -----------------
 # One writer (the orchestrator), many watchers: this code path NEVER writes state.
 # herdr READS (agent list) are allowed; herdr sends/closes are FORBIDDEN here.
@@ -731,11 +757,29 @@ selftest() {
   printf '%s\n' "$dash" | grep -q '^m2herd · .* · drift' || fail "dashboard missing the boxed header line"
   printf '%s\n' "$dash" | grep -q '^read-only · steering: .m2herd/inbox/STEER.md$' || fail "dashboard missing the footer"
 
+  # boot: non-git dir → colorful (but non-fatal) warning; still scaffolds + boots clean
+  local td2 td3 boot_out
+  td2="$(mktemp -d)"
+  boot_out="$("$self" boot --dir "$td2" --goal "boot selftest goal" 2>&1)" || fail "boot exited non-zero on a non-git dir"
+  printf '%s\n' "$boot_out" | grep -qi 'not a git repository' || fail "boot(non-git): missing warning text"
+  printf '%s\n' "$boot_out" | grep -q 'git init' || fail "boot(non-git): warning missing the git-init recommendation"
+  [ -f "$td2/.m2herd/overview.json" ] || fail "boot(non-git): did not scaffold .m2herd/"
+  rm -rf "$td2"
+
+  # boot: git-inited dir → no warning, still boots clean
+  td3="$(mktemp -d)"
+  ( cd "$td3" && git init -q )
+  boot_out="$("$self" boot --dir "$td3" --goal "boot selftest goal" 2>&1)" || fail "boot exited non-zero on a git dir"
+  if printf '%s\n' "$boot_out" | grep -qi 'not a git repository'; then fail "boot(git): unexpected warning on a real git repo"; fi
+  [ -f "$td3/.m2herd/overview.json" ] || fail "boot(git): did not scaffold .m2herd/"
+  rm -rf "$td3"
+
   echo "selftest: PASS"
 }
 
 # ---------- dispatch ---------------------------------------------------------
 case "$CMD" in
+  boot)     boot ;;
   init)     init ;;
   status)   status_cmd ;;
   note)     note ;;
@@ -754,5 +798,5 @@ case "$CMD" in
     elif [ "$WATCH" -eq 1 ]; then dashboard_watch; else dashboard; fi ;;
   self-update) self_update_cmd ;;
   selftest)  selftest ;;
-  help|*)    sed -n '2,28p' "$0" ;;
+  help|*)    sed -n '2,30p' "$0" ;;
 esac
