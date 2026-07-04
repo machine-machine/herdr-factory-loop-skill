@@ -4,6 +4,14 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.5.1] - 2026-07-04
+
+### Changed
+- **README** — the install one-liner is now explicitly documented as the copy-paste
+  install-AND-update command (re-run anytime; it ff-pulls the existing clone and re-links
+  skill, hooks, and the `m2herd`/`m2herd-up`/`m2herd-tui` PATH symlinks); the Update section
+  leads with it and documents `m2herd self-update [--check]` as the built-in engine updater.
+
 ## [2.5.0] - 2026-07-04
 
 ### Added
