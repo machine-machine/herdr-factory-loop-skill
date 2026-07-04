@@ -17,6 +17,40 @@ manage agent integrations.
 > the goal — understand the intent first, then fan out concurrent
 > workers, converge results, and report back on the same channel.
 
+## Quick start
+
+```bash
+# install the skill (one-liner — see Install for what it does)
+curl -sSL https://raw.githubusercontent.com/machine-machine/herdr-factory-loop-skill/main/scripts/install.sh | bash
+
+# set up the whole factory: orchestrator choice + spec-kit + SDD loop
+./scripts/onboard.sh
+```
+
+## Typical command flow
+
+The m2herd context fabric (per-repo, Claude Code as main orchestrator):
+
+```
+m2herd boot                      # one-command start: init .m2herd/ (warns + recommends `git init` if the folder is not a git repo), sync, resume
+m2herd note "…"                  # jot a thought into NOTES.md
+m2herd refile --area A           # move live notes into context/A/
+m2herd resume | status | next    # where are we / what now
+m2herd dashboard --watch         # live TUI over the fabric
+```
+
+`m2herd boot` is the recommended entry point (init + sync + resume in one
+command); the older `m2herd init` still exists for finer-grained control.
+
+The worker loop (herdr workspace):
+
+```
+m2herd-up up                     # orchestrator pane + machineroom pane in herdr
+m2herd-up dispatch --slice S     # worktree + worker + file-protocol task handoff
+m2herd-up dispatch --slice S --headless   # cheap non-TUI worker (claude -p / codex exec)
+m2herd-up collect --slice S      # wait, harvest report, update overview.json
+```
+
 ## What is herdr?
 
 herdr is a local CLI + headless server talking over a Unix-domain socket.
@@ -77,14 +111,10 @@ See `skill/SKILL.md` §11 for the full SDD workflow, including how
 
 ### Quick install (one command)
 
-```bash
-# from a fresh agent environment
-curl -sSL https://raw.githubusercontent.com/machine-machine/herdr-factory-loop-skill/main/scripts/install.sh | bash
-```
-
-This will clone the repo and symlink the skill into the right location
-for Claude (`~/.claude/skills/herdr/`), Hermes (`~/.hermes/skills/herdr/`),
-and Cursor (`~/.cursor/skills/herdr/`). For Claude and Hermes it also wires
+See the curl one-liner in [Quick start](#quick-start) above. It clones
+the repo and symlinks the skill into the right location for Claude
+(`~/.claude/skills/herdr/`), Hermes (`~/.hermes/skills/herdr/`), and
+Cursor (`~/.cursor/skills/herdr/`). For Claude and Hermes it also wires
 up the dispatch-nudge hook (SKILL.md §14) so herding gets (re-)considered
 every turn by default — pass `--no-nudge-hook` to skip it.
 
