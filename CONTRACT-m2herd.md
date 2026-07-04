@@ -169,6 +169,7 @@ updated: <ISO-8601 UTC>
 
 ### scripts/m2herd.sh — the engine (slice A)
 ```
+m2herd.sh boot   [--dir P] [--goal "…"]   # recommended entry point: init (if needed) + sync + resume + next; loud tty-gated warning + `git init` recommendation when --dir is not a git repo (non-fatal)
 m2herd.sh init   [--dir P] [--goal "…"]   # scaffold .m2herd/ from templates/m2herd/, gitignore it
 m2herd.sh status [--dir P]                # render overview.json human-readably
 m2herd.sh note   [--dir P] "text"         # append "- [<UTC ts>] text" to NOTES.md
@@ -191,7 +192,14 @@ Notes pane viewer command (exact): `watch -n 2 -t cat .m2herd/NOTES.md` if `watc
 exists, else a `while :; do clear; cat .m2herd/NOTES.md; sleep 2; done` bash loop.
 Herdr rules (binding): identify `$SELF` first and never touch it; after `agent start`
 RE-RESOLVE the pane by cwd from `herdr agent list` (returned pane_id can be off by one);
-no `--split` (stray-pane bug); settle ~1s between `agent send` and Enter.
+no `agent start --split` (stray-pane bug); settle ~1s between `agent send` and Enter.
+Worker pane placement (TUI dispatch): orchestrator always keeps the LEFT 50% of its tab;
+workers subdivide the RIGHT half via `herdr pane split` — first worker splits the
+orchestrator `--direction right --ratio 0.5`, each further worker splits the LAST worker
+pane `--direction down --ratio 0.5`; fall back to `agent start --no-focus` when the
+orchestrator pane cannot be resolved. `up` and TUI `dispatch` warn (tty-gated, non-fatal)
+when not running inside a herdr pane (bounded ancestor-process walk, never HERDR_* env);
+`up` probes the herdr server first and fails with a clear "start herdr" message.
 
 ### hooks (slice B; filenames fixed — install.sh registers by FILENAME)
 ```

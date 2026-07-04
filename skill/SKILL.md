@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 2.4.0
+version: 2.5.0
 description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator). ALSO trigger for meta-orchestration — when the user wants to be the "meta-orchestrator" / "orchestrator of orchestrators", oversee or launch multiple orchestrators (each driving its own herd of workers) across several missions/repos, or drive a portfolio of parallel missions with /goal-based autonomy (fleet-loop.sh / fleet-control). ALSO trigger for m2herd — the Claude Code (Fable) main-orchestrator context fabric — when the user mentions m2herd, .m2herd, "context fabric", wants to offload context into the repo folder (the folder holds the context, the orchestrator holds pointers), refile or archive notes/areas, push a project gist to fleet memory, or come back to a project via the resume file (RESUME.md).
 ---
 
@@ -829,6 +829,7 @@ Mechanical, idempotent bash (herd-loop.sh style); jq required. `--dir` defaults 
 install.sh symlinks it onto PATH as `m2herd` (§16.5).
 
 ```
+m2herd.sh boot   [--dir P] [--goal "…"]   # RECOMMENDED entry point: init (if needed) + sync + resume + next; loud tty-gated yellow warning + `git init` recommendation when --dir is not a git repo (non-fatal — dispatch needs git worktrees)
 m2herd.sh init   [--dir P] [--goal "…"]   # scaffold .m2herd/ from templates/m2herd/, gitignore it
 m2herd.sh status [--dir P]                # render overview.json human-readably
 m2herd.sh note   [--dir P] "text"         # append "- [<UTC ts>] text" to NOTES.md
@@ -911,8 +912,24 @@ m2herd-up.sh --dry-run <same args>                  # print every herdr/git comm
 
 It follows the binding herdr rules from this skill: identify `$SELF` first and never touch it
 (§2); after `agent start` RE-RESOLVE the pane by cwd from `herdr agent list` (the returned
-pane_id can be off by one); no `--split` (stray-pane bug); settle ~1s between `agent send` and
-Enter (§4).
+pane_id can be off by one); no `agent start --split` (stray-pane bug); settle ~1s between
+`agent send` and Enter (§4).
+
+**Worker pane placement (TUI dispatch).** The orchestrator always keeps the LEFT 50% of its
+tab; workers share the RIGHT half and keep subdividing it, driven by `herdr pane split`
+(which does NOT have the `agent start --split` bug): the first worker splits the orchestrator
+pane `--direction right --ratio 0.5` (50/50), each further worker splits the LAST worker pane
+`--direction down --ratio 0.5` (2 workers → 25/25 stacked right, then 12.5/12.5, …). The new
+pane is resolved by cwd from `herdr pane list`, the worker binary launched via `pane run`.
+When the orchestrator pane cannot be resolved, dispatch falls back to the original
+`agent start … --no-focus` path and says why.
+
+**Not-inside-herdr guard.** `up` and TUI `dispatch` detect whether they run inside a herdr
+pane (bounded ancestor-process walk matching a `herdr` ancestor — HERDR_* env vars are
+deliberately not trusted) and print a loud tty-gated warning when they don't: panes would
+spawn into a herdr session nobody is viewing (attach with `herdr`, or use `--headless` for
+dispatch). `up` also probes the herdr server first and fails with a clear "start herdr first"
+message instead of the cryptic "workspace create failed".
 
 **Headless dispatch — cheap hands, Fable judgment.** `dispatch --headless [--model M]` skips
 the pane entirely: `claude -p <pointer> --model M --dangerously-skip-permissions

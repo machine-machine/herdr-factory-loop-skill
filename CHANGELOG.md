@@ -4,6 +4,31 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.5.0] - 2026-07-04
+
+### Added
+- **`m2herd boot`** — the recommended single-command entry point: init (if needed) + sync +
+  resume + next, with a git preflight that prints a loud tty-gated yellow warning and a
+  `git init` recommendation when the target folder is not a git repository (worker dispatch
+  relies on git worktrees). Selftest covers both the non-git and git paths.
+- **Worker pane layout (`m2herd-up dispatch`, TUI mode)** — workers are now placed BESIDE the
+  orchestrator via `herdr pane split` (never `agent start --split`, the stray-pane bug): the
+  orchestrator always keeps the LEFT 50% of its tab; workers share the right half and keep
+  subdividing it (1 worker → 50/50; 2 → 25/25 stacked right; each further worker halves the
+  last worker pane). Falls back to the old `agent start --no-focus` path when the
+  orchestrator pane cannot be resolved.
+- **Not-inside-herdr guard (`m2herd-up`)** — `up` and TUI `dispatch` now detect (via a bounded
+  ancestor-process walk, no trust in HERDR_* env vars) when they are not running inside a
+  herdr pane and warn loudly that panes would spawn into a session nobody is viewing
+  (suggesting `herdr` attach, or `--headless` for dispatch). `up` also probes the herdr
+  server up-front and fails with a clear "start herdr first" message instead of the cryptic
+  "workspace create failed".
+
+### Changed
+- **README** — restructured around a Quick start and a new "Typical command flow" centerpiece
+  (the m2herd fabric flow and the `m2herd-up` worker loop); install section references the
+  one-liner instead of repeating it.
+
 ## [2.4.0] - 2026-07-02
 
 ### Added
