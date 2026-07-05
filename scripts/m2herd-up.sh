@@ -352,7 +352,8 @@ trace_collect_write() { # trace_collect_write <slice> <state:done|failed> [token
   else
     trace_warn "no status.json at $sj — writing a fresh one"
     jq -n --arg slice "$slice" --arg st "$state" --arg ts "$(utc_now)" --arg tok "${tok:-0}" --arg cost "${cost:-0}" \
-      '{slice:$slice, state:$st, collected_at:$ts, tokens:($tok|tonumber), cost_usd:($cost|tonumber)}' \
+      '{slice:$slice, state:$st, agent:"", runner:"", model:"", branch:"", worktree:"",
+        dispatched_at:"", collected_at:$ts, tokens:($tok|tonumber), cost_usd:($cost|tonumber)}' \
       > "$sj" 2>/dev/null || trace_warn "write $sj failed"
   fi
 }

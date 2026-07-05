@@ -709,13 +709,13 @@ resolve_run_id() {
   local want="${RUN:-current}" id
   case "$want" in
     latest)
-      ls -1 "$RUNS_DIR" 2>/dev/null | grep -v '^CURRENT$' | sort | tail -1 ;;
+      ls -1 "$RUNS_DIR" 2>/dev/null | grep '^r-' | sort | tail -1 || true ;;
     current|"")
       if [ -f "$RUNS_DIR/CURRENT" ] && [ -s "$RUNS_DIR/CURRENT" ]; then
         id="$(cat "$RUNS_DIR/CURRENT")"
         if [ -n "$id" ] && [ -d "$RUNS_DIR/$id" ]; then printf '%s' "$id"; return 0; fi
       fi
-      ls -1 "$RUNS_DIR" 2>/dev/null | grep -v '^CURRENT$' | sort | tail -1 ;;
+      ls -1 "$RUNS_DIR" 2>/dev/null | grep '^r-' | sort | tail -1 || true ;;
     *)
       [ -d "$RUNS_DIR/$want" ] && printf '%s' "$want" ;;
   esac
@@ -780,7 +780,7 @@ evolve_analyze() {
     log "no run traces at .m2herd/runs/ yet — dispatch a herd first (m2herd-up dispatch)"
     return 0
   fi
-  local run_id; run_id="$(resolve_run_id)"
+  local run_id; run_id="$(resolve_run_id || true)"
   if [ -z "$run_id" ]; then
     log "no matching run found for --run ${RUN:-current}"
     return 0
@@ -816,7 +816,7 @@ evolve_analyze() {
   local n; n="$(jq 'length' <<<"$sigs")"
   log "wrote signatures → .m2herd/evolver/signatures/$run_id.json ($n signature(s))"
 
-  local today created=0 i kind where evidence slice_name slug pid lesson
+  local today created=0 i kind where evidence slice_name slug pid lesson seen_pids="" dup
   today="$(date -u +%Y-%m-%d)"
   if [ "$n" -gt 0 ]; then
     for i in $(seq 0 $((n - 1))); do
@@ -826,7 +826,14 @@ evolve_analyze() {
       slice_name="${where#slice:}"
       slug="$(slug_of "$kind" "$slice_name")"
       pid="${today}-${run_id}-${slug}"
+      # distinct signatures may share (kind, slice) — suffix the within-pass ordinal so
+      # every signature gets its own proposal file and re-runs regenerate the SAME ids
+      dup="$(printf '%s' "$seen_pids" | grep -cx "$pid" || true)"
+      seen_pids="$seen_pids$pid
+"
+      [ "$dup" -gt 0 ] && pid="$pid-$((dup + 1))"
       if [ ! -f "$EVO_DIR/proposals/$pid.md" ]; then
+        evidence="$(printf '%s' "$evidence" | tr '\n' ' ')"
         lesson="signature $kind at $where: $evidence"
         write_proposal "$pid" "$run_id" "memory" ".m2herd/evolver/LESSONS.md" "low" "proposed" "$lesson" "$evidence"
         created=$((created + 1))
