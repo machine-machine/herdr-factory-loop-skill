@@ -143,6 +143,10 @@ init() {
   [ -f "$m2/RESUME.md" ] || cp "$tmpl/RESUME.md" "$m2/RESUME.md"
   [ -f "$m2/NOTES.md" ]  || cp "$tmpl/NOTES.md"  "$m2/NOTES.md"
   [ -f "$m2/inbox/STEER.md" ] || cp "$tmpl/inbox/STEER.md" "$m2/inbox/STEER.md"
+  mkdir -p "$m2/evolver" "$m2/runs"
+  [ -f "$m2/evolver/README.md" ]  || cp "$tmpl/evolver/README.md"  "$m2/evolver/README.md"  2>/dev/null || true
+  [ -f "$m2/evolver/LESSONS.md" ] || cp "$tmpl/evolver/LESSONS.md" "$m2/evolver/LESSONS.md" 2>/dev/null || true
+  [ -f "$m2/runs/README.md" ]     || cp "$tmpl/runs/README.md"     "$m2/runs/README.md"     2>/dev/null || true
   if [ ! -f "$m2/overview.json" ]; then
     jq --arg g "$GOAL" --arg ts "$(ts)" '.goal=$g | .updated_at=$ts' "$tmpl/overview.json" > "$m2/overview.json"
   else
@@ -772,7 +776,7 @@ EOF
 
 evolve_analyze() {
   resolve_dir; need_init; evolve_dirs
-  if [ ! -d "$RUNS_DIR" ] || [ -z "$(ls -A "$RUNS_DIR" 2>/dev/null)" ]; then
+  if [ ! -d "$RUNS_DIR" ] || [ -z "$(ls -d "$RUNS_DIR"/r-* 2>/dev/null)" ]; then
     log "no run traces at .m2herd/runs/ yet — dispatch a herd first (m2herd-up dispatch)"
     return 0
   fi
