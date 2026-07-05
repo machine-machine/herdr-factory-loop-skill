@@ -27,6 +27,18 @@
 # touch it; after `agent start` RE-RESOLVE the pane by cwd from `herdr agent list`
 # (the returned pane_id can be off by one); no `--split` (stray-pane bug); settle
 # ~1s between `agent send` and the Enter. Idempotent. Safe to re-run.
+#
+# Trace bundles (evolver contract §1): dispatch ensures a run under
+# .m2herd/runs/<run-id>/ (CURRENT pointer + run.json), records the slice into
+# run.json's slices[], and writes runs/<id>/slices/<S>/{prompt.md,status.json}
+# for BOTH pane and headless workers. collect completes the bundle: copies the
+# report.md, flips status.json to done|failed, and fills tokens/cost_usd when
+# the headless usage JSON has them. Trace writes are best-effort — a failure
+# warns ("trace: ...") but never aborts dispatch/collect; the worker flow is
+# the priority, traces are telemetry. Lesson injection (contract §4): when
+# .m2herd/evolver/LESSONS.md has content below the M2HERD:LIVE marker, both
+# the pane and headless pointer messages gain one extra sentence pointing the
+# worker at it; the task file itself is never mutated.
 
 set -euo pipefail
 
@@ -229,6 +241,135 @@ set_worker_state() { # set_worker_state <slice> <state>
   mv "$tmp" "$OV"
 }
 
+# ---------- run trace bundles (.m2herd/runs/<run-id>/, evolver contract §1) ---
+# Best-effort telemetry: every writer here warns and returns 1 on failure
+# instead of letting `set -e` tear down dispatch/collect. Callers guard with
+# `|| true`.
+trace_warn() { log "trace: $* (non-fatal, continuing)"; }
+
+RUN_ID=""   # set by run_ensure
+
+# Ensure .m2herd/runs/CURRENT + run.json exist; create a new run if CURRENT is
+# missing. Sets $RUN_ID. Read-modify-write is jq whole-file, same idiom as the
+# overview.json writers above.
+run_ensure() {
+  local runs="$REPO/.m2herd/runs" cur goal rj
+  cur="$runs/CURRENT"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    RUN_ID="$(cat "$cur" 2>/dev/null || true)"
+    if [ -z "$RUN_ID" ]; then
+      RUN_ID="r-$(date -u +%Y%m%dT%H%M%SZ)"
+      plan "mkdir -p $runs/$RUN_ID/slices; write $runs/$RUN_ID/run.json (run_id, created_at, goal, base); write $cur"
+    else
+      plan "reuse existing run $RUN_ID ($cur)"
+    fi
+    return 0
+  fi
+  mkdir -p "$runs" 2>/dev/null || { trace_warn "cannot create $runs"; RUN_ID=""; return 1; }
+  RUN_ID="$(cat "$cur" 2>/dev/null || true)"
+  if [ -z "$RUN_ID" ]; then
+    RUN_ID="r-$(date -u +%Y%m%dT%H%M%SZ)"
+    rj="$runs/$RUN_ID/run.json"
+    mkdir -p "$runs/$RUN_ID/slices" || { trace_warn "mkdir $runs/$RUN_ID failed"; RUN_ID=""; return 1; }
+    goal="$(jq -r '.goal // ""' "$OV" 2>/dev/null || true)"
+    jq -n --arg id "$RUN_ID" --arg ts "$(utc_now)" --arg goal "$goal" --arg base "$BASE" \
+      '{run_id:$id, created_at:$ts, goal:$goal, base:$base, slices:[]}' > "$rj" 2>/dev/null \
+      || { trace_warn "write $rj failed"; RUN_ID=""; return 1; }
+    printf '%s' "$RUN_ID" > "$cur" 2>/dev/null || trace_warn "write $cur failed"
+    log "trace: new run $RUN_ID"
+  fi
+  return 0
+}
+
+# Append (dedup) a slice to run.json .slices[]. jq whole-file rewrite.
+run_append_slice() { # run_append_slice <slice>
+  [ -n "$RUN_ID" ] || return 0
+  local slice="$1" rj="$REPO/.m2herd/runs/$RUN_ID/run.json" tmp
+  if [ "$DRY_RUN" -eq 1 ]; then plan "jq rewrite $rj: slices[] += \"$slice\" (dedup)"; return 0; fi
+  [ -f "$rj" ] || { trace_warn "no run.json at $rj"; return 1; }
+  tmp="$(mktemp)"
+  jq --arg s "$slice" '.slices = (((.slices // []) + [$s]) | unique)' "$rj" > "$tmp" 2>/dev/null \
+    && mv "$tmp" "$rj" || { rm -f "$tmp"; trace_warn "append slice to $rj failed"; return 1; }
+}
+
+# Write the dispatch half of the bundle: prompt.md (copy of the task file) +
+# status.json (state=spawned). Same for pane and headless — runner/model differ.
+trace_dispatch_write() { # trace_dispatch_write <slice> <runner:pane|headless> <model> <branch> <wt>
+  [ -n "$RUN_ID" ] || return 0
+  local slice="$1" runner="$2" model="$3" branch="$4" wt="$5"
+  local dir="$REPO/.m2herd/runs/$RUN_ID/slices/$slice" task="$REPO/.m2herd/dispatch/$slice.task.md"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    plan "mkdir -p $dir; cp $task -> $dir/prompt.md; write $dir/status.json (state=spawned runner=$runner${model:+ model=$model})"
+    return 0
+  fi
+  mkdir -p "$dir" || { trace_warn "mkdir $dir failed"; return 1; }
+  cp "$task" "$dir/prompt.md" 2>/dev/null || trace_warn "copy $task -> $dir/prompt.md failed"
+  jq -n --arg slice "$slice" --arg agent "$AGENT" --arg runner "$runner" --arg model "$model" \
+        --arg branch "$branch" --arg wt "$wt" --arg ts "$(utc_now)" \
+    '{slice:$slice, state:"spawned", agent:$agent, runner:$runner, model:$model, branch:$branch,
+      worktree:$wt, dispatched_at:$ts, collected_at:"", tokens:0, cost_usd:0}' \
+    > "$dir/status.json" 2>/dev/null || trace_warn "write $dir/status.json failed"
+}
+
+# Find which run holds a slice at collect time: prefer CURRENT; if CURRENT is
+# missing, fall back to the lexically latest run dir containing the slice.
+trace_find_run_for_slice() { # trace_find_run_for_slice <slice> -> echoes run-id or empty
+  local slice="$1" runs="$REPO/.m2herd/runs" cur rid
+  cur="$runs/CURRENT"
+  if [ -f "$cur" ]; then
+    rid="$(cat "$cur" 2>/dev/null || true)"
+    [ -n "$rid" ] && { printf '%s' "$rid"; return 0; }
+  fi
+  rid="$(ls -1 "$runs" 2>/dev/null | grep '^r-' | sort -r | while IFS= read -r d; do
+    if [ -d "$runs/$d/slices/$slice" ]; then printf '%s' "$d"; break; fi
+  done)"
+  printf '%s' "$rid"
+}
+
+# Complete the bundle at collect time: copy report.md, flip status.json to
+# done|failed, fill tokens/cost_usd when the caller has them (headless only —
+# reuses the same tok/cost values already parsed for set_worker_usage, no
+# duplicate parsing).
+trace_collect_write() { # trace_collect_write <slice> <state:done|failed> [tokens] [cost_usd]
+  local slice="$1" state="$2" tok="${3:-}" cost="${4:-}" out rid dir sj
+  out="$REPO/.m2herd/dispatch/$slice.out.md"
+  rid="$(trace_find_run_for_slice "$slice")"
+  if [ -z "$rid" ]; then trace_warn "no run dir found for slice $slice — skipping report/status update"; return 0; fi
+  dir="$REPO/.m2herd/runs/$rid/slices/$slice"; sj="$dir/status.json"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    plan "cp $out -> $dir/report.md; update $sj (state=$state collected_at=<now>${tok:+ tokens=$tok}${cost:+ cost_usd=$cost})"
+    return 0
+  fi
+  mkdir -p "$dir" || { trace_warn "mkdir $dir failed"; return 1; }
+  cp "$out" "$dir/report.md" 2>/dev/null || trace_warn "copy $out -> $dir/report.md failed"
+  if [ -f "$sj" ]; then
+    local tmp; tmp="$(mktemp)"
+    jq --arg st "$state" --arg ts "$(utc_now)" --arg tok "$tok" --arg cost "$cost" '
+      .state = $st | .collected_at = $ts
+      | .tokens    = (if $tok  != "" then ($tok  | tonumber) else .tokens    end)
+      | .cost_usd  = (if $cost != "" then ($cost | tonumber) else .cost_usd  end)
+    ' "$sj" > "$tmp" 2>/dev/null && mv "$tmp" "$sj" || { rm -f "$tmp"; trace_warn "update $sj failed"; }
+  else
+    trace_warn "no status.json at $sj — writing a fresh one"
+    jq -n --arg slice "$slice" --arg st "$state" --arg ts "$(utc_now)" --arg tok "${tok:-0}" --arg cost "${cost:-0}" \
+      '{slice:$slice, state:$st, agent:"", runner:"", model:"", branch:"", worktree:"",
+        dispatched_at:"", collected_at:$ts, tokens:($tok|tonumber), cost_usd:($cost|tonumber)}' \
+      > "$sj" 2>/dev/null || trace_warn "write $sj failed"
+  fi
+}
+
+# ---------- lesson injection (evolver contract §4) -----------------------------
+# When LESSONS.md has content below the M2HERD:LIVE marker, both pane and
+# headless pointer messages gain one sentence naming it. The task file itself
+# is never mutated.
+lessons_pointer_suffix() { # -> appended sentence, or empty
+  local lf="$REPO/.m2herd/evolver/LESSONS.md" marker='<!-- === M2HERD:LIVE === -->' body
+  [ -f "$lf" ] || return 0
+  body="$(awk -v m="$marker" 'f{print} $0==m{f=1}' "$lf" 2>/dev/null | sed '/^[[:space:]]*$/d')"
+  [ -n "$body" ] || return 0
+  printf ' Also read %s (accepted factory lessons) before starting.' "$lf"
+}
+
 # ---------- file-protocol submit (settle before Enter) ------------------------
 submit_pointer() { # submit_pointer <pane> <text>
   local pane="$1" text="$2"
@@ -383,6 +524,9 @@ dispatch() {
   local branch="wip/m2herd-$SLICE" task="$REPO/.m2herd/dispatch/$SLICE.task.md"
   log "dispatch: slice=$SLICE repo=$REPO base=$BASE agent=$AGENT (self pane: ${SELF:-<unknown>})"
 
+  run_ensure || true
+  run_append_slice "$SLICE" || true
+
   # task file is the deliverable definition — the orchestrator writes it first
   if [ ! -f "$task" ]; then
     if [ "$DRY_RUN" -eq 1 ]; then log "! task file missing: $task (write it before a real dispatch)"
@@ -440,7 +584,7 @@ dispatch() {
   if [ "$HEADLESS" -eq 1 ]; then
     local out="$REPO/.m2herd/dispatch/$SLICE.out.md" lg="$REPO/.m2herd/dispatch/$SLICE.log" hpid="" wtask
     wtask="$(copy_task_into_wt "$wt")"
-    local hprompt="$(confinement_line "$wt" "$branch") Read $wtask and follow its instructions exactly. Write your complete report to $out when done (the report file is the ONLY thing you write outside the worktree)."
+    local hprompt="$(confinement_line "$wt" "$branch") Read $wtask and follow its instructions exactly. Write your complete report to $out when done (the report file is the ONLY thing you write outside the worktree).$(lessons_pointer_suffix)"
     if [ "$DRY_RUN" -eq 1 ]; then
       case "$AGENT" in
         claude)   plan "cd '$wt' && nohup claude -p '<pointer>' --model '$MODEL' --dangerously-skip-permissions --output-format json > '$lg' 2>&1 &" ;;
@@ -448,6 +592,7 @@ dispatch() {
         opencode) plan "cd '$wt' && nohup opencode run '<pointer>' > '$lg' 2>&1 &" ;;
       esac
       record_worker "$SLICE" "-" "$wt" "$branch" "spawned" "headless" "$MODEL" ""
+      trace_dispatch_write "$SLICE" "headless" "$MODEL" "$branch" "$wt" || true
       log "dispatch: dry-run headless plan complete for $SLICE"
       return 0
     fi
@@ -459,6 +604,7 @@ dispatch() {
     hpid="$(cat "$lg.pid" 2>/dev/null || true)"; rm -f "$lg.pid"
     [ -n "$hpid" ] || { echo "headless spawn failed (no pid) — see $lg" >&2; exit 1; }
     record_worker "$SLICE" "-" "$wt" "$branch" "spawned" "headless" "$MODEL" "$hpid"
+    trace_dispatch_write "$SLICE" "headless" "$MODEL" "$branch" "$wt" || true
     log "dispatch: done — $SLICE headless ($AGENT/$MODEL, pid $hpid), log $lg"
     return 0
   fi
@@ -528,10 +674,11 @@ dispatch() {
   # 3. file-protocol dispatch: one-line pointer, settle, Enter — same confinement
   #    as headless: the worker reads the task COPY inside its own worktree.
   local wtask2; wtask2="$(copy_task_into_wt "$wt")"
-  submit_pointer "$pane" "$(confinement_line "$wt" "$branch") Read $wtask2 and follow its instructions exactly."
+  submit_pointer "$pane" "$(confinement_line "$wt" "$branch") Read $wtask2 and follow its instructions exactly.$(lessons_pointer_suffix)"
 
   # 4. record in overview.json workers[]
   record_worker "$SLICE" "$pane" "$wt" "$branch" "spawned"
+  trace_dispatch_write "$SLICE" "pane" "" "$branch" "$wt" || true
   log "dispatch: done — $SLICE recorded in overview.json (state=spawned)"
 }
 
@@ -546,6 +693,7 @@ collect() {
     plan "herdr agent wait '$pane' --status idle --timeout $WAIT_TIMEOUT"
     plan "herdr agent read '$pane' --source recent-unwrapped --lines 300  # → $out (unless worker already wrote it)"
     set_worker_state "$SLICE" "done"
+    trace_collect_write "$SLICE" "done" "" ""
     log "collect: dry-run plan complete for $SLICE"
     return 0
   fi
@@ -565,7 +713,9 @@ collect() {
         sleep 5; waited=$((waited + 5))
         if [ "$waited" -ge "$max" ]; then
           echo "headless worker $SLICE (pid $wpid) still running after ${max}s" >&2
-          set_worker_state "$SLICE" "failed"; exit 1
+          set_worker_state "$SLICE" "failed"
+          trace_collect_write "$SLICE" "failed" "" "" || true
+          exit 1
         fi
       done
     fi
@@ -573,12 +723,13 @@ collect() {
       # worker didn't write its report file — salvage the runner's .result text
       jq -r '.result // empty' "$lg" > "$out" 2>/dev/null || true
     fi
-    [ -s "$out" ] || { echo "headless worker $SLICE produced no report ($out empty; see $lg)" >&2; set_worker_state "$SLICE" "failed"; exit 1; }
+    [ -s "$out" ] || { echo "headless worker $SLICE produced no report ($out empty; see $lg)" >&2; set_worker_state "$SLICE" "failed"; trace_collect_write "$SLICE" "failed" "" "" || true; exit 1; }
     local tok cost
     tok="$(jq -r '[.modelUsage[]?.outputTokens] | add // empty' "$lg" 2>/dev/null || true)"
     cost="$(jq -r '[.modelUsage[]?.costUSD] | add // empty' "$lg" 2>/dev/null || true)"
     set_worker_state "$SLICE" "done"
     set_worker_usage "$SLICE" "${tok:-}" "${cost:-}"
+    trace_collect_write "$SLICE" "done" "${tok:-}" "${cost:-}" || true
     log "collect: done — $SLICE headless state=done${tok:+, ${tok} out-tokens}${cost:+, \$${cost}}, report at $out"
     return 0
   fi
@@ -591,6 +742,7 @@ collect() {
   if ! herdr agent wait "$pane" --status idle --timeout "$WAIT_TIMEOUT" >/dev/null 2>&1; then
     echo "worker $SLICE (pane $pane) did not reach idle within ${WAIT_TIMEOUT}ms" >&2
     set_worker_state "$SLICE" "failed"
+    trace_collect_write "$SLICE" "failed" "" "" || true
     exit 1
   fi
 
@@ -607,6 +759,9 @@ collect() {
   fi
 
   set_worker_state "$SLICE" "done"
+  if [ -s "$out" ]; then trace_collect_write "$SLICE" "done" "" "" || true
+  else trace_collect_write "$SLICE" "failed" "" "" || true
+  fi
   log "collect: done — $SLICE state=done, report at $out"
 }
 
