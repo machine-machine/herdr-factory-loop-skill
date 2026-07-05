@@ -21,6 +21,17 @@
 #   m2herd.sh gist    [--dir P] [--push]      # one-paragraph project gist; --push pipes it to $M2HERD_GIST_CMD if set
 #   m2herd.sh next    [--dir P]               # self-prompting primitive: mechanical priority walk, prints exactly one "NEXT: " line
 #                                             #   (drift → coach intent → refile notes → collect worker → open question → compare/dispatch)
+#   m2herd.sh evolve analyze  [--dir P] [--run <id|latest|current>]
+#                                             # mechanical: read .m2herd/runs/<run-id>/, write signatures + skeleton
+#                                             #   proposals under .m2herd/evolver/; no LLM, no network; idempotent
+#   m2herd.sh evolve proposals [--dir P]      # list proposals: id, kind, risk, status
+#   m2herd.sh evolve show <id> [--dir P]      # print a proposal file
+#   m2herd.sh evolve apply <id> [--dir P] [--ack-repo]
+#                                             # memory/policy: append lesson to LESSONS.md, mark applied
+#                                             #   template: same, but target must be under .m2herd/
+#                                             #   repo: never edits target; prints a branch/patch recommendation;
+#                                             #   marks applied only with --ack-repo
+#   m2herd.sh evolve reject <id> [--dir P]    # flip proposal status to rejected
 #   m2herd.sh dashboard [--dir P] [--watch [--interval N]]
 #                                             # tier-1 TUI: read-only render — header (drift dot, update line, ages), NEXT, areas,
 #                                             #   workers, open questions, NOTES tail; tput colors on a tty, plain when piped; NEVER
@@ -37,7 +48,11 @@ set -euo pipefail
 
 # ---------- arg parsing ------------------------------------------------------
 CMD="${1:-help}"; shift || true
-DIR="$PWD"; GOAL=""; AREA=""; TEXT=""; CHECK=0; PUSH=0; WATCH=0; INTERVAL=2
+# `evolve` is a subcommand group: the word right after it (analyze/proposals/
+# show/apply/reject) is consumed here as EVOLVE_ACTION, same idiom as CMD itself.
+EVOLVE_ACTION=""
+if [ "$CMD" = "evolve" ]; then EVOLVE_ACTION="${1:-}"; shift || true; fi
+DIR="$PWD"; GOAL=""; AREA=""; TEXT=""; CHECK=0; PUSH=0; WATCH=0; INTERVAL=2; RUN=""; ACK_REPO=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --dir)   DIR="$2"; shift 2 ;;
@@ -47,6 +62,8 @@ while [ $# -gt 0 ]; do
     --push)  PUSH=1; shift ;;
     --watch) WATCH=1; shift ;;
     --interval) INTERVAL="$2"; shift 2 ;;
+    --run)   RUN="$2"; shift 2 ;;
+    --ack-repo) ACK_REPO=1; shift ;;
     -h|--help) CMD="help"; shift ;;
     *) if [ -z "$TEXT" ]; then TEXT="$1"; shift; else echo "unknown arg: $1" >&2; exit 2; fi ;;
   esac
@@ -102,6 +119,20 @@ write_header() {
 }
 # first non-empty, non-heading line, "- [ts] " prefix stripped — used as a summary
 first_line() { awk 'NF && $1 !~ /^#/ {print; exit}' | sed -E 's/^- \[[^]]+\] //' | cut -c1-160; }
+
+# value of a key from a proposal's YAML frontmatter (between the two --- fences)
+frontmatter_get() {
+  awk -v k="$2" 'BEGIN{c=0} { if ($0=="---"){c++; if (c==2) exit; next}
+    if (c==1 && $0 ~ "^"k":"){sub("^"k":[[:space:]]*","");print;exit} }' "$1" 2>/dev/null
+}
+# rewrite the `status:` line inside a proposal's frontmatter fence, body untouched
+set_status() {
+  local f="$1" st="$2" tmp
+  tmp="$(mktemp)"
+  awk -v st="$st" 'BEGIN{c=0}
+    { if ($0=="---"){c++; print; next}
+      if (c==1 && $0 ~ /^status:/){print "status: " st} else {print} }' "$f" > "$tmp" && mv "$tmp" "$f"
+}
 
 # ---------- init: scaffold .m2herd/ from templates/m2herd/ --------------------
 init() {
@@ -302,6 +333,15 @@ resume_cmd() {
      then "  archived: " + ((.areas//[])|map(select((.status//"active")=="archived")|.name)|join(", "))
      else empty end)
   ' "$(OV)"
+  local lf="$DIR/.m2herd/evolver/LESSONS.md" tail5
+  if [ -f "$lf" ]; then
+    tail5="$(live_tail "$lf" | awk 'NF' | tail -5)"
+    if has_ink "$tail5"; then
+      echo
+      echo "Recent factory lessons:"
+      printf '%s\n' "$tail5" | sed 's/^/  /'
+    fi
+  fi
 }
 
 # ---------- gist: the .m2herd → AMS memory bridge ------------------------------
@@ -649,6 +689,220 @@ dashboard() {
   printf '%sread-only · steering: .m2herd/inbox/STEER.md%s\n' "$D" "$R"
 }
 
+# ---------- evolve: continual-harness factory evolver -------------------------
+# .m2herd/runs/ (written by m2herd-up.sh) → .m2herd/evolver/{signatures,proposals,LESSONS.md}
+# Mechanical only — no LLM, no network; same doctrine as `next`. See
+# .m2herd/dispatch/_evolver-contract.md for the binding file/format contract.
+evolve_dirs() {
+  RUNS_DIR="$DIR/.m2herd/runs"
+  EVO_DIR="$DIR/.m2herd/evolver"
+  mkdir -p "$EVO_DIR/signatures" "$EVO_DIR/proposals"
+}
+
+# --run <id|latest|current> (default: current, falling back to latest); prints
+# the resolved run-id, or nothing if none can be found.
+resolve_run_id() {
+  local want="${RUN:-current}" id
+  case "$want" in
+    latest)
+      ls -1 "$RUNS_DIR" 2>/dev/null | grep -v '^CURRENT$' | sort | tail -1 ;;
+    current|"")
+      if [ -f "$RUNS_DIR/CURRENT" ] && [ -s "$RUNS_DIR/CURRENT" ]; then
+        id="$(cat "$RUNS_DIR/CURRENT")"
+        if [ -n "$id" ] && [ -d "$RUNS_DIR/$id" ]; then printf '%s' "$id"; return 0; fi
+      fi
+      ls -1 "$RUNS_DIR" 2>/dev/null | grep -v '^CURRENT$' | sort | tail -1 ;;
+    *)
+      [ -d "$RUNS_DIR/$want" ] && printf '%s' "$want" ;;
+  esac
+}
+
+ensure_lessons_file() {
+  local lf="$EVO_DIR/LESSONS.md"
+  [ -f "$lf" ] || cat > "$lf" <<EOF
+# Factory Lessons
+
+Accepted lessons from the m2herd factory evolver. Do not hand-edit above the marker.
+
+$MARKER
+EOF
+}
+# append "- [ts] (<proposal-id>) <lesson>" to LESSONS.md, once per proposal-id
+append_lesson_once() {
+  local pid="$1" lesson="$2" lf
+  [ -n "$lesson" ] || return 0
+  ensure_lessons_file
+  lf="$EVO_DIR/LESSONS.md"
+  live_tail "$lf" | grep -qF "($pid)" && return 0
+  printf -- '- [%s] (%s) %s\n' "$(ts)" "$pid" "$lesson" >> "$lf"
+}
+
+# kebab slug from a signature kind + its "slice:<name>" where field
+slug_of() {
+  printf '%s-%s' "$1" "$2" \
+    | tr '[:upper:]_' '[:lower:]-' | tr -c 'a-z0-9-' '-' | tr -s '-' | sed -e 's/^-//' -e 's/-$//'
+}
+
+# write_proposal <id> <run> <kind> <target> <risk> <status> <lesson> <evidence>
+write_proposal() {
+  cat > "$EVO_DIR/proposals/$1.md" <<EOF
+---
+id: $1
+run: $2
+kind: $3
+target: $4
+risk: $5
+status: $6
+lesson: $7
+---
+
+## Observed failure
+$8
+
+## Proposed change
+Append this lesson to LESSONS.md so future dispatches carry it forward.
+
+## Rollback
+Remove the corresponding lesson line from .m2herd/evolver/LESSONS.md and reject this proposal.
+
+## Acceptance check
+Next run of this slice/signature does not recur.
+EOF
+}
+
+evolve_analyze() {
+  resolve_dir; need_init; evolve_dirs
+  if [ ! -d "$RUNS_DIR" ] || [ -z "$(ls -A "$RUNS_DIR" 2>/dev/null)" ]; then
+    log "no run traces at .m2herd/runs/ yet — dispatch a herd first (m2herd-up dispatch)"
+    return 0
+  fi
+  local run_id; run_id="$(resolve_run_id)"
+  if [ -z "$run_id" ]; then
+    log "no matching run found for --run ${RUN:-current}"
+    return 0
+  fi
+  local run_dir="$RUNS_DIR/$run_id" run_json="$RUNS_DIR/$run_id/run.json"
+  local sig_file="$EVO_DIR/signatures/$run_id.json"
+  local sigs="[]" slices slice sdir status_f report_f fail_f
+
+  slices="$(jq -r '.slices[]? // empty' "$run_json" 2>/dev/null || true)"
+  for slice in $slices; do
+    sdir="$run_dir/slices/$slice"
+    status_f="$sdir/status.json"; report_f="$sdir/report.md"; fail_f="$sdir/failures.json"
+    if [ ! -d "$sdir" ] || [ ! -f "$status_f" ]; then
+      sigs="$(jq --arg w "slice:$slice" --arg e "status.json missing for dispatched slice $slice" \
+        '. + [{kind:"missing_status", severity:"medium", where:$w, evidence:$e, confidence:"medium", source:"mechanical"}]' <<<"$sigs")"
+      continue
+    fi
+    if jq -e '.state=="failed"' "$status_f" >/dev/null 2>&1; then
+      sigs="$(jq --arg w "slice:$slice" --arg e "status.json state=failed for slice $slice" \
+        '. + [{kind:"slice_failed", severity:"high", where:$w, evidence:$e, confidence:"high", source:"mechanical"}]' <<<"$sigs")"
+    fi
+    if [ ! -s "$report_f" ]; then
+      sigs="$(jq --arg w "slice:$slice" --arg e "report.md missing or empty for slice $slice" \
+        '. + [{kind:"missing_report", severity:"medium", where:$w, evidence:$e, confidence:"medium", source:"mechanical"}]' <<<"$sigs")"
+    fi
+    if [ -s "$fail_f" ]; then
+      sigs="$(jq --slurpfile extra "$fail_f" \
+        '. + ([$extra[0][]? | {kind, severity, where, evidence, confidence:"high", source:"failures.json"}])' <<<"$sigs")"
+    fi
+  done
+
+  printf '%s' "$sigs" | jq '.' > "$sig_file"
+  local n; n="$(jq 'length' <<<"$sigs")"
+  log "wrote signatures → .m2herd/evolver/signatures/$run_id.json ($n signature(s))"
+
+  local today created=0 i kind where evidence slice_name slug pid lesson
+  today="$(date -u +%Y-%m-%d)"
+  if [ "$n" -gt 0 ]; then
+    for i in $(seq 0 $((n - 1))); do
+      kind="$(jq -r ".[$i].kind" <<<"$sigs")"
+      where="$(jq -r ".[$i].where" <<<"$sigs")"
+      evidence="$(jq -r ".[$i].evidence" <<<"$sigs")"
+      slice_name="${where#slice:}"
+      slug="$(slug_of "$kind" "$slice_name")"
+      pid="${today}-${run_id}-${slug}"
+      if [ ! -f "$EVO_DIR/proposals/$pid.md" ]; then
+        lesson="signature $kind at $where: $evidence"
+        write_proposal "$pid" "$run_id" "memory" ".m2herd/evolver/LESSONS.md" "low" "proposed" "$lesson" "$evidence"
+        created=$((created + 1))
+      fi
+    done
+  fi
+  log "proposals: $created new (re-run is idempotent — keyed on proposal-id)"
+}
+
+evolve_proposals() {
+  resolve_dir; need_init; evolve_dirs
+  local files f id kind risk status out
+  files="$(ls -1 "$EVO_DIR"/proposals/*.md 2>/dev/null | sort || true)"
+  if [ -z "$files" ]; then log "no proposals yet — run: m2herd evolve analyze"; return 0; fi
+  # accumulate then print once (a single write) so a downstream `grep -q`/`head`
+  # closing the pipe early can't SIGPIPE us mid-loop
+  out="$(printf '%-46s %-16s %-6s %s' "id" "kind" "risk" "status")"
+  while IFS= read -r f; do
+    id="$(frontmatter_get "$f" id)"; kind="$(frontmatter_get "$f" kind)"
+    risk="$(frontmatter_get "$f" risk)"; status="$(frontmatter_get "$f" status)"
+    out="$out
+$(printf '%-46s %-16s %-6s %s' "$id" "$kind" "$risk" "$status")"
+  done <<< "$files"
+  printf '%s\n' "$out"
+}
+
+evolve_show() {
+  resolve_dir; need_init; evolve_dirs
+  [ -n "$TEXT" ] || { echo "evolve show needs a proposal id: m2herd evolve show <id>" >&2; exit 2; }
+  local f="$EVO_DIR/proposals/$TEXT.md"
+  [ -f "$f" ] || { echo "no such proposal: $TEXT" >&2; exit 1; }
+  cat "$f"
+}
+
+evolve_apply() {
+  resolve_dir; need_init; evolve_dirs
+  [ -n "$TEXT" ] || { echo "evolve apply needs a proposal id: m2herd evolve apply <id>" >&2; exit 2; }
+  local f="$EVO_DIR/proposals/$TEXT.md"
+  [ -f "$f" ] || { echo "no such proposal: $TEXT" >&2; exit 1; }
+  local kind target status lesson
+  kind="$(frontmatter_get "$f" kind)"; target="$(frontmatter_get "$f" target)"
+  status="$(frontmatter_get "$f" status)"; lesson="$(frontmatter_get "$f" lesson)"
+  if [ "$status" = "applied" ]; then log "already applied: $TEXT"; return 0; fi
+  case "$kind" in
+    memory|policy)
+      append_lesson_once "$TEXT" "$lesson"
+      set_status "$f" "applied"
+      log "applied $TEXT → lesson recorded in .m2herd/evolver/LESSONS.md"
+      ;;
+    template)
+      case "$target" in
+        .m2herd/*) : ;;
+        *) echo "evolve apply: template target must be under .m2herd/ (got: $target) — refusing" >&2; exit 1 ;;
+      esac
+      append_lesson_once "$TEXT" "$lesson"
+      set_status "$f" "applied"
+      log "applied $TEXT (template target: $target)"
+      ;;
+    repo)
+      if [ "$ACK_REPO" -eq 1 ]; then
+        set_status "$f" "applied"
+        log "applied $TEXT (--ack-repo) — repo target was NOT edited: $target"
+      else
+        log "repo-kind proposal — NOT auto-editing $target"
+        log "recommendation: open a branch, apply by hand from .m2herd/evolver/proposals/$TEXT.md; re-run 'evolve apply $TEXT --ack-repo' once done"
+      fi
+      ;;
+    *) echo "evolve apply: unknown kind '$kind' in $TEXT" >&2; exit 1 ;;
+  esac
+}
+
+evolve_reject() {
+  resolve_dir; need_init; evolve_dirs
+  [ -n "$TEXT" ] || { echo "evolve reject needs a proposal id: m2herd evolve reject <id>" >&2; exit 2; }
+  local f="$EVO_DIR/proposals/$TEXT.md"
+  [ -f "$f" ] || { echo "no such proposal: $TEXT" >&2; exit 1; }
+  set_status "$f" "rejected"
+  log "rejected $TEXT"
+}
+
 # ---------- selftest: tmpdir end-to-end ---------------------------------------
 selftest() {
   need_jq
@@ -774,6 +1028,59 @@ selftest() {
   [ -f "$td3/.m2herd/overview.json" ] || fail "boot(git): did not scaffold .m2herd/"
   rm -rf "$td3"
 
+  # evolve: graceful no-op before any run trace exists
+  "$self" evolve analyze --dir "$td" | grep -qi 'no run traces' || fail "evolve analyze: missing graceful no-runs message"
+
+  # evolve: fabricate .m2herd/runs/CURRENT + one run with one failed slice + failures.json
+  local run_id run_dir sig_file prop_count prop_count2 pid_memory pid_other lesson_count
+  run_id="r-$(date -u +%Y%m%dT%H%M%SZ)"
+  run_dir="$td/.m2herd/runs/$run_id"
+  mkdir -p "$run_dir/slices/demo-slice"
+  printf '%s' "$run_id" > "$td/.m2herd/runs/CURRENT"
+  jq -n --arg id "$run_id" --arg ts "$(ts)" --arg goal "selftest goal" \
+    '{run_id:$id, created_at:$ts, goal:$goal, base:"main", slices:["demo-slice"]}' \
+    > "$run_dir/run.json"
+  printf 'worker report\n' > "$run_dir/slices/demo-slice/report.md"
+  jq -n '{slice:"demo-slice", state:"failed", agent:"claude", runner:"pane", model:"",
+          branch:"wip/m2herd-demo-slice", worktree:"", dispatched_at:"", collected_at:"", tokens:0, cost_usd:0}' \
+    > "$run_dir/slices/demo-slice/status.json"
+  jq -n '[{kind:"test_failure", severity:"high", where:"slice:demo-slice",
+           evidence:"pnpm test failed", suspected_cause:"broke contract"}]' \
+    > "$run_dir/slices/demo-slice/failures.json"
+
+  step evolve analyze --dir "$td"
+  sig_file="$td/.m2herd/evolver/signatures/$run_id.json"
+  [ -f "$sig_file" ] || fail "evolve analyze did not write signatures/$run_id.json"
+  jq -e 'length >= 2' "$sig_file" >/dev/null || fail "evolve analyze: expected >=2 signatures"
+  prop_count="$(ls "$td/.m2herd/evolver/proposals"/*.md 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$prop_count" -ge 2 ] || fail "evolve analyze: expected >=2 proposals, got $prop_count"
+
+  # idempotent re-run: no duplicate proposal files
+  step evolve analyze --dir "$td"
+  prop_count2="$(ls "$td/.m2herd/evolver/proposals"/*.md 2>/dev/null | wc -l | tr -d ' ')"
+  [ "$prop_count2" = "$prop_count" ] || fail "evolve analyze re-run duplicated proposals ($prop_count -> $prop_count2)"
+
+  "$self" evolve proposals --dir "$td" | grep -q "$run_id" || fail "evolve proposals: missing run-derived ids"
+
+  pid_memory="$(basename "$(ls "$td/.m2herd/evolver/proposals"/*.md | head -1)" .md)"
+  pid_other="$(basename "$(ls "$td/.m2herd/evolver/proposals"/*.md | sed -n '2p')" .md)"
+  "$self" evolve show "$pid_memory" --dir "$td" | grep -q '^kind: memory' || fail "evolve show: missing expected frontmatter"
+
+  step evolve apply "$pid_memory" --dir "$td"
+  grep -qF "($pid_memory)" "$td/.m2herd/evolver/LESSONS.md" || fail "evolve apply: lesson not recorded in LESSONS.md"
+  grep -q '^status: applied' "$td/.m2herd/evolver/proposals/$pid_memory.md" || fail "evolve apply: status not flipped to applied"
+
+  # re-apply: idempotent, no duplicate lesson line
+  step evolve apply "$pid_memory" --dir "$td"
+  lesson_count="$(grep -cF "($pid_memory)" "$td/.m2herd/evolver/LESSONS.md")"
+  [ "$lesson_count" = "1" ] || fail "evolve apply re-run duplicated the lesson line (count=$lesson_count)"
+
+  step evolve reject "$pid_other" --dir "$td"
+  grep -q '^status: rejected' "$td/.m2herd/evolver/proposals/$pid_other.md" || fail "evolve reject: status not flipped to rejected"
+
+  local resume_out; resume_out="$("$self" resume --dir "$td")"
+  printf '%s\n' "$resume_out" | grep -q 'Recent factory lessons:' || fail "resume: missing 'Recent factory lessons:' section"
+
   echo "selftest: PASS"
 }
 
@@ -789,6 +1096,16 @@ case "$CMD" in
   archive)  archive ;;
   gist)     gist_cmd ;;
   next)      next_cmd ;;
+  evolve)
+    case "$EVOLVE_ACTION" in
+      analyze)   evolve_analyze ;;
+      proposals) evolve_proposals ;;
+      show)      evolve_show ;;
+      apply)     evolve_apply ;;
+      reject)    evolve_reject ;;
+      *) echo "usage: m2herd.sh evolve {analyze|proposals|show|apply|reject} ..." >&2; exit 2 ;;
+    esac
+    ;;
   dashboard)
     # Tier-3 chain: --watch prefers the Go TUI (m2herd-tui, bubbletea) when installed —
     # correct Unicode widths + adaptive colors on any terminal. M2HERD_NO_TUI=1 forces
@@ -798,5 +1115,5 @@ case "$CMD" in
     elif [ "$WATCH" -eq 1 ]; then dashboard_watch; else dashboard; fi ;;
   self-update) self_update_cmd ;;
   selftest)  selftest ;;
-  help|*)    sed -n '2,30p' "$0" ;;
+  help|*)    sed -n '2,45p' "$0" ;;
 esac
