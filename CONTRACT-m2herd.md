@@ -240,6 +240,149 @@ Each hook slice ships a smoke: pipe a sample payload + empty stdin + garbage std
 | C workspace | `scripts/m2herd-up.sh` |
 | D docs+wire | `skill/SKILL.md`, `README.md`, `CHANGELOG.md`, `scripts/install.sh`, `scripts/onboard.sh` |
 
+## Amendment v2.1 — continual-harness factory evolver (trace + proposal contract)
+
+**Doctrine.** The folder holds the context; the evolver closes the loop from real run
+telemetry back into the factory itself. Run trace bundles are written by `m2herd-up.sh`
+and read by `m2herd.sh evolve`, which classifies boring, mechanical failure signatures,
+writes reviewable proposal files, and only ever mutates live text (`LESSONS.md` or a
+`.m2herd`-scoped template) on explicit `apply` — repo-level files get a patch/branch
+recommendation, never an auto-edit. Templates for both trees ship under
+`templates/m2herd/evolver/` and `templates/m2herd/runs/`.
+
+### §1. Run trace bundles (`.m2herd/runs/`, written by `m2herd-up.sh`, read by `m2herd.sh evolve`)
+
+```
+.m2herd/runs/CURRENT                    # plain text file: the active run-id, no newline padding
+.m2herd/runs/<run-id>/
+  run.json                              # {"run_id","created_at","goal","base","slices":["<slice>",...]}
+  slices/<slice>/
+    prompt.md                           # verbatim copy of .m2herd/dispatch/<slice>.task.md at dispatch time
+    report.md                           # verbatim copy of .m2herd/dispatch/<slice>.out.md at collect time
+    status.json                         # see schema below
+    failures.json                       # OPTIONAL, orchestrator- or worker-authored; array, may be absent
+```
+
+- run-id format: `r-<UTC %Y%m%dT%H%M%SZ>`, e.g. `r-20260705T120000Z`.
+- Run lifecycle: `dispatch` reads `.m2herd/runs/CURRENT`; if missing, it creates a new
+  run-id, `mkdir -p`s the run dir, writes `run.json`, and writes `CURRENT`. Rotation = the
+  orchestrator deletes `CURRENT`; the next dispatch starts a fresh run. No dedicated
+  rotation subcommand in the MVP.
+- `run.json.goal` is copied from `.m2herd/overview.json .goal`; `base` is the dispatch `--base`.
+- `slices[]` in `run.json` is appended (dedup) on each dispatch. jq whole-file rewrites only.
+
+`status.json` schema:
+```json
+{
+  "slice": "<slice>",
+  "state": "spawned|working|done|failed",
+  "agent": "claude|codex|cursor",
+  "runner": "pane|headless",
+  "model": "<model or empty>",
+  "branch": "wip/m2herd-<slice>",
+  "worktree": "<abs path>",
+  "dispatched_at": "<ISO-8601 UTC>",
+  "collected_at": "<ISO-8601 UTC or empty>",
+  "tokens": 0,
+  "cost_usd": 0.0
+}
+```
+`tokens`/`cost_usd` are filled by collect when the headless usage JSON provides them,
+else left `0`.
+
+`failures.json` entry schema (deliberately boring):
+```json
+[{"kind":"test_failure","severity":"high|medium|low","where":"slice:<slice>",
+  "evidence":"<one line>","suspected_cause":"<one line>"}]
+```
+
+### §2. Evolver state (`.m2herd/evolver/`, owned by `m2herd.sh evolve`)
+
+```
+.m2herd/evolver/
+  signatures/<run-id>.json              # array of signature objects (see below)
+  proposals/<proposal-id>.md            # markdown + YAML frontmatter (see below)
+  LESSONS.md                            # accepted lessons; template boilerplate + marker line,
+                                         # lessons appended below
+```
+
+- proposal-id format: `<YYYY-MM-DD>-<run-id>-<slug>` (slug = kebab, from the signature kind + slice).
+- signature object: `{"kind","severity","where","evidence","confidence":"high|medium|low","source":"mechanical|failures.json"}`.
+- `LESSONS.md` uses the standard m2herd marker convention (`<!-- === M2HERD:LIVE === -->`);
+  accepted lessons are appended below the marker as `- [<UTC ts>] (<proposal-id>) <lesson text>`.
+- All evolve commands `mkdir -p` what they need — NO dependency on template seeds existing.
+
+Proposal file format:
+```markdown
+---
+id: 2026-07-05-r-20260705T120000Z-report-missing-trace-capture
+run: r-20260705T120000Z
+kind: memory | template | policy | repo
+target: <path the change applies to, repo-relative or .m2herd-relative>
+risk: low | medium | high
+status: proposed | applied | rejected
+lesson: <one-line lesson appended to LESSONS.md on apply; may be empty for kind=repo>
+---
+
+## Observed failure
+<evidence from the run>
+
+## Proposed change
+<what to change>
+
+## Rollback
+<how to undo>
+
+## Acceptance check
+<how to verify the change helped>
+```
+
+### §3. `m2herd evolve` subcommand semantics
+
+```
+m2herd evolve analyze  [--dir P] [--run <id|latest|current>]   # default: current, falling back to latest
+m2herd evolve proposals [--dir P]                              # list: id, kind, risk, status
+m2herd evolve show <id> [--dir P]                              # print the proposal file
+m2herd evolve apply <id> [--dir P]                             # see apply ladder below
+m2herd evolve reject <id> [--dir P]                            # frontmatter status -> rejected (no file moves)
+```
+
+- `analyze` is MECHANICAL — no LLM calls, same doctrine as `next`. It detects only boring
+  signatures: slice `status.json` `state=="failed"`; `report.md` missing or empty at
+  collect; `status.json` missing for a dispatched slice (in `run.json` `slices[]` but no
+  dir); plus every entry of any `failures.json` passed through verbatim
+  (`source:"failures.json"`). It writes `signatures/<run-id>.json` and one skeleton
+  proposal per signature (kind defaults: mechanical signatures → `memory`, risk low, status
+  proposed, lesson prefilled with a one-line statement of the failure). Idempotent:
+  re-running must not duplicate signatures or proposal files (key on proposal-id).
+- `--run latest` = lexically greatest run dir (run-ids sort chronologically by construction).
+- `apply` rules (conservative ladder):
+  - kind `memory` or `policy`: append the `lesson:` line to `LESSONS.md` (append-once by
+    proposal-id), flip frontmatter `status: applied`.
+  - kind `template`: target MUST be under `.m2herd/`; refuse otherwise. Flip status,
+    append lesson if set.
+  - kind `repo` (targets outside `.m2herd/`, e.g. `skill/SKILL.md` or `scripts/`): NEVER
+    edit the target. Print a branch/patch recommendation ("open a branch, apply by hand,
+    see proposal") and flip `status: applied` only with `--ack-repo`; without it, leave
+    proposed and exit 0 with the recommendation printed.
+- `reject`: flip frontmatter status only. Both apply/reject are idempotent.
+- Frontmatter edits: rewrite the whole frontmatter block deterministically (awk/sed on the
+  `^status:` line inside the frontmatter fence is acceptable here — files are ours), or
+  regenerate the file; do NOT corrupt the body.
+
+### §4. Lesson surfacing
+
+- `m2herd resume` prints, after the areas list, a `Recent factory lessons:` section with
+  the last 5 lesson lines from `LESSONS.md` — only when `LESSONS.md` has content below the marker.
+- `m2herd-up dispatch` (both pane and headless): when `LESSONS.md` has content below the
+  marker, the pointer message sent to the worker gains one sentence: `Also read <abs path
+  to .m2herd/evolver/LESSONS.md> (accepted factory lessons) before starting.` The task
+  file itself is NOT mutated.
+
+Template seeds for both trees (`evolver/README.md`, `evolver/LESSONS.md`, `runs/README.md`)
+live under `templates/m2herd/`. `skill/SKILL.md` documentation for the `evolve` commands
+lands separately once those commands are released.
+
 ## conventions (all slices)
 - bash: `set -euo pipefail`, mechanical + idempotent, the style of `scripts/herd-loop.sh`.
 - jq required for JSON (hooks degrade silent without it); timestamps `date -u +%Y-%m-%dT%H:%M:%SZ`.
