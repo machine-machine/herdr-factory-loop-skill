@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -81,9 +82,14 @@ func HasFabric(dir string) bool {
 // Drift compares overview.json areas[] against the context/ tree, same logic
 // as `m2herd.sh sync --check`: dirs with no matching area are "missing",
 // listed areas with no matching dir are "orphan". clean == no drift.
-func Drift(dir string, ov *Overview) (clean bool, missing, orphan []string) {
+// A ReadDir failure is returned as err with clean=true: an unreadable tree is
+// a warning, not evidence that every listed area is orphan.
+func Drift(dir string, ov *Overview) (clean bool, missing, orphan []string, err error) {
 	tree := map[string]bool{}
-	entries, _ := os.ReadDir(filepath.Join(dir, ".m2herd", "context"))
+	entries, err := os.ReadDir(filepath.Join(dir, ".m2herd", "context"))
+	if err != nil {
+		return true, nil, nil, err
+	}
 	for _, e := range entries {
 		if e.IsDir() {
 			tree[e.Name()] = true
@@ -105,7 +111,7 @@ func Drift(dir string, ov *Overview) (clean bool, missing, orphan []string) {
 	}
 	sort.Strings(missing)
 	sort.Strings(orphan)
-	return len(missing) == 0 && len(orphan) == 0, missing, orphan
+	return len(missing) == 0 && len(orphan) == 0, missing, orphan, nil
 }
 
 var hdrFieldRe = regexp.MustCompile(`(?m)^([a-zA-Z_]+):\s*(.*)$`)
@@ -232,23 +238,38 @@ type BudgetInfo struct {
 	Age     string
 }
 
-// LoadBudget scans /tmp/claude-ctx-*.json (newest first) for the first file
-// with a numeric .used_pct, mirroring budget_row() in scripts/m2herd.sh.
+// LoadBudget scans /tmp/claude-ctx-*.json for the first file with a numeric
+// .used_pct, mirroring budget_row() in scripts/m2herd.sh. Files older than
+// 30 min are ignored, files owned by the current uid are preferred (newest
+// first within each group), and a non-positive budget rejects the file.
 func LoadBudget() BudgetInfo {
 	matches, _ := filepath.Glob("/tmp/claude-ctx-*.json")
-	sort.Slice(matches, func(i, j int) bool {
-		fi, _ := os.Stat(matches[i])
-		fj, _ := os.Stat(matches[j])
-		var ti, tj time.Time
-		if fi != nil {
-			ti = fi.ModTime()
-		}
-		if fj != nil {
-			tj = fj.ModTime()
-		}
-		return ti.After(tj)
-	})
+	uid := os.Getuid()
+	type candidate struct {
+		path string
+		mod  time.Time
+		mine bool
+	}
+	var cands []candidate
 	for _, m := range matches {
+		fi, err := os.Stat(m)
+		if err != nil || time.Since(fi.ModTime()) > 30*time.Minute {
+			continue
+		}
+		mine := false
+		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
+			mine = int(st.Uid) == uid
+		}
+		cands = append(cands, candidate{path: m, mod: fi.ModTime(), mine: mine})
+	}
+	sort.Slice(cands, func(i, j int) bool {
+		if cands[i].mine != cands[j].mine {
+			return cands[i].mine
+		}
+		return cands[i].mod.After(cands[j].mod)
+	})
+	for _, c := range cands {
+		m := c.path
 		b, err := os.ReadFile(m)
 		if err != nil {
 			continue
@@ -272,14 +293,10 @@ func LoadBudget() BudgetInfo {
 				budget = int64(bf)
 			}
 		}
-		info, err := os.Stat(m)
-		var age string
-		if err == nil {
-			age = ageString(time.Since(info.ModTime()))
-		} else {
-			age = "?"
+		if budget <= 0 {
+			continue
 		}
-		return BudgetInfo{Present: true, Pct: int(pctF), Budget: budget, Age: age}
+		return BudgetInfo{Present: true, Pct: int(pctF), Budget: budget, Age: ageString(time.Since(c.mod))}
 	}
 	return BudgetInfo{}
 }
@@ -313,7 +330,9 @@ func LoadUpdateBanner() UpdateBanner {
 	if err != nil {
 		return UpdateBanner{}
 	}
-	if time.Since(t) >= 24*time.Hour {
+	// A future-dated check is clock skew or a corrupt cache — treat as stale,
+	// otherwise the banner would pin until the timestamp is finally passed.
+	if d := time.Since(t); d < 0 || d >= 24*time.Hour {
 		return UpdateBanner{}
 	}
 	return UpdateBanner{Behind: n, Show: true}
@@ -326,6 +345,9 @@ func NextLine(dir string) (line string, ok bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "m2herd", "next", "--dir", dir)
+	// Without WaitDelay a grandchild inheriting stdout keeps the pipe open and
+	// blocks Output() past the context deadline, leaking a goroutine per tick.
+	cmd.WaitDelay = 2 * time.Second
 	out, err := cmd.Output()
 	if err != nil {
 		return "", false
@@ -340,6 +362,7 @@ func HerdrAgents() (statusByPane map[string]string, ok bool) {
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "herdr", "agent", "list")
+	cmd.WaitDelay = 2 * time.Second
 	out, err := cmd.Output()
 	if err != nil {
 		return nil, false
