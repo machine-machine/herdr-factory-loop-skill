@@ -16,7 +16,11 @@ set -u
 # read loop, so a host that never closes stdin costs at most 5s per silent read —
 # the previous $(cat) form blocked forever because cat ran before the timeout applied.
 _stdin=""
+_line=""
 while IFS= read -r -t 5 _line 2>/dev/null; do _stdin="${_stdin}${_line}"; done || true
+# On EOF after a final unterminated line, read returns non-zero but leaves the
+# partial in $_line — append it so a newline-less payload isn't dropped.
+if [ -n "${_line:-}" ]; then _stdin="${_stdin}${_line}"; fi
 
 # jq is required for safe JSON encoding; without it, stay silent.
 command -v jq >/dev/null 2>&1 || exit 0
@@ -32,12 +36,26 @@ fi
 # Not a herd workspace → nothing to say.
 [ -n "$WS" ] || exit 0
 
-conf_get() { grep -E "^$1=" "$WS/herd.conf" 2>/dev/null | head -1 | cut -d= -f2- || true; }
+# Values may be shell-quoted in herd.conf (BUDGET="384000"); strip one layer
+# of surrounding quotes so downstream consumers see the bare value, matching
+# how the JS hooks' Number() coercion treats the same file.
+conf_get() {
+  _v="$(grep -E "^$1=" "$WS/herd.conf" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  case "$_v" in
+    \"*\") _v="${_v#\"}"; _v="${_v%\"}" ;;
+    \'*\') _v="${_v#\'}"; _v="${_v%\'}" ;;
+  esac
+  printf '%s' "$_v"
+}
 
 MODEL="$(conf_get MODEL)"
 BUDGET="$(conf_get BUDGET)"
 [ -n "$MODEL" ]  || MODEL="GLM-5.2"
-[ -n "$BUDGET" ] || BUDGET="384000"
+# BUDGET must be a positive integer before we advertise it as a token budget
+# (the JS hooks reject non-numeric values via Number(); mirror that here).
+BUDGET="$(printf '%s' "$BUDGET" | tr -d '[:space:]')"
+case "$BUDGET" in ''|*[!0-9]*) BUDGET="384000" ;; esac
+[ "$BUDGET" -gt 0 ] 2>/dev/null || BUDGET="384000"
 
 POINTER=""
 if [ -f "$WS/_fleet/context_pointer.md" ]; then

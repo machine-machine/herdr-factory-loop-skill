@@ -44,6 +44,7 @@ let input = '';
 // Agent kills us and reports a hook error.
 const stdinTimeout = setTimeout(() => process.exit(0), 10000);
 process.stdin.setEncoding('utf8');
+process.stdin.on('error', () => process.exit(0));
 process.stdin.on('data', chunk => input += chunk);
 process.stdin.on('end', () => {
   clearTimeout(stdinTimeout);
@@ -62,14 +63,25 @@ process.stdin.on('end', () => {
     const wsDir = resolveWorkspace(cwd);
     let budget = wsDir ? readConfBudget(path.join(wsDir, 'herd.conf')) : null;
 
-    const tmpDir = os.tmpdir();
-    const metricsPath = path.join(tmpDir, `claude-ctx-${sessionId}.json`);
+    // The statusline writer uses literal /tmp (see contract + context-budget.sh);
+    // os.tmpdir() is $TMPDIR (/var/folders/…) on macOS, so check /tmp FIRST and
+    // keep os.tmpdir() as the fallback.
+    const candidates = [
+      path.join('/tmp', `claude-ctx-${sessionId}.json`),
+      path.join(os.tmpdir(), `claude-ctx-${sessionId}.json`)
+    ];
+    const metricsPath = candidates.find(p => { try { return fs.existsSync(p); } catch (e) { return false; } });
     // No bridge file → subagent / fresh session, nothing to measure.
-    if (!fs.existsSync(metricsPath)) process.exit(0);
+    if (!metricsPath) process.exit(0);
+    // Keep the warn/debounce file next to the bridge that was actually found,
+    // so debounce state stays consistent when /tmp and os.tmpdir() differ.
+    const tmpDir = path.dirname(metricsPath);
 
     const metrics = JSON.parse(fs.readFileSync(metricsPath, 'utf8'));
     const now = Math.floor(Date.now() / 1000);
-    if (metrics.timestamp && (now - metrics.timestamp) > STALE_SECONDS) process.exit(0);
+    // A bridge without a (numeric) timestamp is unverifiable → treat as stale.
+    const ts = Number(metrics.timestamp);
+    if (!Number.isFinite(ts) || (now - ts) > STALE_SECONDS) process.exit(0);
 
     // Budget fallbacks: bridge file's own budget, then the factory default.
     if (!budget) budget = Number(metrics.budget) || null;

@@ -18,7 +18,11 @@ set -u
 # read loop, so a host that never closes stdin costs at most 5s per silent read —
 # a $(cat) form would block forever because cat runs before any timeout applies.
 _stdin=""
+_line=""
 while IFS= read -r -t 5 _line 2>/dev/null; do _stdin="${_stdin}${_line}"; done || true
+# On EOF after a final unterminated line, read returns non-zero but leaves the
+# partial in $_line — append it so a newline-less payload isn't dropped.
+if [ -n "${_line:-}" ]; then _stdin="${_stdin}${_line}"; fi
 
 # jq is required for safe JSON encoding; without it, stay silent.
 command -v jq >/dev/null 2>&1 || exit 0
@@ -46,10 +50,18 @@ if command -v m2herd >/dev/null 2>&1; then
   if command -v timeout >/dev/null 2>&1; then
     timeout 3 m2herd sync --check --dir "$ROOT" >/dev/null 2>&1 || _rc=$?
   else
+    # No `timeout` binary: poll the job table instead of forking a detached
+    # sleep-then-kill watcher — no orphaned sleep child, and because we only
+    # kill while `jobs -r` still lists the (unreaped) child, the kill can
+    # never hit a recycled PID.
     m2herd sync --check --dir "$ROOT" >/dev/null 2>&1 & _pid=$!
-    ( sleep 3; kill "$_pid" 2>/dev/null ) & _watch=$!
+    _i=0
+    while [ "$_i" -lt 3 ] && jobs -r 2>/dev/null | grep -q .; do
+      sleep 1
+      _i=$((_i+1))
+    done
+    if jobs -r 2>/dev/null | grep -q .; then kill "$_pid" 2>/dev/null || true; fi
     wait "$_pid" 2>/dev/null; _rc=$?
-    kill "$_watch" 2>/dev/null; wait "$_watch" 2>/dev/null || true
   fi
   if [ "$_rc" -eq 3 ]; then
     DRIFT=" context drift detected — run \`m2herd sync\` to reconcile overview.json with the context/ tree."
