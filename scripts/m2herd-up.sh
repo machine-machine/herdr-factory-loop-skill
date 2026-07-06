@@ -17,10 +17,16 @@
 #                         [--headless [--model M]]  # worktree wip/m2herd-<S> off BASE (default: current branch), spawn worker,
 #                                                   # file-protocol dispatch of .m2herd/dispatch/S.task.md, record in overview.json workers[]
 #                                                   # --headless: no pane/TUI — `claude -p --model M` (default sonnet) or `codex exec`
-#                                                   #   in the worktree via nohup; log → dispatch/S.log, answer → dispatch/S.out.md;
+#                                                   #   in the worktree via nohup; log → dispatch/S.log, stderr → dispatch/S.stderr.log,
+#                                                   #   answer → dispatch/S.out.md;
 #                                                   #   usage (tokens/cost) parsed into workers[] at collect. Cheap hands, Fable judgment.
 #   m2herd-up.sh collect  --slice S [--repo P]      # wait idle (pane) / exited (headless pid), keep/copy report to dispatch/S.out.md,
 #                                                   # update workers[] state (+tokens/cost for headless)
+#   m2herd-up.sh down     [--slice S | --all] [--repo P] [--force]
+#                                                   # tear worker(s) down: close pane (never $SELF; unknown self = fail safe),
+#                                                   #   remove worktree (dirty ones only with --force), delete branch when merged
+#                                                   #   (else kept + reported), set workers[] state=down. Idempotent.
+#                                                   #   retry a slice = clean `down --slice S`, then dispatch it again.
 #   m2herd-up.sh --dry-run <same args>              # print every herdr/git command instead of running it
 #
 # Binding herdr rules (from CONTRACT-m2herd.md): identify $SELF first and never
@@ -47,6 +53,7 @@ DRY_RUN=0
 while [ "${1:-}" = "--dry-run" ]; do DRY_RUN=1; shift; done
 CMD="${1:-help}"; shift || true
 REPO=""; GOAL=""; SLICE=""; BASE=""; AGENT="claude"; HEADLESS=0; MODEL=""; ROOM_ONLY=0
+ALL=0; FORCE=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO="$2"; shift 2 ;;
@@ -56,6 +63,8 @@ while [ $# -gt 0 ]; do
     --agent) AGENT="$2"; shift 2 ;;
     --headless) HEADLESS=1; shift ;;
     --room-only) ROOM_ONLY=1; shift ;;
+    --all) ALL=1; shift ;;
+    --force) FORCE=1; shift ;;
     --model) MODEL="$2"; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) CMD="help"; shift ;;
@@ -82,9 +91,20 @@ WAIT_TIMEOUT="${M2HERD_WAIT_TIMEOUT:-1800000}"      # collect: ms to wait for wo
 
 log()        { printf '  %s\n' "$*"; }
 plan()       { log "[dry-run] $*"; }
-do_or_echo() { if [ "$DRY_RUN" -eq 1 ]; then plan "$*"; else eval "$@"; fi; }
 need()       { command -v "$1" >/dev/null 2>&1 || { echo "required tool not on PATH: $1" >&2; exit 1; }; }
 utc_now()    { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# Central token validation (binding cross-slice convention). A slice name
+# becomes filenames under .m2herd/dispatch/, the branch wip/m2herd-<S>, and
+# prompt text — one gate covers all three. Pure `case` so embedded newlines
+# can't sneak past a line-oriented regex tool.
+validate_token() { # validate_token <what> <value>
+  case "$2" in
+    ''|*..*|[!A-Za-z0-9]*|*[!A-Za-z0-9._-]*)
+      echo "invalid $1 '$2': must match ^[A-Za-z0-9][A-Za-z0-9._-]*\$ (no '..')" >&2
+      exit 2 ;;
+  esac
+}
 
 # Are we running inside a herdr-managed pane? Walk the ancestor process chain
 # (bounded ~25 hops) and match any ancestor command name containing "herdr".
@@ -123,13 +143,57 @@ resolve_repo() {
   OV="$REPO/.m2herd/overview.json"
 }
 
-# Binding rule: identify the orchestrator's own pane BEFORE any send/close and
-# treat it as read-only. Empty when the fleet is unreachable (dry-run tolerates).
+# Binding rule: identify the orchestrator's OWN pane BEFORE any send/close and
+# treat it as read-only. NEVER keyed on focus (the human may be looking at any
+# pane): walk THIS process's ancestry (PPid chain, bounded 15 hops — same ps
+# idiom as inside_herdr) and for every ancestor whose command name looks like an
+# agent binary, match its cwd against `herdr agent list`. Exactly one agent at
+# that cwd → that pane is $SELF. Zero everywhere / ambiguous / fleet unreachable
+# → $SELF stays EMPTY, which means UNKNOWN (not "no pane"): destructive ops must
+# go through maybe_self(), which fails safe by treating unknown as "could be me".
 SELF=""
 resolve_self() {
-  SELF="$(herdr agent list 2>/dev/null | jq -r '[.result.agents[] | select(.focused==true)] | first | .pane_id // empty' 2>/dev/null || true)"
+  SELF=""
+  local agents pid=$$ hops=0 comm cwd ppid n
+  agents="$(herdr agent list 2>/dev/null | jq -c '[.result.agents[]? | {pane_id, cwd}]' 2>/dev/null || true)"
+  if [ -z "$agents" ] || [ "$agents" = "[]" ] || [ "$agents" = "null" ]; then
+    return 0   # fleet unreachable or no agents — $SELF stays unknown
+  fi
+  while [ "$hops" -lt 15 ]; do
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
+    if [ -n "$cwd" ]; then
+      case "$comm" in
+        *claude*|*codex*|*cursor*|*opencode*|*hermes*)
+          n="$(printf '%s' "$agents" | jq -r --arg c "$cwd" '[.[] | select(.cwd==$c)] | length' 2>/dev/null || echo 0)"
+          if [ "${n:-0}" -eq 1 ]; then
+            SELF="$(printf '%s' "$agents" | jq -r --arg c "$cwd" \
+              '[.[] | select(.cwd==$c)] | first | .pane_id // empty' 2>/dev/null || true)"
+            return 0
+          elif [ "${n:-0}" -gt 1 ]; then
+            log "! self resolution ambiguous: $n agents share cwd $cwd — \$SELF stays unknown (fail safe)"
+            return 0
+          fi
+          ;;
+      esac
+    fi
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    [ -n "$ppid" ] || break
+    [ "$ppid" -le 1 ] 2>/dev/null && break
+    pid="$ppid"; hops=$((hops + 1))
+  done
+  return 0
 }
 is_self() { [ -n "$SELF" ] && [ "$1" = "$SELF" ]; }
+# Fail-safe self test for DESTRUCTIVE ops (pane close): unknown $SELF counts as
+# "could be me" — returns 0 (refuse) and logs why.
+maybe_self() {
+  if [ -z "$SELF" ]; then
+    log "! \$SELF unresolved — treating pane $1 as possibly-self (fail safe)"
+    return 0
+  fi
+  [ "$1" = "$SELF" ]
+}
 
 # Binding rule: the pane_id returned by `agent start` can be off by one — always
 # RE-RESOLVE by cwd from `herdr agent list` (prefer a name match when given).
@@ -155,6 +219,26 @@ resolve_orch_pane() { # -> pane_id
   local orch_name="m2herd-orch-$(basename "$REPO")"
   herdr agent list 2>/dev/null | jq -r --arg c "$REPO" --arg n "$orch_name" \
     '[.result.agents[] | select(.cwd==$c and ((.name // "")==$n or (.name // "")=="claude"))] | first | .pane_id // empty' 2>/dev/null || true
+}
+
+# Workspace for this repo, by the SAME label up() creates (m2herd:<basename>);
+# falls back to any pane cwd'd at the repo; creates the workspace when missing.
+# The fallback `agent start` must ALWAYS pass --workspace — without it herdr
+# drops the worker into whatever workspace the human happens to have focused.
+resolve_repo_ws() { # -> workspace_id or empty
+  local label="m2herd:$(basename "$REPO")" ws
+  ws="$(herdr workspace list 2>/dev/null | jq -r --arg l "$label" \
+    '[.result.workspaces[]? | select((.label // "")==$l)] | first | .workspace_id // empty' 2>/dev/null || true)"
+  [ -n "$ws" ] || ws="$(herdr pane list 2>/dev/null | jq -r --arg c "$REPO" \
+    '[.result.panes[] | select(.cwd==$c)] | first | .workspace_id // empty' 2>/dev/null || true)"
+  if [ -z "$ws" ]; then
+    herdr workspace create --cwd "$REPO" --label "$label" --no-focus >/dev/null 2>&1 || true
+    ws="$(herdr workspace list 2>/dev/null | jq -r --arg l "$label" \
+      '[.result.workspaces[]? | select((.label // "")==$l)] | first | .workspace_id // empty' 2>/dev/null || true)"
+    [ -n "$ws" ] || ws="$(herdr pane list 2>/dev/null | jq -r --arg c "$REPO" \
+      '[.result.panes[] | select(.cwd==$c)] | first | .workspace_id // empty' 2>/dev/null || true)"
+  fi
+  printf '%s' "$ws"
 }
 
 # tab_id that owns a given pane (from `herdr pane list`). Empty if not found.
@@ -195,50 +279,66 @@ worker_argv() {
 }
 
 # ---------- overview.json writers (always rewrite the whole file with jq) -----
-record_worker() { # record_worker <slice> <pane> <worktree> <branch> <state> [mode] [model] [pid]
-  local slice="$1" pane="$2" wt="$3" branch="$4" state="$5" mode="${6:-tui}" model="${7:-}" pid="${8:-}" tmp
+# Locked RMW (binding cross-slice convention): flock on $OV.lock serializes
+# every writer (m2herd.sh uses the same lock file); the tmp file lives in the
+# SAME dir as $OV so mv is an atomic rename, never a cross-filesystem copy; the
+# tmp is removed on failure. Stock macOS has no flock — degrade to the atomic
+# rename alone. jq args + filter pass straight through; $OV is appended here.
+ov_update() { # ov_update <jq args…> '<filter>'
+  local dir tmp lock="$OV.lock"
+  dir="$(dirname "$OV")"
+  tmp="$(mktemp "$dir/.overview.json.tmp.XXXXXX")" || return 1
+  if command -v flock >/dev/null 2>&1; then
+    if ( flock -w 30 9 && jq "$@" "$OV" > "$tmp" && mv "$tmp" "$OV" ) 9>>"$lock"; then return 0; fi
+  else
+    if jq "$@" "$OV" > "$tmp" && mv "$tmp" "$OV"; then return 0; fi
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+record_worker() { # record_worker <slice> <pane> <worktree> <branch> <state> [mode] [model] [pid] [pid_start] [pid_comm]
+  local slice="$1" pane="$2" wt="$3" branch="$4" state="$5" mode="${6:-tui}" model="${7:-}" pid="${8:-}" pid_start="${9:-}" pid_comm="${10:-}"
   if [ "$DRY_RUN" -eq 1 ]; then
-    plan "jq rewrite $OV: workers[] += {slice:\"$slice\", pane_id:\"$pane\", mode:\"$mode\"${model:+, model:\"$model\"}${pid:+, pid:$pid}, worktree:\"$wt\", branch:\"$branch\", state:\"$state\", …}"
+    plan "jq rewrite $OV (locked): workers[] += {slice:\"$slice\", pane_id:\"$pane\", mode:\"$mode\", agent:\"$AGENT\"${model:+, model:\"$model\"}${pid:+, pid:$pid}, worktree:\"$wt\", branch:\"$branch\", state:\"$state\", …}"
     return 0
   fi
   [ -f "$OV" ] || { echo "no overview.json at $OV (run: m2herd-up.sh up --repo $REPO)" >&2; exit 1; }
-  tmp="$(mktemp)"
-  jq --arg slice "$slice" --arg pane "$pane" --arg wt "$wt" --arg br "$branch" \
-     --arg st "$state" --arg ts "$(utc_now)" --arg mode "$mode" --arg model "$model" --arg pid "$pid" '
+  ov_update --arg slice "$slice" --arg pane "$pane" --arg wt "$wt" --arg br "$branch" \
+     --arg st "$state" --arg ts "$(utc_now)" --arg mode "$mode" --arg agent "$AGENT" \
+     --arg model "$model" --arg pid "$pid" --arg pstart "$pid_start" --arg pcomm "$pid_comm" '
     .workers = ((.workers // []) | map(select(.slice != $slice))) + [({
-      slice: $slice, pane_id: $pane, worktree: $wt, branch: $br, state: $st, mode: $mode,
+      slice: $slice, pane_id: $pane, worktree: $wt, branch: $br, state: $st, mode: $mode, agent: $agent,
       task: (".m2herd/dispatch/" + $slice + ".task.md"),
       out:  (".m2herd/dispatch/" + $slice + ".out.md") }
       + (if $model != "" then {model: $model} else {} end)
-      + (if $pid != "" then {pid: ($pid | tonumber)} else {} end))]
+      + (if $pid != "" then {pid: ($pid | tonumber)} else {} end)
+      + (if $pstart != "" then {pid_start: $pstart} else {} end)
+      + (if $pcomm != "" then {pid_comm: $pcomm} else {} end))]
     | .updated_at = $ts
-  ' "$OV" > "$tmp"
-  mv "$tmp" "$OV"
+  ' || { echo "overview.json update failed (lock timeout or jq error)" >&2; exit 1; }
 }
 
-set_worker_usage() { # set_worker_usage <slice> <output_tokens> <cost_usd>
-  local slice="$1" tok="$2" cost="$3" tmp
-  [ "$DRY_RUN" -eq 1 ] && { plan "jq rewrite $OV: workers[slice==$slice] += {tokens:$tok, cost_usd:$cost}"; return 0; }
+set_worker_usage() { # set_worker_usage <slice> <output_tokens> <cost_usd> — best-effort
+  local slice="$1" tok="$2" cost="$3"
+  [ "$DRY_RUN" -eq 1 ] && { plan "jq rewrite $OV (locked): workers[slice==$slice] += {tokens:$tok, cost_usd:$cost}"; return 0; }
   [ -f "$OV" ] || return 0
-  tmp="$(mktemp)"
-  jq --arg s "$slice" --arg tok "$tok" --arg cost "$cost" '
+  ov_update --arg s "$slice" --arg tok "$tok" --arg cost "$cost" '
     .workers = ((.workers // []) | map(if .slice == $s then
       . + (if $tok  != "" then {tokens:   ($tok  | tonumber)} else {} end)
         + (if $cost != "" then {cost_usd: ($cost | tonumber)} else {} end)
     else . end))
-  ' "$OV" > "$tmp" && mv "$tmp" "$OV"
+  ' || log "! usage update failed for $slice (non-fatal)"
 }
 
 set_worker_state() { # set_worker_state <slice> <state>
-  local slice="$1" state="$2" tmp
-  if [ "$DRY_RUN" -eq 1 ]; then plan "jq rewrite $OV: workers[slice==$slice].state = \"$state\""; return 0; fi
+  local slice="$1" state="$2"
+  if [ "$DRY_RUN" -eq 1 ]; then plan "jq rewrite $OV (locked): workers[slice==$slice].state = \"$state\""; return 0; fi
   [ -f "$OV" ] || { echo "no overview.json at $OV" >&2; exit 1; }
-  tmp="$(mktemp)"
-  jq --arg slice "$slice" --arg st "$state" --arg ts "$(utc_now)" '
+  ov_update --arg slice "$slice" --arg st "$state" --arg ts "$(utc_now)" '
     .workers = ((.workers // []) | map(if .slice == $slice then .state = $st else . end))
     | .updated_at = $ts
-  ' "$OV" > "$tmp"
-  mv "$tmp" "$OV"
+  ' || { echo "overview.json update failed (lock timeout or jq error)" >&2; exit 1; }
 }
 
 # ---------- run trace bundles (.m2herd/runs/<run-id>/, evolver contract §1) ---
@@ -267,6 +367,19 @@ run_ensure() {
   fi
   mkdir -p "$runs" 2>/dev/null || { trace_warn "cannot create $runs"; RUN_ID=""; return 1; }
   RUN_ID="$(cat "$cur" 2>/dev/null || true)"
+  if [ -n "$RUN_ID" ] && [ ! -f "$runs/$RUN_ID/run.json" ]; then
+    # stale CURRENT (run dir wiped) — recreate the bundle so recording resumes
+    # instead of silently never writing traces again
+    trace_warn "CURRENT points at $RUN_ID but run.json is missing — recreating it"
+    if mkdir -p "$runs/$RUN_ID/slices" 2>/dev/null; then
+      goal="$(jq -r '.goal // ""' "$OV" 2>/dev/null || true)"
+      jq -n --arg id "$RUN_ID" --arg ts "$(utc_now)" --arg goal "$goal" --arg base "$BASE" \
+        '{run_id:$id, created_at:$ts, goal:$goal, base:$base, slices:[]}' > "$runs/$RUN_ID/run.json" 2>/dev/null \
+        || { trace_warn "recreate $runs/$RUN_ID/run.json failed"; RUN_ID=""; return 1; }
+    else
+      trace_warn "mkdir $runs/$RUN_ID failed"; RUN_ID=""; return 1
+    fi
+  fi
   if [ -z "$RUN_ID" ]; then
     RUN_ID="r-$(date -u +%Y%m%dT%H%M%SZ)"
     rj="$runs/$RUN_ID/run.json"
@@ -287,7 +400,7 @@ run_append_slice() { # run_append_slice <slice>
   local slice="$1" rj="$REPO/.m2herd/runs/$RUN_ID/run.json" tmp
   if [ "$DRY_RUN" -eq 1 ]; then plan "jq rewrite $rj: slices[] += \"$slice\" (dedup)"; return 0; fi
   [ -f "$rj" ] || { trace_warn "no run.json at $rj"; return 1; }
-  tmp="$(mktemp)"
+  tmp="$(mktemp "$(dirname "$rj")/.run.json.tmp.XXXXXX")" || { trace_warn "mktemp for $rj failed"; return 1; }
   jq --arg s "$slice" '.slices = (((.slices // []) + [$s]) | unique)' "$rj" > "$tmp" 2>/dev/null \
     && mv "$tmp" "$rj" || { rm -f "$tmp"; trace_warn "append slice to $rj failed"; return 1; }
 }
@@ -311,14 +424,19 @@ trace_dispatch_write() { # trace_dispatch_write <slice> <runner:pane|headless> <
     > "$dir/status.json" 2>/dev/null || trace_warn "write $dir/status.json failed"
 }
 
-# Find which run holds a slice at collect time: prefer CURRENT; if CURRENT is
-# missing, fall back to the lexically latest run dir containing the slice.
+# Find which run holds a slice at collect time: CURRENT counts ONLY when that
+# run's run.json actually lists the slice in slices[] (a slice dispatched under
+# an older run must not report into whatever run is current now); otherwise fall
+# back to the lexically latest run dir containing the slice.
 trace_find_run_for_slice() { # trace_find_run_for_slice <slice> -> echoes run-id or empty
   local slice="$1" runs="$REPO/.m2herd/runs" cur rid
   cur="$runs/CURRENT"
   if [ -f "$cur" ]; then
     rid="$(cat "$cur" 2>/dev/null || true)"
-    [ -n "$rid" ] && { printf '%s' "$rid"; return 0; }
+    if [ -n "$rid" ] && [ -f "$runs/$rid/run.json" ] \
+       && jq -e --arg s "$slice" '(.slices // []) | index($s) != null' "$runs/$rid/run.json" >/dev/null 2>&1; then
+      printf '%s' "$rid"; return 0
+    fi
   fi
   rid="$(ls -1 "$runs" 2>/dev/null | grep '^r-' | sort -r | while IFS= read -r d; do
     if [ -d "$runs/$d/slices/$slice" ]; then printf '%s' "$d"; break; fi
@@ -343,7 +461,7 @@ trace_collect_write() { # trace_collect_write <slice> <state:done|failed> [token
   mkdir -p "$dir" || { trace_warn "mkdir $dir failed"; return 1; }
   cp "$out" "$dir/report.md" 2>/dev/null || trace_warn "copy $out -> $dir/report.md failed"
   if [ -f "$sj" ]; then
-    local tmp; tmp="$(mktemp)"
+    local tmp; tmp="$(mktemp "$dir/.status.json.tmp.XXXXXX")" || { trace_warn "mktemp for $sj failed"; return 1; }
     jq --arg st "$state" --arg ts "$(utc_now)" --arg tok "$tok" --arg cost "$cost" '
       .state = $st | .collected_at = $ts
       | .tokens    = (if $tok  != "" then ($tok  | tonumber) else .tokens    end)
@@ -519,6 +637,7 @@ up() {
 # ---------- dispatch: worktree + worker + file-protocol task -------------------
 dispatch() {
   [ -n "$SLICE" ] || { echo "dispatch needs --slice S" >&2; exit 2; }
+  validate_token slice "$SLICE"
   resolve_repo; resolve_self
   [ -n "$BASE" ] || BASE="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
   local branch="wip/m2herd-$SLICE" task="$REPO/.m2herd/dispatch/$SLICE.task.md"
@@ -582,30 +701,38 @@ dispatch() {
   #     Prompt stays a one-line pointer (file protocol); the report lands in $out
   #     by instruction, the runner's own stdout (usage JSON for claude) in $lg.
   if [ "$HEADLESS" -eq 1 ]; then
-    local out="$REPO/.m2herd/dispatch/$SLICE.out.md" lg="$REPO/.m2herd/dispatch/$SLICE.log" hpid="" wtask
+    # stderr goes to its own file so the JSON log stays parseable (usage parse
+    # at collect reads $lg as pure JSON for claude).
+    local out="$REPO/.m2herd/dispatch/$SLICE.out.md" lg="$REPO/.m2herd/dispatch/$SLICE.log"
+    local errlg="$REPO/.m2herd/dispatch/$SLICE.stderr.log" hpid="" hstart="" hcomm="" wtask
     wtask="$(copy_task_into_wt "$wt")"
     local hprompt="$(confinement_line "$wt" "$branch") Read $wtask and follow its instructions exactly. Write your complete report to $out when done (the report file is the ONLY thing you write outside the worktree).$(lessons_pointer_suffix)"
     if [ "$DRY_RUN" -eq 1 ]; then
       case "$AGENT" in
-        claude)   plan "cd '$wt' && nohup claude -p '<pointer>' --model '$MODEL' --dangerously-skip-permissions --output-format json > '$lg' 2>&1 &" ;;
-        codex)    plan "cd '$wt' && nohup codex exec --dangerously-bypass-approvals-and-sandbox '<pointer>' > '$lg' 2>&1 &" ;;
-        opencode) plan "cd '$wt' && nohup opencode run '<pointer>' > '$lg' 2>&1 &" ;;
+        claude)   plan "cd '$wt' && nohup claude -p '<pointer>' --model '$MODEL' --dangerously-skip-permissions --output-format json > '$lg' 2> '$errlg' &" ;;
+        codex)    plan "cd '$wt' && nohup codex exec --dangerously-bypass-approvals-and-sandbox '<pointer>' > '$lg' 2> '$errlg' &" ;;
+        opencode) plan "cd '$wt' && nohup opencode run '<pointer>' > '$lg' 2> '$errlg' &" ;;
       esac
+      plan "record pid + its start-time/comm (ps -o lstart=/-o comm=) so collect can verify the pid was not recycled"
       record_worker "$SLICE" "-" "$wt" "$branch" "spawned" "headless" "$MODEL" ""
       trace_dispatch_write "$SLICE" "headless" "$MODEL" "$branch" "$wt" || true
       log "dispatch: dry-run headless plan complete for $SLICE"
       return 0
     fi
     case "$AGENT" in
-      claude)   ( cd "$wt" && nohup claude -p "$hprompt" --model "$MODEL" --dangerously-skip-permissions --output-format json > "$lg" 2>&1 & echo $! > "$lg.pid" ) ;;
-      codex)    ( cd "$wt" && nohup codex exec --dangerously-bypass-approvals-and-sandbox "$hprompt" > "$lg" 2>&1 & echo $! > "$lg.pid" ) ;;
-      opencode) ( cd "$wt" && nohup opencode run "$hprompt" > "$lg" 2>&1 & echo $! > "$lg.pid" ) ;;
+      claude)   ( cd "$wt" && nohup claude -p "$hprompt" --model "$MODEL" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
+      codex)    ( cd "$wt" && nohup codex exec --dangerously-bypass-approvals-and-sandbox "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
+      opencode) ( cd "$wt" && nohup opencode run "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
     esac
     hpid="$(cat "$lg.pid" 2>/dev/null || true)"; rm -f "$lg.pid"
-    [ -n "$hpid" ] || { echo "headless spawn failed (no pid) — see $lg" >&2; exit 1; }
-    record_worker "$SLICE" "-" "$wt" "$branch" "spawned" "headless" "$MODEL" "$hpid"
+    [ -n "$hpid" ] || { echo "headless spawn failed (no pid) — see $lg / $errlg" >&2; exit 1; }
+    # pin the pid's identity NOW: start-time + comm let collect prove the pid it
+    # waits on is still OUR worker, not a recycled pid (fix: recycled-pid hang)
+    hstart="$(ps -o lstart= -p "$hpid" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' || true)"
+    hcomm="$(ps -o comm= -p "$hpid" 2>/dev/null | tr -d ' ' || true)"
+    record_worker "$SLICE" "-" "$wt" "$branch" "spawned" "headless" "$MODEL" "$hpid" "$hstart" "$hcomm"
     trace_dispatch_write "$SLICE" "headless" "$MODEL" "$branch" "$wt" || true
-    log "dispatch: done — $SLICE headless ($AGENT/$MODEL, pid $hpid), log $lg"
+    log "dispatch: done — $SLICE headless ($AGENT/$MODEL, pid $hpid), log $lg, stderr $errlg"
     return 0
   fi
 
@@ -621,21 +748,37 @@ dispatch() {
   orch_tab=""
   [ -n "$orch_pane" ] && orch_tab="$(pane_tab_id "$orch_pane")"
 
+  # Name/cwd matching is brittle: the orchestrator pane's REGISTERED cwd can
+  # differ from $REPO (pane born elsewhere, orchestrator cd'd later). When the
+  # ancestor-walk self-identity resolved $SELF, this session IS the orchestrator
+  # — use $SELF's tab as the orchestrator tab.
+  if { [ -z "$orch_pane" ] || [ -z "$orch_tab" ]; } && [ -n "$SELF" ]; then
+    orch_pane="$SELF"
+    orch_tab="$(pane_tab_id "$SELF")"
+    [ -n "$orch_tab" ] && log "orchestrator unresolved by name/cwd — using \$SELF pane $SELF (tab $orch_tab)"
+  fi
+
   if [ -z "$orch_pane" ] || [ -z "$orch_tab" ]; then
     # FALLBACK: orchestrator pane unresolvable (up never ran, not in a workspace,
-    # room-only session name mismatch, fleet unreachable) — use the ORIGINAL
-    # `agent start --no-focus` path unchanged, with a log line saying why.
-    log "! orchestrator pane unresolved (pane='${orch_pane:-}' tab='${orch_tab:-}') — falling back to 'agent start --no-focus'"
+    # room-only session name mismatch, fleet unreachable) — `agent start
+    # --no-focus`, pinned to the repo's workspace by label (created if missing):
+    # never let the worker land in whatever workspace the human has focused.
+    local ws
     if [ "$DRY_RUN" -eq 1 ]; then
-      plan "herdr agent start '$wname' --cwd '$wt' --no-focus -- \"\$(command -v $bin)\" $flag"
+      log "! orchestrator pane unresolved (pane='${orch_pane:-}' tab='${orch_tab:-}') — falling back to 'agent start --no-focus'"
+      plan "resolve/create workspace by label 'm2herd:$(basename "$REPO")' (herdr workspace list/create)"
+      plan "herdr agent start '$wname' --workspace '<ws>' --cwd '$wt' --no-focus -- \"\$(command -v $bin)\" $flag"
       plan "re-resolve worker pane by cwd from 'herdr agent list' (returned pane_id can be off by one)"
       pane="PANE-DRYRUN"
     else
-      herdr agent start "$wname" --cwd "$wt" --no-focus -- "$(command -v "$bin")" $flag >/dev/null 2>&1 || true
+      ws="$(resolve_repo_ws)"
+      [ -n "$ws" ] || { echo "cannot resolve or create workspace 'm2herd:$(basename "$REPO")' (herdr server up?)" >&2; exit 1; }
+      log "! orchestrator pane unresolved (pane='${orch_pane:-}' tab='${orch_tab:-}') — falling back to 'agent start --no-focus' in workspace $ws"
+      herdr agent start "$wname" --workspace "$ws" --cwd "$wt" --no-focus -- "$(command -v "$bin")" $flag >/dev/null 2>&1 || true
       pane="$(resolve_pane_by_cwd "$wt" "$wname")"
       [ -n "$pane" ] || { echo "worker pane never appeared in agent list (cwd $wt)" >&2; exit 1; }
       is_self "$pane" && { echo "resolved worker pane is \$SELF ($pane) — refusing" >&2; exit 1; }
-      log "worker spawned (fallback): pane $pane ($wname)"
+      log "worker spawned (fallback): pane $pane ($wname) in workspace $ws"
       sleep 2   # let the TUI boot before the pointer lands
     fi
   else
@@ -685,6 +828,7 @@ dispatch() {
 # ---------- collect: wait idle, copy report, update state ----------------------
 collect() {
   [ -n "$SLICE" ] || { echo "collect needs --slice S" >&2; exit 2; }
+  validate_token slice "$SLICE"
   resolve_repo; resolve_self
   local out="$REPO/.m2herd/dispatch/$SLICE.out.md" pane
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -702,31 +846,64 @@ collect() {
   local wmode wpid
   wmode="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .mode // "tui"' "$OV")"
 
-  # HEADLESS collect: wait for the pid to exit, then keep/derive the report and
-  # parse usage (tokens / cost) from the runner's JSON log into workers[].
+  # HEADLESS collect: wait for the pid to exit — but only after proving it is
+  # still OUR worker (start-time recorded at dispatch; a recycled pid must not
+  # hang the collect). Then keep/derive the report per agent and parse usage
+  # (tokens / cost) from the runner's JSON log into workers[].
   if [ "$wmode" = "headless" ]; then
     wpid="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .pid // empty' "$OV")"
-    local lg="$REPO/.m2herd/dispatch/$SLICE.log" waited=0 max=$((WAIT_TIMEOUT / 1000))
+    local wagent wstart
+    wagent="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .agent // "claude"' "$OV")"
+    wstart="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .pid_start // empty' "$OV")"
+    local lg="$REPO/.m2herd/dispatch/$SLICE.log" errlg="$REPO/.m2herd/dispatch/$SLICE.stderr.log"
+    local waited=0 max=$((WAIT_TIMEOUT / 1000))
     if [ -n "$wpid" ]; then
-      log "collect: waiting for headless $SLICE (pid $wpid, max ${max}s)"
-      while kill -0 "$wpid" 2>/dev/null; do
+      local curstart
+      curstart="$(ps -o lstart= -p "$wpid" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' || true)"
+      if [ -z "$curstart" ]; then
+        log "collect: pid $wpid already exited — reading report"
+      elif [ -n "$wstart" ] && [ "$curstart" != "$wstart" ]; then
+        log "collect: pid $wpid start-time mismatch (recorded '$wstart', found '$curstart') — recycled pid, our worker already exited; not waiting on it"
+      else
+        log "collect: waiting for headless $SLICE (pid $wpid, max ${max}s)"
+        while kill -0 "$wpid" 2>/dev/null; do
+          sleep 5; waited=$((waited + 5))
+          if [ "$waited" -ge "$max" ]; then
+            echo "headless worker $SLICE (pid $wpid) still running after ${max}s" >&2
+            set_worker_state "$SLICE" "failed"
+            trace_collect_write "$SLICE" "failed" "" "" || true
+            exit 1
+          fi
+        done
+      fi
+    else
+      # No pid recorded — the worker may STILL be running; don't instantly fail
+      # it. Bounded wait on the log/report instead: done when the report shows
+      # up or the log has been quiet for 60s.
+      log "collect: no pid recorded for $SLICE — waiting on report/log activity instead (max ${max}s)"
+      local sz lastsz="" quiet=0
+      while [ "$waited" -lt "$max" ]; do
+        [ -s "$out" ] && break
+        sz="$(wc -c < "$lg" 2>/dev/null | tr -d ' ' || echo 0)"
+        if [ "$sz" = "$lastsz" ]; then quiet=$((quiet + 5)); else quiet=0; lastsz="$sz"; fi
+        if [ "$quiet" -ge 60 ]; then log "collect: log quiet ${quiet}s — assuming the runner exited"; break; fi
         sleep 5; waited=$((waited + 5))
-        if [ "$waited" -ge "$max" ]; then
-          echo "headless worker $SLICE (pid $wpid) still running after ${max}s" >&2
-          set_worker_state "$SLICE" "failed"
-          trace_collect_write "$SLICE" "failed" "" "" || true
-          exit 1
-        fi
       done
     fi
     if [ ! -s "$out" ] && [ -s "$lg" ]; then
-      # worker didn't write its report file — salvage the runner's .result text
-      jq -r '.result // empty' "$lg" > "$out" 2>/dev/null || true
+      # worker didn't write its report file — salvage per agent: claude logs a
+      # JSON envelope (.result), codex/opencode/anything else log plain text
+      case "$wagent" in
+        claude) jq -r '.result // empty' "$lg" > "$out" 2>/dev/null || true ;;
+        *)      tail -n 60 "$lg" > "$out" 2>/dev/null || true ;;
+      esac
     fi
-    [ -s "$out" ] || { echo "headless worker $SLICE produced no report ($out empty; see $lg)" >&2; set_worker_state "$SLICE" "failed"; trace_collect_write "$SLICE" "failed" "" "" || true; exit 1; }
-    local tok cost
-    tok="$(jq -r '[.modelUsage[]?.outputTokens] | add // empty' "$lg" 2>/dev/null || true)"
-    cost="$(jq -r '[.modelUsage[]?.costUSD] | add // empty' "$lg" 2>/dev/null || true)"
+    [ -s "$out" ] || { echo "headless worker $SLICE produced no report ($out empty; see $lg and $errlg)" >&2; set_worker_state "$SLICE" "failed"; trace_collect_write "$SLICE" "failed" "" "" || true; exit 1; }
+    local tok="" cost=""
+    if [ "$wagent" = "claude" ] && [ -s "$lg" ] && jq -e . "$lg" >/dev/null 2>&1; then
+      tok="$(jq -r '[.modelUsage[]?.outputTokens] | add // empty' "$lg" 2>/dev/null || true)"
+      cost="$(jq -r '[.modelUsage[]?.costUSD] | add // empty' "$lg" 2>/dev/null || true)"
+    fi
     set_worker_state "$SLICE" "done"
     set_worker_usage "$SLICE" "${tok:-}" "${cost:-}"
     trace_collect_write "$SLICE" "done" "${tok:-}" "${cost:-}" || true
@@ -737,6 +914,28 @@ collect() {
   pane="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .pane_id // empty' "$OV")"
   [ -n "$pane" ] || { echo "slice '$SLICE' not in overview.json workers[] — dispatch it first" >&2; exit 1; }
   is_self "$pane" && { echo "worker pane for $SLICE is \$SELF ($pane) — refusing" >&2; exit 1; }
+
+  # Dead-pane check BEFORE the long wait: a closed pane must not burn the full
+  # WAIT_TIMEOUT. An empty pane list means the fleet is unreachable — then we
+  # can't tell "gone" from "unreachable", so skip the check and let the wait
+  # itself fail.
+  local known_panes
+  known_panes="$(herdr pane list 2>/dev/null | jq -r '.result.panes[]?.pane_id' 2>/dev/null || true)"
+  if [ -n "$known_panes" ] && ! printf '%s\n' "$known_panes" | grep -qxF "$pane"; then
+    if [ -s "$out" ]; then
+      log "pane $pane is gone but the worker already wrote $out — keeping it"
+      set_worker_state "$SLICE" "done"
+      trace_collect_write "$SLICE" "done" "" "" || true
+      log "collect: done — $SLICE state=done (pane closed after writing its report)"
+      return 0
+    fi
+    echo "worker pane $pane for $SLICE no longer exists — marking failed" >&2
+    printf 'FAILED %s: worker pane %s disappeared before collect and no report was written (checked %s).\n' \
+      "$SLICE" "$pane" "$(utc_now)" > "$out"
+    set_worker_state "$SLICE" "failed"
+    trace_collect_write "$SLICE" "failed" "" "" || true
+    exit 1
+  fi
 
   log "collect: waiting for $SLICE (pane $pane) to go idle (timeout ${WAIT_TIMEOUT}ms)"
   if ! herdr agent wait "$pane" --status idle --timeout "$WAIT_TIMEOUT" >/dev/null 2>&1; then
@@ -758,11 +957,99 @@ collect() {
     log "copied worker report → $out"
   fi
 
-  set_worker_state "$SLICE" "done"
-  if [ -s "$out" ]; then trace_collect_write "$SLICE" "done" "" "" || true
-  else trace_collect_write "$SLICE" "failed" "" "" || true
+  # State honesty: an empty report is a FAILED collect — say so in BOTH
+  # overview.json and the trace status.json, never a hollow "done".
+  if [ -s "$out" ]; then
+    set_worker_state "$SLICE" "done"
+    trace_collect_write "$SLICE" "done" "" "" || true
+    log "collect: done — $SLICE state=done, report at $out"
+  else
+    echo "worker $SLICE went idle but produced no report ($out empty)" >&2
+    set_worker_state "$SLICE" "failed"
+    trace_collect_write "$SLICE" "failed" "" "" || true
+    exit 1
   fi
-  log "collect: done — $SLICE state=done, report at $out"
+}
+
+# ---------- down: tear a worker down (pane → worktree → branch → state) --------
+# Idempotent: every step skips cleanly when its target is already gone. Retrying
+# a slice = clean `down --slice S`, then a normal dispatch recreates everything.
+down_one() { # down_one <slice> -> 0 ok, 1 something refused/failed
+  local s="$1" w pane wt branch fflag="" rc=0
+  w="$(jq -c --arg s "$s" '[.workers[]? | select(.slice==$s)] | first // empty' "$OV" 2>/dev/null || true)"
+  if [ -z "$w" ] || [ "$w" = "null" ]; then log "down: slice '$s' not in workers[] — nothing to do"; return 0; fi
+  pane="$(printf '%s' "$w" | jq -r '.pane_id // empty')"
+  wt="$(printf '%s' "$w" | jq -r '.worktree // empty')"
+  branch="$(printf '%s' "$w" | jq -r '.branch // empty')"
+
+  # 1. pane — never $SELF; unknown $SELF counts as "could be me" (fail safe)
+  if [ -n "$pane" ] && [ "$pane" != "-" ]; then
+    if maybe_self "$pane"; then
+      log "down: NOT closing pane $pane (is or could be \$SELF) — close it by hand"
+    elif [ "$DRY_RUN" -eq 1 ]; then
+      plan "herdr pane close '$pane'"
+    else
+      herdr pane close "$pane" >/dev/null 2>&1 || true   # already-gone is fine
+      log "down: pane $pane closed (or already gone)"
+    fi
+  fi
+
+  # 2. worktree — git itself refuses a dirty one; --force forwards to git
+  [ "$FORCE" -eq 1 ] && fflag="--force"
+  if [ -n "$wt" ] && [ -d "$wt" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      plan "git -C '$REPO' worktree remove ${fflag:+$fflag }'$wt'"
+    elif git -C "$REPO" worktree remove $fflag "$wt" >/dev/null 2>&1; then
+      log "down: worktree removed: $wt"
+    elif [ "$FORCE" -eq 1 ]; then
+      log "! down: worktree remove --force failed for $wt (locked?) — remove it by hand"; rc=1
+    else
+      log "! down: worktree $wt is dirty or locked — refusing (re-run with --force)"; rc=1
+    fi
+  fi
+
+  # 3. branch — delete only when merged; otherwise keep it and say so
+  if [ -n "$branch" ] && git -C "$REPO" show-ref --verify --quiet "refs/heads/$branch" 2>/dev/null; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      plan "git -C '$REPO' branch -d '$branch'   # -d deletes only when merged"
+    elif git -C "$REPO" branch -d "$branch" >/dev/null 2>&1; then
+      log "down: branch $branch deleted (was merged)"
+    else
+      log "down: branch $branch kept — unmerged or still checked out (delete by hand: git -C $REPO branch -D $branch)"
+    fi
+  fi
+
+  # 4. state (locked write) — only when nothing was refused; a dirty-refused
+  # worktree keeps its old state so the refusal stays visible in overview.json
+  if [ "$rc" -eq 0 ]; then
+    set_worker_state "$s" "down"
+  else
+    log "down: leaving $s state unchanged (teardown incomplete)"
+  fi
+  return "$rc"
+}
+
+down() {
+  resolve_repo; resolve_self
+  if [ "$ALL" -eq 0 ] && [ -z "$SLICE" ]; then echo "down needs --slice S or --all" >&2; exit 2; fi
+  if [ "$DRY_RUN" -eq 1 ] && [ ! -f "$OV" ]; then plan "read $OV workers[] (absent — nothing to do)"; return 0; fi
+  [ -f "$OV" ] || { echo "no overview.json at $OV" >&2; exit 1; }
+  local targets s rc=0
+  if [ "$ALL" -eq 1 ]; then
+    targets="$(jq -r '.workers[]?.slice // empty' "$OV" 2>/dev/null || true)"
+    [ -n "$targets" ] || { log "down: no workers recorded — nothing to do"; return 0; }
+  else
+    validate_token slice "$SLICE"
+    targets="$SLICE"
+  fi
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    down_one "$s" || rc=1
+  done <<EOF
+$targets
+EOF
+  [ "$rc" -eq 0 ] || exit 1
+  log "down: done"
 }
 
 # ---------- dispatch table -----------------------------------------------------
@@ -771,5 +1058,6 @@ case "$CMD" in
   up)       up ;;
   dispatch) dispatch ;;
   collect)  collect ;;
-  help|*)   sed -n '2,24p' "$0" ;;
+  down)     down ;;
+  help|*)   awk 'NR >= 2 { if ($0 ~ /^set -euo pipefail/) exit; print }' "$0" ;;
 esac
