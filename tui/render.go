@@ -189,7 +189,7 @@ func Render(s *Snapshot, width int) string {
 	lines = append(lines, notesBlock(s)...)
 
 	lines = append(lines, "")
-	lines = append(lines, styleDim.Render("read-only · [r]esume [s]teer [q]uit"))
+	lines = append(lines, styleDim.Render("read-only · [,] settings [r]esume [s]teer [q]uit"))
 
 	// Long values (goal, done_when, notes, branches, …) must not wrap inside
 	// the box — a wrapped line breaks the border and the two-column layout.

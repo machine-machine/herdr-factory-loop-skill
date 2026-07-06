@@ -1,6 +1,7 @@
-// Command m2herd-tui is a READ-ONLY bubbletea dashboard over an m2herd
-// context fabric (.m2herd/). It never writes fabric state and never calls
-// mutating herdr/git commands — see CONTRACT-m2herd.md §"read-only doctrine".
+// Command m2herd-tui is a read-only dashboard over an m2herd context fabric
+// (.m2herd/), with a dedicated settings view as its only writer surface.
+// The dashboard never writes fabric state and never calls mutating herdr/git
+// commands — see CONTRACT-m2herd.md §"read-only doctrine".
 package main
 
 import (

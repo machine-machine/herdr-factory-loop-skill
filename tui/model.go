@@ -31,6 +31,8 @@ type model struct {
 
 	showResume bool
 	resumeVP   viewport.Model
+
+	settings *settingsView
 }
 
 func newModel(dir string) model {
@@ -84,6 +86,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.settings != nil {
+			return m.updateSettingsKey(msg)
+		}
 		if m.showResume {
 			switch msg.String() {
 			case "ctrl+c":
@@ -99,6 +104,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
+		case ",":
+			m.settings = &settingsView{loading: true}
+			return m, loadSettingsCmd(m.dir)
 		case "r":
 			return m, loadResumeCmd(m.dir)
 		case "s":
@@ -148,6 +156,34 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.seq++
 		m.loading = true
 		return m, loadSnapshotCmd(m.dir, m.seq)
+
+	case settingsMsg:
+		if m.settings == nil {
+			return m, nil
+		}
+		m.settings.loading = false
+		m.settings.err = msg.err
+		m.settings.settings = msg.settings
+		m.settings.clampCursor()
+		return m, nil
+
+	case settingsSavedMsg:
+		if m.settings == nil {
+			return m, nil
+		}
+		if msg.err != nil {
+			m.settings.setToast("invalid: "+msg.err.Error(), true)
+		} else {
+			m.settings.settings = msg.settings
+			m.settings.setToast("saved ✓", false)
+		}
+		return m, settingsToastCmd()
+
+	case settingsToastMsg:
+		if m.settings != nil {
+			m.settings.toastLive = false
+		}
+		return m, nil
 	}
 	return m, nil
 }
@@ -165,6 +201,9 @@ func suspendForSteerCmd(dir string) tea.Cmd {
 }
 
 func (m model) View() string {
+	if m.settings != nil {
+		return RenderSettings(m.settings, m.width)
+	}
 	if m.showResume {
 		title := styleBold.Render("RESUME.md") + "  " + styleDim.Render("(esc to close)")
 		box := lipgloss.NewStyle().
