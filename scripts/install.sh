@@ -64,9 +64,15 @@ if [ "$install_hermes" -eq 0 ] && [ "$install_claude" -eq 0 ] && [ "$install_cur
   install_cursor=1
 fi
 
-# Resolve the skill source path
+# Resolve the skill source path.
+# When run from inside a checkout of this repo (skill/SKILL.md next to
+# scripts/), default to --local so we install the checkout, not GitHub HEAD.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ "$local_mode" -eq 0 ] && [ -f "$SCRIPT_DIR/../skill/SKILL.md" ]; then
+  echo "Detected a local checkout at $(cd "$SCRIPT_DIR/.." && pwd) — using it (implied --local, no clone/pull; run via curl|bash for remote mode)."
+  local_mode=1
+fi
 if [ "$local_mode" -eq 1 ]; then
-  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   SKILL_SRC="$SCRIPT_DIR/../skill"
   HOOKS_SRC_DIR="$SCRIPT_DIR/../hooks"
   SCRIPTS_SRC_DIR="$SCRIPT_DIR"
@@ -75,9 +81,22 @@ if [ "$local_mode" -eq 1 ]; then
     echo "Run this from inside a clone of the repo, or omit --local." >&2
     exit 1
   fi
+elif [ "$uninstall" -eq 1 ]; then
+  # Uninstall only removes symlinks — never clone/pull (no network needed).
+  SKILL_SRC="$CACHE_DIR/skill"
+  HOOKS_SRC_DIR="$CACHE_DIR/hooks"
+  SCRIPTS_SRC_DIR="$CACHE_DIR/scripts"
 else
+  if ! command -v git >/dev/null 2>&1; then
+    echo "git is required to fetch the skill in remote mode — install git, or run scripts/install.sh --local from a checkout." >&2
+    exit 1
+  fi
   if [ ! -d "$CACHE_DIR" ]; then
     echo "Cloning $REPO_URL to $CACHE_DIR ..."
+    git clone --depth 1 "$REPO_URL" "$CACHE_DIR"
+  elif ! git -C "$CACHE_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    echo "Cache at $CACHE_DIR is not a valid git repo (interrupted clone?) — removing and re-cloning ..."
+    rm -rf "$CACHE_DIR"
     git clone --depth 1 "$REPO_URL" "$CACHE_DIR"
   else
     echo "Updating existing clone at $CACHE_DIR ..."
@@ -92,7 +111,6 @@ HOOK_SRC="$HOOKS_SRC_DIR/$HOOK_NAME"
 install_one() {
   local target_dir="$1"
   local label="$2"
-  mkdir -p "$target_dir"
   local link="$target_dir/$SKILL_NAME"
   if [ "$uninstall" -eq 1 ]; then
     if [ -L "$link" ]; then
@@ -105,9 +123,15 @@ install_one() {
     fi
     return 0
   fi
-  # Replace any existing symlink/dir with a fresh symlink to SKILL_SRC
-  if [ -L "$link" ] || [ -e "$link" ]; then
-    rm -rf "$link"
+  mkdir -p "$target_dir"
+  # Replace an existing symlink; NEVER delete a real directory/file here —
+  # move it to a timestamped sibling so user data survives.
+  if [ -L "$link" ]; then
+    rm "$link"
+  elif [ -e "$link" ]; then
+    local bak="$link.bak-$BACKUP_TS"
+    mv "$link" "$bak"
+    echo "[$label] WARNING: $link was a real directory/file — moved to $bak (nothing deleted)" >&2
   fi
   ln -s "$SKILL_SRC" "$link"
   echo "[$label] linked $link -> $SKILL_SRC"
@@ -128,7 +152,12 @@ install_hook_file() {
     return 0
   fi
   mkdir -p "$hooks_dir"
-  [ -L "$link" ] || [ -e "$link" ] && rm -rf "$link"
+  if [ -L "$link" ]; then
+    rm "$link"
+  elif [ -e "$link" ]; then
+    mv "$link" "$link.bak-$BACKUP_TS"
+    echo "[$label] WARNING: $link was a real file — moved to $link.bak-$BACKUP_TS" >&2
+  fi
   ln -s "$src" "$link"
   chmod +x "$src" 2>/dev/null || true
   echo "[$label] linked hook $link -> $src"
@@ -144,6 +173,26 @@ backup_file() {
   [ -f "$f.bak-$BACKUP_TS" ] || cp "$f" "$f.bak-$BACKUP_TS"
 }
 
+# Track jq tmp files so an aborted run never leaves settings.json.tmp.$$ behind.
+TMP_FILES=""
+track_tmp() { TMP_FILES="$TMP_FILES $1"; }
+cleanup_tmps() { local t; for t in $TMP_FILES; do rm -f "$t"; done; }
+trap cleanup_tmps EXIT
+
+# settings_json_ok FILE LABEL — validate before jq-editing. On invalid JSON:
+# back up, warn, return 1 so the caller skips registration instead of
+# aborting mid-install.
+settings_json_ok() {
+  local f="$1" label="$2"
+  [ -f "$f" ] || return 0
+  if ! jq empty "$f" >/dev/null 2>&1; then
+    backup_file "$f"
+    echo "[$label] WARNING: $f is not valid JSON — backed up to $f.bak-$BACKUP_TS; skipping hook registration there (fix the file and re-run)" >&2
+    return 1
+  fi
+  return 0
+}
+
 # --- Claude Code: register in ~/.claude/settings.json .hooks.UserPromptSubmit
 register_claude_hook() {
   local hooks_dir="$HOME/.claude/hooks"
@@ -157,8 +206,10 @@ register_claude_hook() {
       echo "[claude] jq not found — cannot remove hook entry from $settings automatically" >&2
       return 0
     fi
+    settings_json_ok "$settings" claude || return 0
     backup_file "$settings"
     local tmp="$settings.tmp.$$"
+    track_tmp "$tmp"
     jq --arg cmd "$cmd" '
       if has("hooks") and (.hooks | has("UserPromptSubmit")) then
         .hooks.UserPromptSubmit |= map(select(any(.hooks[]?; .command == $cmd) | not))
@@ -174,9 +225,11 @@ register_claude_hook() {
     echo "[claude] warn: jq not found — skipping settings.json registration (hook file installed, but inactive until wired up manually)" >&2
     return 0
   fi
+  settings_json_ok "$settings" claude || return 0
   [ -f "$settings" ] || echo '{}' > "$settings"
   backup_file "$settings"
   local tmp="$settings.tmp.$$"
+  track_tmp "$tmp"
   jq --arg cmd "$cmd" '
     .hooks.UserPromptSubmit = ((.hooks.UserPromptSubmit // []) as $arr |
       if ($arr | any(.hooks[]?.command == $cmd)) then $arr
@@ -209,8 +262,10 @@ register_m2herd_hooks() {
       echo "[claude] jq not found — cannot remove m2herd hook entries from $settings automatically" >&2
       return 0
     fi
+    settings_json_ok "$settings" claude || return 0
     backup_file "$settings"
     local tmp="$settings.tmp.$$"
+    track_tmp "$tmp"
     # Strip only OUR command from each matcher group; drop a group only when
     # that leaves it empty — foreign hooks a user consolidated into the same
     # group keep theirs.
@@ -243,9 +298,11 @@ register_m2herd_hooks() {
     echo "[claude] warn: node not found — skipping the $M2HERD_BUDGET_HOOK PostToolUse hook (SessionStart/PreCompact still registered)" >&2
     budget_ok=0
   fi
+  settings_json_ok "$settings" claude || return 0
   [ -f "$settings" ] || echo '{}' > "$settings"
   backup_file "$settings"
   local tmp="$settings.tmp.$$"
+  track_tmp "$tmp"
   jq --arg ss "$M2HERD_SESSION_HOOK" --arg pc "$M2HERD_PRECOMPACT_HOOK" --arg bj "$M2HERD_BUDGET_HOOK" \
      --arg sscmd "bash \"$hooks_dir/$M2HERD_SESSION_HOOK\"" \
      --arg pccmd "bash \"$hooks_dir/$M2HERD_PRECOMPACT_HOOK\"" \
@@ -290,6 +347,16 @@ install_m2herd_bins() {
     chmod +x "$src" 2>/dev/null || true
     echo "[claude] linked $link -> $src"
   done
+
+  if [ "$uninstall" -eq 0 ]; then
+    case ":$PATH:" in
+      *":$bin_dir:"*) ;;
+      *)
+        echo "[claude] WARNING: $bin_dir is not on your PATH — m2herd/m2herd-up won't be found. Add to your shell profile:" >&2
+        echo "  export PATH=\"\$HOME/.local/bin:\$PATH\"" >&2
+        ;;
+    esac
+  fi
 
   # m2herd-tui: pick the prebuilt for this OS/arch (Go, static). Absent prebuilt
   # is fine — `m2herd dashboard --watch` falls back to the bash renderer.
@@ -356,13 +423,19 @@ if [ "$install_hermes" -eq 1 ]; then
   install_one "$HOME/.hermes/skills" "hermes"
   register_hermes_hook
   # context-budget layer: wire the Hermes hooks (idempotent self-installer).
-  hooks_installer="$(cd "$(dirname "$0")" && pwd)/install-hermes-context.sh"
-  if [ -x "$hooks_installer" ]; then
+  # Resolve via SCRIPTS_SRC_DIR (cache/checkout scripts dir) — dirname "$0"
+  # points nowhere useful under curl|bash.
+  hooks_installer="$SCRIPTS_SRC_DIR/install-hermes-context.sh"
+  if [ -f "$hooks_installer" ]; then
     if [ "$uninstall" -eq 1 ]; then
-      "$hooks_installer" --uninstall || echo "[hermes] context-budget hooks uninstall failed (non-fatal)" >&2
+      bash "$hooks_installer" --uninstall || echo "[hermes] context-budget hooks uninstall failed (non-fatal)" >&2
     else
-      "$hooks_installer" || echo "[hermes] context-budget hooks install failed (non-fatal)" >&2
+      bash "$hooks_installer" || echo "[hermes] context-budget hooks install failed (non-fatal)" >&2
     fi
+  elif [ "$uninstall" -eq 1 ]; then
+    echo "[hermes] note: $hooks_installer not found — skipping context-budget hooks uninstall (remove entries from ~/.hermes/config.yaml manually if present)" >&2
+  else
+    echo "[hermes] WARNING: $hooks_installer not found — context-budget hooks (SKILL.md §15) NOT installed; re-run after a full clone/update" >&2
   fi
 fi
 if [ "$install_claude" -eq 1 ]; then

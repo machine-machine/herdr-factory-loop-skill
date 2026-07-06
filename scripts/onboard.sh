@@ -12,7 +12,9 @@
 # Usage:
 #   ./scripts/onboard.sh                # interactive TUI
 #   ./scripts/onboard.sh --orchestrator claude|hermes|cursor|all \
-#                        [--repo /path/to/repo] [--yes]    # non-interactive
+#                        [--repo /path/to/repo] [--yes] [--force]
+#   --yes    non-interactive; assumes claude when --orchestrator is omitted
+#   --force  pass --force through to 'specify init' (overwrite existing files)
 #
 # Idempotent. Safe to re-run.
 
@@ -51,11 +53,31 @@ warn() { printf '%s\n' "  ${YELLOW}!${RESET} $*"; }
 fail() { printf '%s\n' "  ${RED}✗${RESET} $*"; }
 step() { printf '\n%s\n' "${BOLD}── $* ──${RESET}"; }
 
+# A controlling terminal we can actually read from ([ -e /dev/tty ] is true
+# even when the device cannot be opened, e.g. CI or a headless worker pane).
+has_tty() { [ -t 0 ] || { : </dev/tty; } 2>/dev/null; }
+
+no_tty_usage() {
+  {
+    fail "interactive input needed but no terminal is available."
+    say  "  Re-run non-interactively, e.g.:"
+    say  "    ./scripts/onboard.sh --orchestrator claude|hermes|cursor|all [--repo /path/to/repo] [--yes]"
+  } >&2
+  exit 1
+}
+
+# tty_read VARNAME — read one line from the controlling terminal into VARNAME;
+# exits with usage guidance when there is no terminal to read from.
+tty_read() {
+  has_tty || no_tty_usage
+  IFS= read -r "$1" </dev/tty || no_tty_usage
+}
+
 # menu LABEL OPTION... — prints chosen option to stdout.
 # Uses gum if available, otherwise a numbered prompt.
 menu() {
   local label="$1"; shift
-  if command -v gum >/dev/null 2>&1; then
+  if command -v gum >/dev/null 2>&1 && has_tty; then
     gum choose --header "$label" "$@"
     return
   fi
@@ -65,7 +87,7 @@ menu() {
   local choice
   while true; do
     printf '  %s' "choose [1-$#]: " >&2
-    read -r choice </dev/tty
+    tty_read choice
     if [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le $# ]; then
       eval "printf '%s\n' \"\${$choice}\""
       return
@@ -77,13 +99,13 @@ menu() {
 confirm() {
   local prompt="$1"
   [ "$ASSUME_YES" -eq 1 ] && return 0
-  if command -v gum >/dev/null 2>&1; then
+  if command -v gum >/dev/null 2>&1 && has_tty; then
     gum confirm "$prompt"
     return
   fi
   local ans
   printf '  %s [y/N]: ' "$prompt" >&2
-  read -r ans </dev/tty
+  tty_read ans
   [ "$ans" = "y" ] || [ "$ans" = "Y" ]
 }
 
@@ -92,12 +114,15 @@ confirm() {
 ORCHESTRATOR=""
 TARGET_REPO=""
 ASSUME_YES=0
+FORCE_INIT=0
+need_val() { [ "$#" -ge 2 ] || { fail "$1 requires a value"; exit 1; }; }
 while [ $# -gt 0 ]; do
   case "$1" in
-    --orchestrator) ORCHESTRATOR="$2"; shift 2 ;;
-    --repo)         TARGET_REPO="$2"; shift 2 ;;
+    --orchestrator) need_val "$@"; ORCHESTRATOR="$2"; shift 2 ;;
+    --repo)         need_val "$@"; TARGET_REPO="$2"; shift 2 ;;
     --yes|-y)       ASSUME_YES=1; shift ;;
-    -h|--help)      sed -n '2,18p' "$0"; exit 0 ;;
+    --force)        FORCE_INIT=1; shift ;;
+    -h|--help)      sed -n '2,19p' "$0"; exit 0 ;;
     *) fail "unknown arg: $1"; exit 1 ;;
   esac
 done
@@ -108,7 +133,12 @@ banner
 
 step "1/6  Orchestrator"
 say "  The orchestrator is the agent that drives the SDD loop and herds the workers."
+if [ -z "$ORCHESTRATOR" ] && [ "$ASSUME_YES" -eq 1 ]; then
+  ORCHESTRATOR="claude"
+  warn "--yes given without --orchestrator — defaulting to 'claude' (pass --orchestrator to override)"
+fi
 if [ -z "$ORCHESTRATOR" ]; then
+  has_tty || no_tty_usage
   CHOICE=$(menu "Which orchestrator should run the factory loop?" \
     "claude  — Claude Code drives spec-kit + the herd" \
     "hermes  — Hermes drives spec-kit + the herd" \
@@ -127,6 +157,7 @@ esac
 
 step "2/6  Substrate checks"
 MISSING=0
+HERDR_OK=1
 if command -v herdr >/dev/null 2>&1; then
   if herdr status >/dev/null 2>&1; then
     ok "herdr server is running ($(herdr --version 2>/dev/null | head -1 || echo 'version unknown'))"
@@ -134,12 +165,36 @@ if command -v herdr >/dev/null 2>&1; then
     warn "herdr is installed but the server is not running — start it with: herdr server start"
   fi
 else
-  fail "herdr not found on PATH — install it first: https://github.com/machine-machine"
-  MISSING=1
+  HERDR_OK=0
+  warn "herdr not found on PATH — onboarding can finish, but the herd cannot run without it."
+  warn "  install: clone https://github.com/machine-machine/herdr and follow its README"
+  warn "  (binary lands in ~/.local/bin/herdr; verify with: herdr status)"
 fi
+# Required + recommended tools — report everything missing at once, exit once.
 for tool in jq git; do
-  if command -v "$tool" >/dev/null 2>&1; then ok "$tool found"; else fail "$tool not found (required)"; MISSING=1; fi
+  if command -v "$tool" >/dev/null 2>&1; then ok "$tool found"; else
+    fail "$tool not found (required) — install via your package manager (apt/brew install $tool)"
+    MISSING=1
+  fi
 done
+command -v node >/dev/null 2>&1 && ok "node found" \
+  || warn "node not on PATH — the m2herd/context-budget PostToolUse hooks need it (https://nodejs.org or your package manager)"
+command -v tmux >/dev/null 2>&1 && ok "tmux found" \
+  || warn "tmux not on PATH — herdr panes run on tmux (apt/brew install tmux)"
+if command -v uv >/dev/null 2>&1 || command -v uvx >/dev/null 2>&1; then
+  ok "uv/uvx found"
+else
+  warn "neither uv nor uvx on PATH — needed for spec-kit (install: curl -LsSf https://astral.sh/uv/install.sh | sh)"
+fi
+if command -v yq >/dev/null 2>&1; then
+  if yq --version 2>&1 | grep -qi mikefarah; then
+    ok "yq found (mikefarah/yq)"
+  else
+    warn "yq on PATH looks like python-yq — Hermes hook registration needs mikefarah/yq v4 ('yq eval -i'): https://github.com/mikefarah/yq"
+  fi
+else
+  warn "yq not on PATH — Hermes config.yaml hook registration will be skipped (install mikefarah/yq v4: https://github.com/mikefarah/yq)"
+fi
 case "$ORCHESTRATOR" in
   claude|all) command -v claude >/dev/null 2>&1 && ok "claude CLI found" || warn "claude CLI not on PATH" ;;
 esac
@@ -208,8 +263,12 @@ specify_cmd() {
 
 step "5/6  Establish the SDD loop in a repo"
 if [ -z "$TARGET_REPO" ] && [ "$ASSUME_YES" -eq 0 ]; then
-  printf '  %s' "Path to the repo to initialize with spec-kit (empty = skip): "
-  read -r TARGET_REPO </dev/tty || TARGET_REPO=""
+  if has_tty; then
+    printf '  %s' "Path to the repo to initialize with spec-kit (empty = skip): "
+    read -r TARGET_REPO </dev/tty || TARGET_REPO=""
+  else
+    warn "no terminal to prompt for a repo — skipping spec-kit init (pass --repo /path to set one)"
+  fi
 fi
 SPECKIT_INITIALIZED="false"
 if [ -n "$TARGET_REPO" ]; then
@@ -233,8 +292,17 @@ if [ -n "$TARGET_REPO" ]; then
     # /speckit.* prompts land in .hermes/commands/ (falls back to claude
     # templates on old spec-kit builds — Hermes can read .claude/commands/*.md).
     INIT_ARGS=(init --here --script sh)
-    # we already confirm below; skip spec-kit's own "directory not empty" prompt
-    printf '%s' "$INIT_HELP" | grep -q -- '--force' && INIT_ARGS+=(--force)
+    # --force overwrites existing files in the target repo — only pass it
+    # through when the user explicitly asked (onboard.sh --force).
+    if [ "$FORCE_INIT" -eq 1 ]; then
+      if printf '%s' "$INIT_HELP" | grep -q -- '--force'; then
+        INIT_ARGS+=(--force)
+      else
+        warn "this spec-kit build has no --force flag — ignoring onboard.sh --force"
+      fi
+    elif [ "$ASSUME_YES" -eq 1 ]; then
+      warn "spec-kit may prompt or refuse if $TARGET_REPO is not empty — re-run with --force to overwrite"
+    fi
     case "$ORCHESTRATOR" in
       hermes)
         if [ "$HAS_GENERIC" -eq 1 ]; then
@@ -263,6 +331,11 @@ fi
 
 step "6/6  Write factory config"
 mkdir -p "$CONFIG_DIR"
+if [ -f "$CONFIG_FILE" ]; then
+  CONFIG_BAK="$CONFIG_FILE.bak-$(date +%Y%m%d%H%M%S)"
+  cp "$CONFIG_FILE" "$CONFIG_BAK"
+  ok "backed up existing config to $CONFIG_BAK"
+fi
 cat > "$CONFIG_FILE" <<EOF
 # herdr factory loop — written by scripts/onboard.sh, safe to edit.
 [orchestrator]
@@ -281,6 +354,10 @@ ok "wrote $CONFIG_FILE"
 
 # ---------- done -----------------------------------------------------------------
 
+if [ "$HERDR_OK" -eq 0 ]; then
+  printf '\n'
+  warn "herdr is still missing — install it before running the herd (the 'herd implements' step needs it)"
+fi
 printf '\n%s\n' "${GREEN}${BOLD}Onboarding complete.${RESET} The SDD factory loop:"
 cat <<EOF
 

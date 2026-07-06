@@ -27,8 +27,11 @@ NAME=$(awk '/^---$/{c++; next} c==1 && /^name:/{print $2}' skill/SKILL.md | tr -
 ok "frontmatter name == herdr"
 
 # 4. reference.md exists (optional but recommended)
-[ -f skill/reference.md ] || echo "warn: skill/reference.md is missing (recommended)"
-ok "skill/reference.md present"
+if [ -f skill/reference.md ]; then
+  ok "skill/reference.md present"
+else
+  echo "warn: skill/reference.md is missing (recommended)"
+fi
 
 # 5. version field, if present, looks like semver
 if grep -q '^version:' skill/SKILL.md; then
@@ -39,11 +42,14 @@ if grep -q '^version:' skill/SKILL.md; then
   ok "version field is valid semver: $VER"
   # If CHANGELOG exists, the most recent version header should match
   if [ -f CHANGELOG.md ]; then
-    LATEST=$(grep -E '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | head -1 | sed -E 's/^## \[([^]]+)\].*/\1/')
-    if [ -n "$LATEST" ] && [ "$LATEST" != "$VER" ]; then
+    LATEST=$(grep -E '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | head -1 | sed -E 's/^## \[([^]]+)\].*/\1/' || true)
+    if [ -z "$LATEST" ]; then
+      err "CHANGELOG.md has no '## [x.y.z]' version header — add one (latest release first) matching skill version $VER"
+    fi
+    if [ "$LATEST" != "$VER" ]; then
       err "CHANGELOG.md latest version is [$LATEST] but skill frontmatter says [$VER] — bump one to match"
     fi
-    [ -n "$LATEST" ] && ok "CHANGELOG.md latest version matches skill version"
+    ok "CHANGELOG.md latest version matches skill version"
   fi
 else
   echo "warn: no version field in frontmatter (consider adding one)"
@@ -51,7 +57,7 @@ fi
 
 # 6. No broken relative .md links in SKILL.md
 #    (looks for [text](./path.md) and checks the file exists)
-BROKEN=$(grep -oE '\]\(\./[A-Za-z0-9._-]+\.md\)' skill/SKILL.md | sed -E 's/.*\(\.\/([^)]+)\).*/\1/' | sort -u || true)
+BROKEN=$(grep -oE '\]\(\./[A-Za-z0-9._/-]+\.md\)' skill/SKILL.md | sed -E 's/.*\(\.\/([^)]+)\).*/\1/' | sort -u || true)
 for f in $BROKEN; do
   [ -f "skill/$f" ] || err "broken link in skill/SKILL.md: $f"
 done
