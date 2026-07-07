@@ -8,7 +8,11 @@
   "workers": {
     "agent": "claude",
     "runner": "pane",
-    "max": 3
+    "max": 3,
+    "base": "",
+    "model": "",
+    "settle_seconds": 2,
+    "wait_timeout_minutes": 30
   },
   "routing": []
 }

@@ -20,8 +20,8 @@
 #   m2herd.sh archive [--dir P] --area A      # distill context/A/context.md to header + <=10 summary lines, mark archived (deep/ untouched)
 #   m2herd.sh gist    [--dir P] [--push]      # one-paragraph project gist; --push pipes it to $M2HERD_GIST_CMD if set
 #   m2herd.sh next    [--dir P]               # self-prompting primitive: mechanical priority walk, prints exactly one "NEXT: " line
-#                                             #   (drift → steer → machineroom → coach intent → refile notes → collect worker
-#                                             #    → failed worker → open question → compare/dispatch)
+#                                             #   (drift → context budget ≥75% → steer → machineroom → coach intent → refile notes
+#                                             #    → collect worker → failed worker → open question → compare/dispatch)
 #   m2herd.sh evolve analyze  [--dir P] [--run <id|latest|current>]
 #                                             # mechanical: read .m2herd/runs/<run-id>/, write signatures + skeleton
 #                                             #   proposals under .m2herd/evolver/; no LLM, no network; idempotent
@@ -39,6 +39,8 @@
 #                                             #   writes to the fabric. --watch: flicker-free repaint loop (home-cursor redraw, no
 #                                             #   clear) every N s (default 2), refreshing the self-update check every 10 min
 #   m2herd.sh config list|get|set [--dir P] ... # read/write .m2herd/settings.json with defaults + validation
+#   m2herd.sh doctor  [--dir P]               # "why is it not working": jq/git/herdr/symlinks/node/hooks/statusline-bridge/
+#                                             #   .m2herd-drift/go checks — ok|warn|FAIL + one-line remedy; exit 1 iff any FAIL
 #   m2herd.sh self-update [--check]           # --check: fetch the engine repo, cache behind-count in ~/.cache/m2herd/update-status
 #                                             #   (dashboard renders it); no flag: ff-only pull of the engine repo (refuses dirty tree)
 #   m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync (+--check drift) → archive → gist → next; jq asserts
@@ -87,14 +89,15 @@ OV()       { echo "$DIR/.m2herd/overview.json"; }
 SETTINGS(){ echo "$DIR/.m2herd/settings.json"; }
 # Resolve through symlinks ($0 may be ~/.local/bin/m2herd → scripts/m2herd.sh);
 # macOS has no readlink -f, so walk the link chain by hand.
-self_path() {
-  local p="$0" l
+resolve_link() {
+  local p="$1" l
   while [ -L "$p" ]; do
     l="$(readlink "$p")"
     case "$l" in /*) p="$l" ;; *) p="$(dirname "$p")/$l" ;; esac
   done
   printf '%s' "$p"
 }
+self_path() { resolve_link "$0"; }
 tmpl_dir() { cd "$(dirname "$(self_path)")/../templates/m2herd" 2>/dev/null && pwd; }
 need_jq()  { command -v jq >/dev/null 2>&1 || { echo "m2herd.sh: jq is required" >&2; exit 1; }; }
 resolve_dir() { DIR="$(cd "$DIR" 2>/dev/null && pwd)" || { echo "no such dir: $DIR" >&2; exit 1; }; need_jq; }
@@ -129,7 +132,8 @@ settings_defaults_json() {
     schema_version: 1,
     _doc: ".m2herd/context/settings-ux/context.md",
     orchestrator: {agent: "claude", runner: "pane"},
-    workers: {agent: "claude", runner: "pane", max: 3},
+    workers: {agent: "claude", runner: "pane", max: 3, base: "", model: "",
+              settle_seconds: 2, wait_timeout_minutes: 30},
     routing: []
   }'
 }
@@ -173,12 +177,19 @@ settings_validate_nonneg() {
   jq -en --argjson n "$2" '$n | (type=="number") and (. >= 0)' >/dev/null 2>&1 \
     || { echo "config set: $1 must be numeric and >= 0" >&2; exit 2; }
 }
+settings_validate_min1() {
+  jq -en --argjson n "$2" '$n | (type=="number") and (. >= 1)' >/dev/null 2>&1 \
+    || { echo "config set: $1 must be numeric and >= 1" >&2; exit 2; }
+}
+# routing rules: {pattern, agent} required; runner (pane|headless) and model (string) optional
 settings_validate_routing() {
   jq -e '
     type=="array" and all(.[]; type=="object"
       and ((.pattern // "") | type=="string" and length > 0)
-      and (.agent | IN("claude","codex","cursor","opencode")))
-  ' >/dev/null 2>&1 || { echo "config set: routing must be a JSON array of {pattern, agent} rules" >&2; exit 2; }
+      and (.agent | IN("claude","codex","cursor","opencode"))
+      and ((.runner // "pane") | IN("pane","headless"))
+      and ((.model // "") | type=="string"))
+  ' >/dev/null 2>&1 || { echo "config set: routing must be a JSON array of {pattern, agent[, runner, model]} rules" >&2; exit 2; }
 }
 
 settings_jq_path() {
@@ -190,6 +201,10 @@ settings_jq_path() {
     workers.agent) echo '.workers.agent' ;;
     workers.runner) echo '.workers.runner' ;;
     workers.max) echo '.workers.max' ;;
+    workers.base) echo '.workers.base' ;;
+    workers.model) echo '.workers.model' ;;
+    workers.settle_seconds) echo '.workers.settle_seconds' ;;
+    workers.wait_timeout_minutes) echo '.workers.wait_timeout_minutes' ;;
     routing) echo '.routing' ;;
     *) echo "unknown config path: $1" >&2; exit 2 ;;
   esac
@@ -460,6 +475,10 @@ config_list() {
     (mark(["workers","agent"]; .workers.agent) + "workers.agent=" + .workers.agent),
     (mark(["workers","runner"]; .workers.runner) + "workers.runner=" + .workers.runner),
     (mark(["workers","max"]; .workers.max) + "workers.max=" + (.workers.max|tostring)),
+    (mark(["workers","base"]; .workers.base) + "workers.base=" + .workers.base),
+    (mark(["workers","model"]; .workers.model) + "workers.model=" + .workers.model),
+    (mark(["workers","settle_seconds"]; .workers.settle_seconds) + "workers.settle_seconds=" + (.workers.settle_seconds|tostring)),
+    (mark(["workers","wait_timeout_minutes"]; .workers.wait_timeout_minutes) + "workers.wait_timeout_minutes=" + (.workers.wait_timeout_minutes|tostring)),
     (mark(["routing"]; .routing) + "routing=" + (.routing|tojson))
   ' <<<"$eff"
 }
@@ -478,6 +497,9 @@ settings_set_locked() {
     orchestrator.agent|workers.agent) settings_validate_agent "$key" "$value" ;;
     orchestrator.runner|workers.runner) settings_validate_runner "$key" "$value" ;;
     workers.max) settings_validate_nonneg "$key" "$value" ;;
+    workers.base|workers.model) : ;;   # free-form strings (branch name / model id)
+    workers.settle_seconds) settings_validate_nonneg "$key" "$value" ;;
+    workers.wait_timeout_minutes) settings_validate_min1 "$key" "$value" ;;
     routing) printf '%s' "$value" | settings_validate_routing ;;
     *) echo "unknown or read-only config path: $key" >&2; exit 2 ;;
   esac
@@ -489,6 +511,10 @@ settings_set_locked() {
     workers.agent)       jq --arg v "$value" '.workers.agent=$v' <<<"$eff" > "$tmp" ;;
     workers.runner)      jq --arg v "$value" '.workers.runner=$v' <<<"$eff" > "$tmp" ;;
     workers.max)         jq --argjson v "$value" '.workers.max=$v' <<<"$eff" > "$tmp" ;;
+    workers.base)        jq --arg v "$value" '.workers.base=$v' <<<"$eff" > "$tmp" ;;
+    workers.model)       jq --arg v "$value" '.workers.model=$v' <<<"$eff" > "$tmp" ;;
+    workers.settle_seconds)       jq --argjson v "$value" '.workers.settle_seconds=$v' <<<"$eff" > "$tmp" ;;
+    workers.wait_timeout_minutes) jq --argjson v "$value" '.workers.wait_timeout_minutes=$v' <<<"$eff" > "$tmp" ;;
     routing)             jq --argjson v "$value" '.routing=$v' <<<"$eff" > "$tmp" ;;
   esac
   if jq '.' "$tmp" > "$tmp.pretty"; then mv "$tmp.pretty" "$tmp"; else rm -f "$tmp" "$tmp.pretty"; return 1; fi
@@ -514,12 +540,25 @@ config_cmd() {
 # ---------- resume -----------------------------------------------------------
 resume_cmd() {
   resolve_dir; need_init
-  cat "$DIR/.m2herd/RESUME.md"
+  # ~40-line report cap: RESUME.md (leading comment stripped, head ≤20 lines),
+  # areas (≤8 + one rollup line), lessons stay last-5. Full detail on disk.
+  local rf="$DIR/.m2herd/RESUME.md" body blines
+  if grep -q '^-->$' "$rf" 2>/dev/null; then body="$(awk 'p{print} /^-->$/{p=1}' "$rf")"; else body="$(cat "$rf")"; fi
+  blines="$(printf '%s\n' "$body" | wc -l | tr -d ' ')"
+  if [ "$blines" -gt 20 ]; then
+    printf '%s\n' "$body" | head -20
+    echo "… ($((blines - 20)) more lines — read .m2herd/RESUME.md)"
+  else
+    printf '%s\n' "$body"
+  fi
   echo
   echo "areas:"
   jq -r '
-    ((.areas//[])[] | select((.status//"active")!="archived")
-      | "  - " + .name + ": " + (if (.summary//"")=="" then "(no summary)" else .summary end) + "  → " + .path),
+    def act: [ (.areas//[])[] | select((.status//"active")!="archived") ];
+    (act[:8][] | "  - " + .name + ": " + (if (.summary//"")=="" then "(no summary)" else .summary end) + "  → " + .path),
+    (if (act|length) > 8
+     then "  …and " + ((act|length) - 8 | tostring) + " more areas — m2herd status for all"
+     else empty end),
     (if ((.areas//[])|map(select((.status//"active")=="archived"))|length)>0
      then "  archived: " + ((.areas//[])|map(select((.status//"active")=="archived")|.name)|join(", "))
      else empty end)
@@ -605,15 +644,39 @@ machineroom_watching() {
   return 1
 }
 
+# active area with the biggest context.md (offload target for the budget rung)
+largest_area() {
+  local n sz best="" bestsz=0
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    sz="$(wc -c < "$DIR/.m2herd/context/$n/context.md" 2>/dev/null | tr -d ' ')" || sz=0
+    case "$sz" in ''|*[!0-9]*) sz=0 ;; esac
+    if [ "$sz" -gt "$bestsz" ]; then bestsz="$sz"; best="$n"; fi
+  done < <(jq -r '(.areas//[])[] | select((.status//"active")!="archived") | .name' "$(OV)")
+  printf '%s' "$best"
+}
+
 # mechanical priority walk — NO LLM, exactly one "NEXT: " line.
-# Ladder order (first hit wins): drift → steer inbox → machineroom up →
-# coach intent (done_when) → refile notes → collect stale worker →
-# failed worker → open question → compare/dispatch.
+# Ladder order (first hit wins): drift → context budget (fresh bridge ≥75%) →
+# steer inbox → machineroom up → coach intent (done_when) → refile notes →
+# collect stale worker → failed worker → open question → compare/dispatch.
 next_cmd() {
   resolve_dir; need_init
-  local m2="$DIR/.m2herd" w q
+  local m2="$DIR/.m2herd" w q bf pct mt big
   if ! drift_report >/dev/null; then
     echo "NEXT: context drift — run: m2herd sync"; return 0
+  fi
+  # budget rung: fresh (≤30 min) bridge file at ≥75% → offload before anything piles on
+  bf="$(newest_bridge_file)"
+  if [ -n "$bf" ]; then
+    mt="$(file_mtime "$bf")"
+    if [ $(( $(date -u +%s) - mt )) -le 1800 ]; then
+      pct="$(bridge_pct "$bf")"
+      if [ "$pct" -ge 75 ]; then
+        big="$(largest_area)"; [ -n "$big" ] || big="<pick>"
+        echo "NEXT: context at ${pct}% — offload: m2herd refile --area $big, or archive stale areas"; return 0
+      fi
+    fi
   fi
   if [ -f "$m2/inbox/STEER.md" ] && has_ink "$(live_tail "$m2/inbox/STEER.md")"; then
     echo "NEXT: drain steering — read .m2herd/inbox/STEER.md, act, then clear below the marker"; return 0
@@ -685,12 +748,14 @@ age_secs() { # epoch → humanized 42s / 3m / 7h / 4d
 }
 age_of() { age_secs "$(epoch_of "${1:-}")"; }
 
-# budget row from the newest /tmp/claude-ctx-*.json bridge file OWNED BY THIS
-# UID; silent no-op when none. Null-safe glob loop — no `ls -t` word-splitting,
-# and /tmp is world-writable so foreign-uid bridge files are ignored.
-budget_row() {
-  local f="" c pct budget mt best=0 filled bar
-  for c in /tmp/claude-ctx-*.json; do
+# newest claude-ctx-*.json bridge file OWNED BY THIS UID under $BRIDGE_DIR
+# (default /tmp; M2HERD_BRIDGE_DIR overrides — selftest isolation). Prints the
+# path, or nothing. Null-safe glob loop — no `ls -t` word-splitting, and /tmp
+# is world-writable so foreign-uid bridge files are ignored.
+BRIDGE_DIR="${M2HERD_BRIDGE_DIR:-/tmp}"
+newest_bridge_file() {
+  local f="" c mt best=0
+  for c in "$BRIDGE_DIR"/claude-ctx-*.json; do
     [ -f "$c" ] || continue                              # unmatched glob stays literal
     [ -O "$c" ] || continue                              # not ours → ignore
     jq -e '.used_pct|numbers' "$c" >/dev/null 2>&1 || continue
@@ -698,8 +763,23 @@ budget_row() {
     case "$mt" in ''|*[!0-9]*) mt=0 ;; esac   # never let a stat surprise reach the integer tests
     if [ "$mt" -gt "$best" ]; then best="$mt"; f="$c"; fi
   done
+  [ -n "$f" ] && printf '%s' "$f"
+  return 0
+}
+# integer used_pct from a bridge file ("83.4" → 83; garbage → 0)
+bridge_pct() {
+  local pct; pct="$(jq -r '.used_pct' "$1" 2>/dev/null)"; pct="${pct%.*}"
+  case "$pct" in ''|*[!0-9]*) pct=0 ;; esac
+  printf '%s' "$pct"
+}
+
+# budget row from the newest bridge file; silent no-op when none
+budget_row() {
+  local f pct budget best filled bar
+  f="$(newest_bridge_file)"
   [ -n "$f" ] || return 0
-  pct="$(jq -r '.used_pct' "$f")"; pct="${pct%.*}"; [ -n "$pct" ] || pct=0
+  best="$(file_mtime "$f")"
+  pct="$(bridge_pct "$f")"
   budget="$(jq -r '.budget // 384000' "$f")"
   filled=$((pct * 20 / 100)); [ "$filled" -le 20 ] || filled=20; [ "$filled" -ge 0 ] || filled=0
   bar="$(printf '%*s' "$filled" '' | tr ' ' '█')$(printf '%*s' "$((20 - filled))" '' | tr ' ' '░')"
@@ -1156,6 +1236,113 @@ evolve_reject() {
   log "rejected $TEXT"
 }
 
+# ---------- doctor: one command answering "why is it not working" -------------
+# Each check prints ok|warn|FAIL|note + a one-line remedy. Exit 1 iff any FAIL
+# (warns don't fail). FAIL is reserved for hard breakage: jq/git missing, herdr
+# installed but its server dead, a PATH symlink whose target file is gone, and
+# fabric drift. Environment nits (herdr not installed, hooks/statusline not
+# registered, node/go absent) are warns/notes — the fabric still works degraded.
+doctor_cmd() {
+  DIR="$(cd "$DIR" 2>/dev/null && pwd)" || { echo "no such dir: $DIR" >&2; exit 1; }
+  local fails=0 warns=0 settings="$HOME/.claude/settings.json"
+  d_ok()   { printf '  ok    %s\n' "$*"; }
+  d_note() { printf '  note  %s\n' "$*"; }
+  d_warn() { printf '  warn  %s\n' "$*"; warns=$((warns + 1)); }
+  d_fail() { printf '  FAIL  %s\n' "$*"; fails=$((fails + 1)); }
+  echo "m2herd doctor — $DIR"
+
+  # core tools (doctor itself must not die on missing jq — it reports it)
+  if command -v jq  >/dev/null 2>&1; then d_ok "jq present"
+  else d_fail "jq missing — install it (apt/brew install jq); every fabric write needs it"; fi
+  if command -v git >/dev/null 2>&1; then d_ok "git present"
+  else d_fail "git missing — install it; worker dispatch needs worktrees/branches"; fi
+
+  # herdr: absent → graceful skip (headless workers still work); present+dead server → FAIL
+  if command -v herdr >/dev/null 2>&1; then
+    if herdr status >/dev/null 2>&1; then d_ok "herdr on PATH + server responds"
+    else d_fail "herdr on PATH but server not responding — start the herdr app/server"; fi
+  else
+    d_warn "herdr not on PATH — pane workers unavailable (headless still works); skipping server check"
+  fi
+
+  # PATH symlinks: missing → warn; target file gone → FAIL; target in a
+  # different repo than this engine → warn (stale-symlink detection)
+  local engine name link tgt tgt_repo
+  engine="$(engine_repo 2>/dev/null || true)"
+  for name in m2herd m2herd-up; do
+    link="$(command -v "$name" 2>/dev/null || true)"
+    if [ -z "$link" ]; then
+      d_warn "$name not on PATH — run: scripts/install.sh (symlinks into ~/.local/bin)"
+      continue
+    fi
+    tgt="$(resolve_link "$link")"
+    if [ ! -f "$tgt" ]; then
+      d_fail "$name → $tgt is gone (dangling symlink) — re-run: scripts/install.sh"
+      continue
+    fi
+    tgt_repo="$(cd "$(dirname "$tgt")/.." 2>/dev/null && pwd || true)"
+    if [ -n "$engine" ] && [ -n "$tgt_repo" ] && [ "$tgt_repo" != "$engine" ]; then
+      d_warn "$name points at another repo ($tgt) — stale symlink? this engine: $engine"
+    else
+      d_ok "$name on PATH → $tgt"
+    fi
+  done
+
+  # node (the m2herd-budget.js PostToolUse hook runs under node)
+  if command -v node >/dev/null 2>&1; then d_ok "node present (budget hook can run)"
+  else d_warn "node missing — m2herd-budget.js hook inert; install node for budget sensing"; fi
+
+  # hooks registered in ~/.claude/settings.json — keyed on FILENAME (commands
+  # embed node/nvm paths that change across upgrades; see install.sh)
+  if [ -f "$settings" ]; then
+    local h missing=""
+    for h in m2herd-session.sh m2herd-precompact.sh m2herd-budget.js; do
+      grep -q "$h" "$settings" 2>/dev/null || missing="$missing $h"
+    done
+    if [ -z "$missing" ]; then d_ok "m2herd hooks registered in ~/.claude/settings.json"
+    else d_warn "hooks not registered:$missing — run: scripts/install.sh"; fi
+  else
+    d_warn "no ~/.claude/settings.json — Claude Code not set up here? run: scripts/install.sh"
+  fi
+
+  # statusline/ctx bridge: WRITER registered (statusLine key) + a fresh (≤30 min)
+  # bridge file — both, or budget sensing is dead
+  local bf="" fresh=0 mt
+  bf="$(newest_bridge_file)"
+  if [ -n "$bf" ]; then
+    mt="$(file_mtime "$bf")"
+    [ $(( $(date -u +%s) - mt )) -le 1800 ] && fresh=1
+  fi
+  if grep -q '"statusLine"' "$settings" 2>/dev/null && [ "$fresh" -eq 1 ]; then
+    d_ok "statusline bridge registered + fresh $(basename "$bf") ($(bridge_pct "$bf")% used)"
+  else
+    d_warn "budget sensing dead — register scripts/ctx-bridge.sh as statusline (needs a statusLine entry in ~/.claude/settings.json writing $BRIDGE_DIR/claude-ctx-<session>.json)"
+  fi
+
+  # fabric in the target dir + drift
+  if [ -f "$DIR/.m2herd/overview.json" ]; then
+    if command -v jq >/dev/null 2>&1; then
+      if drift_report >/dev/null 2>&1; then d_ok ".m2herd/ present, overview.json matches context/ tree"
+      else d_fail ".m2herd/ drifted — run: m2herd sync --dir $DIR"; fi
+    else
+      d_warn ".m2herd/ present but jq missing — cannot drift-check"
+    fi
+  else
+    d_warn "no .m2herd/ at $DIR — bootstrap it: m2herd boot --dir $DIR"
+  fi
+
+  # go toolchain: optional (tier-3 TUI only) — note, never a warn/FAIL
+  if command -v go >/dev/null 2>&1; then d_note "go toolchain present — m2herd-tui buildable (optional)"
+  else d_note "go toolchain absent — m2herd-tui (optional) unavailable; bash dashboard still works"; fi
+
+  echo
+  if [ "$fails" -gt 0 ]; then
+    echo "doctor: $fails FAIL, $warns warn — fix the FAIL lines above"
+    exit 1
+  fi
+  echo "doctor: healthy ($warns warn)"
+}
+
 # ---------- selftest: tmpdir end-to-end ---------------------------------------
 selftest() {
   need_jq
@@ -1169,6 +1356,9 @@ selftest() {
   td="$(mktemp -d)"; td2=""; td3=""
   trap 'rm -rf "$td" ${td2:+"$td2"} ${td3:+"$td3"}' EXIT
   echo "selftest: workdir $td"
+  # bridge isolation: the budget rung/row must not see the REAL /tmp bridge
+  # files of whatever Claude session happens to be running this selftest
+  mkdir -p "$td/bridge"; export M2HERD_BRIDGE_DIR="$td/bridge"
   step() { echo "+ m2herd.sh $*"; "$self" "$@" >/dev/null || { echo "selftest FAIL at: $*" >&2; exit 1; }; }
   fail() { echo "selftest FAIL: $*" >&2; exit 1; }
 
@@ -1211,6 +1401,26 @@ selftest() {
   rc=0; "$self" config set workers.agent bogus --dir "$td" >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] || fail "config set invalid enum exited $rc (want 2)"
   step config set workers.max 5 --dir "$td"
+  # v1 schema completion: base/model strings, settle/wait numerics with floors
+  [ "$("$self" config get workers.settle_seconds --dir "$td")" = "2" ] || fail "config get: default workers.settle_seconds"
+  [ "$("$self" config get workers.wait_timeout_minutes --dir "$td")" = "30" ] || fail "config get: default workers.wait_timeout_minutes"
+  step config set workers.base main --dir "$td"
+  [ "$("$self" config get workers.base --dir "$td")" = "main" ] || fail "config set/get workers.base round-trip"
+  step config set workers.model gpt-5.2-codex --dir "$td"
+  [ "$("$self" config get workers.model --dir "$td")" = "gpt-5.2-codex" ] || fail "config set/get workers.model round-trip"
+  step config set workers.settle_seconds 4 --dir "$td"
+  [ "$("$self" config get workers.settle_seconds --dir "$td")" = "4" ] || fail "config set/get workers.settle_seconds round-trip"
+  step config set workers.wait_timeout_minutes 45 --dir "$td"
+  [ "$("$self" config get workers.wait_timeout_minutes --dir "$td")" = "45" ] || fail "config set/get workers.wait_timeout_minutes round-trip"
+  rc=0; "$self" config set workers.settle_seconds -1 --dir "$td" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || fail "config set workers.settle_seconds -1 exited $rc (want 2)"
+  rc=0; "$self" config set workers.wait_timeout_minutes 0 --dir "$td" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || fail "config set workers.wait_timeout_minutes 0 exited $rc (want 2)"
+  # routing entries: optional runner (pane|headless) + model accepted; bogus runner rejected
+  step config set routing '[{"pattern":"*.rs","agent":"codex","runner":"headless","model":"gpt-5.2"}]' --dir "$td"
+  [ "$("$self" config get routing --dir "$td" | jq -r '.[0].runner')" = "headless" ] || fail "routing entry lost its runner field"
+  rc=0; "$self" config set routing '[{"pattern":"*.rs","agent":"codex","runner":"bogus"}]' --dir "$td" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || fail "config set routing with bogus runner exited $rc (want 2)"
   step config set routing '[{"pattern":"*.go","agent":"codex"},{"pattern":"docs/**","agent":"claude"}]' --dir "$td"
   [ "$("$self" config get routing --dir "$td" | jq 'length')" = "2" ] || fail "config set/get routing JSON array"
   "$self" config set orchestrator.agent cursor --dir "$td" >/dev/null 2>&1 & lp1=$!
@@ -1282,6 +1492,13 @@ selftest() {
   "$self" next --dir "$td" | grep -q '^NEXT: compare RESUME.md against goal/done_when' || fail "next(6): want compare/dispatch"
   [ "$("$self" next --dir "$td" | wc -l | tr -d ' ')" = "1" ] || fail "next printed more than one line"
 
+  # next budget rung: fresh bridge file at 80% outranks everything below drift
+  printf '{"used_pct": 80, "budget": 384000}\n' > "$td/bridge/claude-ctx-selftest.json"
+  "$self" next --dir "$td" | grep -q '^NEXT: context at 80% — offload: m2herd refile --area ' \
+    || fail "next(budget): want context-offload line at 80%"
+  rm -f "$td/bridge/claude-ctx-selftest.json"
+  "$self" next --dir "$td" | grep -q '^NEXT: compare RESUME.md' || fail "next(budget): rung did not clear with the bridge file"
+
   # dashboard: read-only render — NEXT line + area rows present, and NO writes to the fabric
   local before after dash
   before="$(find "$td/.m2herd" -type f -exec cksum {} + | sort)"
@@ -1327,6 +1544,15 @@ selftest() {
   if printf '%s\n' "$boot_out" | grep -qi 'not a git repository'; then fail "boot(git): unexpected warning on a real git repo"; fi
   [ -f "$td3/.m2herd/overview.json" ] || fail "boot(git): did not scaffold .m2herd/"
   rm -rf "$td3"
+
+  # doctor: healthy fixture exits 0 (warns allowed, FAILs not); herdr checks
+  # skip gracefully when herdr is absent from this machine's PATH
+  local doc_out drc
+  drc=0; doc_out="$("$self" doctor --dir "$td" 2>&1)" || drc=$?
+  [ "$drc" -eq 0 ] || { printf '%s\n' "$doc_out" >&2; fail "doctor exited $drc on a healthy fixture (want 0)"; }
+  printf '%s\n' "$doc_out" | grep -q 'jq present' || fail "doctor: missing the jq check line"
+  printf '%s\n' "$doc_out" | grep -q '^doctor: healthy' || fail "doctor: missing the healthy summary line"
+  if printf '%s\n' "$doc_out" | grep -q 'FAIL'; then fail "doctor reported FAIL on a healthy fixture"; fi
 
   # evolve: graceful no-op before any run trace exists
   "$self" evolve analyze --dir "$td" | grep -qi 'no run traces' || fail "evolve analyze: missing graceful no-runs message"
@@ -1389,6 +1615,22 @@ selftest() {
   local resume_out; resume_out="$("$self" resume --dir "$td")"
   printf '%s\n' "$resume_out" | grep -q 'Recent factory lessons:' || fail "resume: missing 'Recent factory lessons:' section"
 
+  # resume cap: >8 active areas → 8 rows + one rollup line; report stays ~40 lines;
+  # lessons section survives the cap
+  local i rlines
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    mkdir -p "$td/.m2herd/context/bulk$i/deep"
+    printf -- '---\narea: bulk%s\nrelated: []\ndeep: ./deep/\nupdated: %s\n---\nbulk area %s body\n' "$i" "$(ts)" "$i" \
+      > "$td/.m2herd/context/bulk$i/context.md"
+  done
+  step sync --dir "$td"
+  resume_out="$("$self" resume --dir "$td")"
+  printf '%s\n' "$resume_out" | grep -q 'more areas — m2herd status for all' || fail "resume: missing the area rollup line"
+  [ "$(printf '%s\n' "$resume_out" | grep -c ' → .m2herd/context/')" -eq 8 ] || fail "resume: expected exactly 8 area rows under the cap"
+  printf '%s\n' "$resume_out" | grep -q 'Recent factory lessons:' || fail "resume: lessons section lost under the cap"
+  rlines="$(printf '%s\n' "$resume_out" | wc -l | tr -d ' ')"
+  [ "$rlines" -le 45 ] || fail "resume report is $rlines lines (want <= ~40)"
+
   echo "selftest: PASS"
 }
 
@@ -1405,6 +1647,7 @@ case "$CMD" in
   gist)     gist_cmd ;;
   next)      next_cmd ;;
   config)   config_cmd ;;
+  doctor)   doctor_cmd ;;
   evolve)
     case "$EVOLVE_ACTION" in
       analyze)   evolve_analyze ;;
@@ -1424,5 +1667,5 @@ case "$CMD" in
     elif [ "$WATCH" -eq 1 ]; then dashboard_watch; else dashboard; fi ;;
   self-update) self_update_cmd ;;
   selftest)  selftest ;;
-  help|*)    sed -n '2,46p' "$0" ;;
+  help|*)    sed -n '2,48p' "$0" ;;
 esac
