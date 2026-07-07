@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "_doc": ".m2herd/context/settings-ux/context.md",
+  "orchestrator": {
+    "agent": "claude",
+    "runner": "pane"
+  },
+  "workers": {
+    "agent": "claude",
+    "runner": "pane",
+    "max": 3
+  },
+  "routing": []
+}
