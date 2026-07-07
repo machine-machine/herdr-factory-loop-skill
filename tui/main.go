@@ -6,8 +6,10 @@ package main
 import (
 	"fmt"
 	"os"
+	"strconv"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"golang.org/x/term"
 )
 
 func main() {
@@ -76,23 +78,31 @@ func runOnce(dir string) {
 }
 
 func terminalWidth() int {
+	if w, _, err := term.GetSize(int(os.Stdout.Fd())); err == nil && w > 0 {
+		return w
+	}
 	if w := envInt("COLUMNS"); w > 0 {
 		return w
 	}
 	return 100
 }
 
+// envInt parses a positive integer from the environment, clamped to a sane
+// terminal-width range (20..1000). Returns 0 when unset or unparseable.
 func envInt(name string) int {
 	v := os.Getenv(name)
 	if v == "" {
 		return 0
 	}
-	n := 0
-	for _, c := range v {
-		if c < '0' || c > '9' {
-			return 0
-		}
-		n = n*10 + int(c-'0')
+	n, err := strconv.Atoi(v)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	if n < 20 {
+		return 20
+	}
+	if n > 1000 {
+		return 1000
 	}
 	return n
 }

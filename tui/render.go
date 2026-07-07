@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/mattn/go-runewidth"
 )
 
@@ -25,6 +26,7 @@ type Snapshot struct {
 	AreaAges   map[string]string
 	Agents     map[string]string
 	AgentsOK   bool
+	Warnings   []string
 }
 
 // BuildSnapshot gathers every read-only data source in one pass.
@@ -33,7 +35,11 @@ func BuildSnapshot(dir string) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	clean, missing, orphan := Drift(dir, ov)
+	var warnings []string
+	clean, missing, orphan, driftErr := Drift(dir, ov)
+	if driftErr != nil {
+		warnings = append(warnings, "drift check skipped: "+driftErr.Error())
+	}
 	next, nextOK := NextLine(dir)
 	ages := make(map[string]string, len(ov.Areas))
 	for _, a := range ov.Areas {
@@ -54,6 +60,7 @@ func BuildSnapshot(dir string) (*Snapshot, error) {
 		AreaAges:   ages,
 		Agents:     agents,
 		AgentsOK:   agentsOK,
+		Warnings:   warnings,
 	}, nil
 }
 
@@ -95,12 +102,26 @@ func padRight(s string, w int) string {
 	return s + strings.Repeat(" ", w-cw)
 }
 
+// padLine pads possibly-styled text to a cell width; lipgloss.Width strips
+// ANSI escapes before measuring, so styled rows still align.
 func padLine(s string, w int) string {
-	cw := runewidth.StringWidth(s)
+	cw := lipgloss.Width(s)
 	if cw >= w {
 		return s
 	}
 	return s + strings.Repeat(" ", w-cw)
+}
+
+// truncLine truncates possibly-styled text to a cell width with an ellipsis,
+// keeping escape sequences intact (ansi.Truncate is ANSI-aware).
+func truncLine(s string, w int) string {
+	if w <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= w {
+		return s
+	}
+	return ansi.Truncate(s, w, "…")
 }
 
 // Render draws one full frame at the given terminal width.
@@ -121,6 +142,12 @@ func Render(s *Snapshot, width int) string {
 	lines = append(lines, headerLine(s, contentWidth))
 	lines = append(lines, styleDim.Render(padRight("goal:", 11))+valueOr(s.Overview.Goal, "(none)"))
 	lines = append(lines, styleDim.Render(padRight("done_when:", 11))+valueOr(s.Overview.DoneWhen, "(not coached)"))
+	if row := driftRow(s); row != "" {
+		lines = append(lines, row)
+	}
+	for _, w := range s.Warnings {
+		lines = append(lines, styleYellow.Render(padRight("warning:", 11)+w))
+	}
 	if row := budgetRow(s.Budget); row != "" {
 		lines = append(lines, row)
 	}
@@ -139,7 +166,7 @@ func Render(s *Snapshot, width int) string {
 	if len(workers) > 0 && width >= wideThreshold {
 		left := make([]string, len(areas))
 		for i, l := range areas {
-			left[i] = padLine(l, areasColWidth)
+			left[i] = padLine(truncLine(l, areasColWidth-1), areasColWidth)
 		}
 		lines = append(lines, strings.Split(lipgloss.JoinHorizontal(lipgloss.Top, strings.Join(left, "\n"), strings.Join(workers, "\n")), "\n")...)
 	} else {
@@ -163,6 +190,12 @@ func Render(s *Snapshot, width int) string {
 
 	lines = append(lines, "")
 	lines = append(lines, styleDim.Render("read-only · [r]esume [s]teer [q]uit"))
+
+	// Long values (goal, done_when, notes, branches, …) must not wrap inside
+	// the box — a wrapped line breaks the border and the two-column layout.
+	for i, l := range lines {
+		lines[i] = truncLine(l, contentWidth)
+	}
 
 	box := lipgloss.NewStyle().
 		Border(lipgloss.RoundedBorder()).
@@ -207,6 +240,21 @@ func headerLine(s *Snapshot, width int) string {
 		fill = 1
 	}
 	return left + " " + strings.Repeat("─", fill) + " " + right
+}
+
+// driftRow lists the drifted area names compactly; the header only shows ◐.
+func driftRow(s *Snapshot) string {
+	if s.DriftClean {
+		return ""
+	}
+	var parts []string
+	if len(s.Missing) > 0 {
+		parts = append(parts, "missing: "+strings.Join(s.Missing, ", "))
+	}
+	if len(s.Orphan) > 0 {
+		parts = append(parts, "orphan: "+strings.Join(s.Orphan, ", "))
+	}
+	return styleYellow.Render(padRight("drift:", 11) + strings.Join(parts, " · "))
 }
 
 func budgetRow(b BudgetInfo) string {
