@@ -20,7 +20,8 @@
 #   m2herd.sh archive [--dir P] --area A      # distill context/A/context.md to header + <=10 summary lines, mark archived (deep/ untouched)
 #   m2herd.sh gist    [--dir P] [--push]      # one-paragraph project gist; --push pipes it to $M2HERD_GIST_CMD if set
 #   m2herd.sh next    [--dir P]               # self-prompting primitive: mechanical priority walk, prints exactly one "NEXT: " line
-#                                             #   (drift → coach intent → refile notes → collect worker → open question → compare/dispatch)
+#                                             #   (drift → steer → machineroom → coach intent → refile notes → collect worker
+#                                             #    → failed worker → open question → compare/dispatch)
 #   m2herd.sh evolve analyze  [--dir P] [--run <id|latest|current>]
 #                                             # mechanical: read .m2herd/runs/<run-id>/, write signatures + skeleton
 #                                             #   proposals under .m2herd/evolver/; no LLM, no network; idempotent
@@ -88,11 +89,40 @@ tmpl_dir() { cd "$(dirname "$(self_path)")/../templates/m2herd" 2>/dev/null && p
 need_jq()  { command -v jq >/dev/null 2>&1 || { echo "m2herd.sh: jq is required" >&2; exit 1; }; }
 resolve_dir() { DIR="$(cd "$DIR" 2>/dev/null && pwd)" || { echo "no such dir: $DIR" >&2; exit 1; }; need_jq; }
 need_init(){ [ -f "$(OV)" ] || { echo "no .m2herd/ at $DIR (run: m2herd.sh init --dir $DIR)" >&2; exit 1; }; }
+# VALIDATION convention (shared with m2herd-up.sh): tokens spliced into fabric
+# paths (--area, --run, evolve proposal ids) must match ^[A-Za-z0-9][A-Za-z0-9._-]*$
+# and never contain '..' — rejects path traversal and shell-hostile names.
+validate_token() { # validate_token <label> <value>
+  if [[ ! "$2" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || [[ "$2" == *..* ]]; then
+    echo "invalid $1: '$2' (allowed: [A-Za-z0-9][A-Za-z0-9._-]*, no '..')" >&2; exit 2
+  fi
+}
+# LOCKING convention (shared with m2herd-up.sh): every read-modify-write of a
+# fabric file serializes on flock of "<file>.lock" (lock lives NEXT to the state
+# file); tmp files are mktemp'd in the SAME directory as the target so the final
+# mv is an atomic rename, and removed when the generator fails. Systems without
+# flock (stock macOS) degrade to unlocked — same behavior as before.
+with_lock() { # with_lock <lockfile> <cmd…>
+  local lf="$1"; shift
+  if command -v flock >/dev/null 2>&1; then ( flock 9; "$@" ) 9>"$lf"; else "$@"; fi
+}
 # whole-file overview.json rewrite through jq: ov_put [jq args…] '<filter>'
-ov_put()   { local tmp; tmp="$(mktemp)"; jq "$@" "$(OV)" > "$tmp" && mv "$tmp" "$(OV)"; }
+ov_put()   { with_lock "$(OV).lock" ov_put_locked "$@"; }
+ov_put_locked() {
+  local ov tmp; ov="$(OV)"
+  tmp="$(mktemp "$(dirname "$ov")/.overview.XXXXXX")"
+  if jq "$@" "$ov" > "$tmp"; then mv "$tmp" "$ov"; else rm -f "$tmp"; return 1; fi
+}
 
 live_tail() { awk -v m="$MARKER" 'p{print} index($0,m){p=1}' "$1"; }   # content below the marker
 keep_head() { awk -v m="$MARKER" '{print} index($0,m){exit}' "$1"; }   # boilerplate through the marker
+# reset a marker file to boilerplate-through-marker (post-refile NOTES truncation);
+# run under with_lock "<file>.lock" per the locking convention above
+notes_truncate() {
+  local nf="$1" tmp
+  tmp="$(mktemp "$(dirname "$nf")/.notes.XXXXXX")"
+  if keep_head "$nf" > "$tmp"; then mv "$tmp" "$nf"; else rm -f "$tmp"; return 1; fi
+}
 has_ink()   { printf '%s' "$1" | grep -q '[^[:space:]]'; }
 
 # context.md body: everything after the closing --- of the annotation header
@@ -126,12 +156,14 @@ frontmatter_get() {
     if (c==1 && $0 ~ "^"k":"){sub("^"k":[[:space:]]*","");print;exit} }' "$1" 2>/dev/null
 }
 # rewrite the `status:` line inside a proposal's frontmatter fence, body untouched
-set_status() {
+set_status() { with_lock "$1.lock" set_status_locked "$1" "$2"; }
+set_status_locked() {
   local f="$1" st="$2" tmp
-  tmp="$(mktemp)"
-  awk -v st="$st" 'BEGIN{c=0}
+  tmp="$(mktemp "$(dirname "$f")/.status.XXXXXX")"
+  if awk -v st="$st" 'BEGIN{c=0}
     { if ($0=="---"){c++; print; next}
-      if (c==1 && $0 ~ /^status:/){print "status: " st} else {print} }' "$f" > "$tmp" && mv "$tmp" "$f"
+      if (c==1 && $0 ~ /^status:/){print "status: " st} else {print} }' "$f" > "$tmp"
+  then mv "$tmp" "$f"; else rm -f "$tmp"; return 1; fi
 }
 
 # ---------- init: scaffold .m2herd/ from templates/m2herd/ --------------------
@@ -148,14 +180,20 @@ init() {
   [ -f "$m2/evolver/LESSONS.md" ] || cp "$tmpl/evolver/LESSONS.md" "$m2/evolver/LESSONS.md" 2>/dev/null || true
   [ -f "$m2/runs/README.md" ]     || cp "$tmpl/runs/README.md"     "$m2/runs/README.md"     2>/dev/null || true
   if [ ! -f "$m2/overview.json" ]; then
-    jq --arg g "$GOAL" --arg ts "$(ts)" '.goal=$g | .updated_at=$ts' "$tmpl/overview.json" > "$m2/overview.json"
+    local tmp; tmp="$(mktemp "$m2/.overview.XXXXXX")"
+    if jq --arg g "$GOAL" --arg ts "$(ts)" '.goal=$g | .updated_at=$ts' "$tmpl/overview.json" > "$tmp"
+    then mv "$tmp" "$m2/overview.json"; else rm -f "$tmp"; return 1; fi
   else
     # backfill optional v1.2 fields on older fabrics; empty done_when = "intent not yet coached"
     ov_put --arg g "$GOAL" --arg ts "$(ts)" '
       (if $g != "" then .goal=$g | .updated_at=$ts else . end)
       | .done_when = (.done_when // "") | .open_questions = (.open_questions // [])'
   fi
-  grep -qxF '.m2herd/' "$DIR/.gitignore" 2>/dev/null || printf '.m2herd/\n' >> "$DIR/.gitignore"
+  if ! grep -qxF '.m2herd/' "$DIR/.gitignore" 2>/dev/null; then
+    # a .gitignore without a trailing newline would glue '.m2herd/' onto its last pattern
+    if [ -s "$DIR/.gitignore" ] && [ -n "$(tail -c1 "$DIR/.gitignore" 2>/dev/null)" ]; then echo >> "$DIR/.gitignore"; fi
+    printf '.m2herd/\n' >> "$DIR/.gitignore"
+  fi
   log "initialized .m2herd/ at $m2 (gitignored)"
 }
 
@@ -171,6 +209,7 @@ note() {
 refile() {
   resolve_dir; need_init
   [ -n "$AREA" ] || { echo "refile needs --area A" >&2; exit 2; }
+  validate_token area "$AREA"
   local m2="$DIR/.m2herd" adir="$DIR/.m2herd/context/$AREA" cf now body related live first tmp
   cf="$adir/context.md"; now="$(ts)"
   mkdir -p "$adir/deep"
@@ -178,14 +217,14 @@ refile() {
   related="$(hdr_get "$cf" related | tr -d '[]')"
   [ -n "$related" ] || related="$(jq -r --arg n "$AREA" '[.areas[]?|select(.name==$n)|(.related//[])|join(", ")][0] // ""' "$(OV)")"
   live="$(live_tail "$m2/NOTES.md")"
-  tmp="$(mktemp)"
+  tmp="$(mktemp "$adir/.context.XXXXXX")"
   {
     write_header "$AREA" "$related" ""      # refiling (re)activates the area
     [ -z "$body" ] || printf '%s\n' "$body"
     if has_ink "$live"; then printf '\n## refiled %s\n\n%s\n' "$now" "$live"; fi
-  } > "$tmp" && mv "$tmp" "$cf"
+  } > "$tmp" && mv "$tmp" "$cf" || { rm -f "$tmp"; return 1; }
   if has_ink "$live"; then
-    tmp="$(mktemp)"; keep_head "$m2/NOTES.md" > "$tmp" && mv "$tmp" "$m2/NOTES.md"
+    with_lock "$m2/NOTES.md.lock" notes_truncate "$m2/NOTES.md"
     log "refiled live notes → context/$AREA/context.md"
   else
     log "no live notes to move — context/$AREA/ refreshed"
@@ -223,14 +262,15 @@ areas_from_tree() {
 }
 
 # refresh RESUME.md: regenerate boilerplate + snapshot above the marker, preserve below
-refresh_resume() {
+refresh_resume() { with_lock "$DIR/.m2herd/RESUME.md.lock" refresh_resume_locked; }
+refresh_resume_locked() {
   local m2="$DIR/.m2herd" resume tpl live tmp
   resume="$m2/RESUME.md"; tpl="$(tmpl_dir)/RESUME.md"
   [ -f "$tpl" ] || { echo "template RESUME.md not found next to $0" >&2; exit 1; }
   live=""
   [ -f "$resume" ] && live="$(live_tail "$resume")"
   has_ink "$live" || live="$(live_tail "$tpl")"
-  tmp="$(mktemp)"
+  tmp="$(mktemp "$m2/.resume.XXXXXX")"
   {
     awk '{print} /^-->$/{exit}' "$tpl"
     echo
@@ -245,7 +285,7 @@ refresh_resume() {
     echo
     printf '%s\n' "$MARKER"
     printf '%s\n' "$live"
-  } > "$tmp" && mv "$tmp" "$resume"
+  } > "$tmp" && mv "$tmp" "$resume" || { rm -f "$tmp"; return 1; }
 }
 
 # DRIFT lines for overview.json vs the context/ tree; returns 1 when drift exists
@@ -255,8 +295,9 @@ drift_report() {
   ov="$(jq -r '.areas[]?.name' "$(OV)" | sort)"
   missing="$(comm -23 <(printf '%s\n' "$tree" | sed '/^$/d') <(printf '%s\n' "$ov" | sed '/^$/d'))"
   orphan="$(comm -13 <(printf '%s\n' "$tree" | sed '/^$/d') <(printf '%s\n' "$ov" | sed '/^$/d'))"
-  if [ -n "$missing" ]; then drift=1; for n in $missing; do echo "DRIFT missing: context/$n/ exists but overview.json has no area '$n'"; done; fi
-  if [ -n "$orphan" ];  then drift=1; for n in $orphan;  do echo "DRIFT orphan:  overview.json lists area '$n' but context/$n/ does not exist"; done; fi
+  # here-string while-read (not `for n in $var`): area names with spaces stay whole
+  if [ -n "$missing" ]; then drift=1; while IFS= read -r n; do [ -n "$n" ] || continue; echo "DRIFT missing: context/$n/ exists but overview.json has no area '$n'"; done <<<"$missing"; fi
+  if [ -n "$orphan" ];  then drift=1; while IFS= read -r n; do [ -n "$n" ] || continue; echo "DRIFT orphan:  overview.json lists area '$n' but context/$n/ does not exist"; done <<<"$orphan"; fi
   [ "$drift" -eq 0 ]
 }
 
@@ -281,16 +322,17 @@ sync_cmd() {
 archive() {
   resolve_dir; need_init
   [ -n "$AREA" ] || { echo "archive needs --area A" >&2; exit 2; }
+  validate_token area "$AREA"
   local m2="$DIR/.m2herd" cf="$DIR/.m2herd/context/$AREA/context.md" now related summary tmp
   [ -f "$cf" ] || { echo "no such area to archive: context/$AREA/context.md" >&2; exit 1; }
   now="$(ts)"
   related="$(hdr_get "$cf" related | tr -d '[]')"
   summary="$(body_of "$cf" | awk 'NF' | head -10)"
-  tmp="$(mktemp)"
+  tmp="$(mktemp "$(dirname "$cf")/.context.XXXXXX")"
   {
     write_header "$AREA" "$related" "archived"
     [ -z "$summary" ] || printf '%s\n' "$summary"
-  } > "$tmp" && mv "$tmp" "$cf"
+  } > "$tmp" && mv "$tmp" "$cf" || { rm -f "$tmp"; return 1; }
   ov_put --arg n "$AREA" --arg ts "$now" '
     .updated_at=$ts
     | if any(.areas[]?; .name==$n) then
@@ -375,14 +417,24 @@ gist_cmd() {
 }
 
 # ---------- next: the self-prompting primitive --------------------------------
-# first spawned|working worker whose pane is gone or idle (needs herdr to verify; else none)
+# first spawned|working worker whose pane is gone or idle (needs herdr to verify; else none).
+# Headless workers (mode=headless, or pane_id "-"/empty) have no pane in `agent list`
+# — never mark them gone from it; judge liveness by their recorded pid (kill -0)
+# when present, else skip: a live headless worker must NOT trigger a collect nudge.
 stale_worker() {
   command -v herdr >/dev/null 2>&1 || return 0
   local agents; agents="$(herdr agent list 2>/dev/null)" || return 0
   [ -n "$agents" ] || return 0
-  jq -r '(.workers // [])[] | select(.state=="spawned" or .state=="working") | .slice + "\t" + (.pane_id // "")' "$(OV)" \
-  | while IFS=$'\t' read -r slice pane; do
+  jq -r '(.workers // [])[] | select(.state=="spawned" or .state=="working")
+         | [.slice, (.pane_id // ""), (.mode // "tui"), ((.pid // "")|tostring)] | join("\u001f")' "$(OV)" \
+  | while IFS=$'\x1f' read -r slice pane mode pid; do
       [ -n "$slice" ] || continue
+      if [ "$mode" = "headless" ] || [ "$pane" = "-" ] || [ -z "$pane" ]; then
+        if [ -n "$pid" ] && [ "$pid" != "null" ] && [ "$pid" -gt 0 ] 2>/dev/null; then
+          kill -0 "$pid" 2>/dev/null || { echo "$slice"; break; }
+        fi
+        continue
+      fi
       st="$(jq -r --arg p "$pane" '[.result.agents[]? | select(.pane_id==$p) | .agent_status][0] // "gone"' <<<"$agents")"
       if [ "$st" = "gone" ] || [ "$st" = "idle" ]; then echo "$slice"; break; fi
     done
@@ -408,7 +460,10 @@ machineroom_watching() {
   return 1
 }
 
-# mechanical priority walk — NO LLM, exactly one "NEXT: " line
+# mechanical priority walk — NO LLM, exactly one "NEXT: " line.
+# Ladder order (first hit wins): drift → steer inbox → machineroom up →
+# coach intent (done_when) → refile notes → collect stale worker →
+# failed worker → open question → compare/dispatch.
 next_cmd() {
   resolve_dir; need_init
   local m2="$DIR/.m2herd" w q
@@ -430,6 +485,10 @@ next_cmd() {
   w="$(stale_worker)"
   if [ -n "$w" ]; then
     echo "NEXT: collect worker $w — run: m2herd-up collect --slice $w"; return 0
+  fi
+  w="$(jq -r '[(.workers // [])[] | select((.state//"")=="failed") | .slice][0] // ""' "$(OV)")"
+  if [ -n "$w" ]; then
+    echo "NEXT: worker $w failed — read dispatch/$w.out.md, then retry or clean up"; return 0
   fi
   q="$(jq -r '(.open_questions // [])[0] // ""' "$(OV)")"
   if [ -n "$q" ]; then
@@ -481,20 +540,25 @@ age_secs() { # epoch → humanized 42s / 3m / 7h / 4d
 }
 age_of() { age_secs "$(epoch_of "${1:-}")"; }
 
-# budget row from the newest /tmp/claude-ctx-*.json bridge file; silent no-op when none
+# budget row from the newest /tmp/claude-ctx-*.json bridge file OWNED BY THIS
+# UID; silent no-op when none. Null-safe glob loop — no `ls -t` word-splitting,
+# and /tmp is world-writable so foreign-uid bridge files are ignored.
 budget_row() {
-  local f="" c pct budget mt filled bar
-  for c in $(ls -t /tmp/claude-ctx-*.json 2>/dev/null); do
-    if jq -e '.used_pct|numbers' "$c" >/dev/null 2>&1; then f="$c"; break; fi
+  local f="" c pct budget mt best=0 filled bar
+  for c in /tmp/claude-ctx-*.json; do
+    [ -f "$c" ] || continue                              # unmatched glob stays literal
+    [ -O "$c" ] || continue                              # not ours → ignore
+    jq -e '.used_pct|numbers' "$c" >/dev/null 2>&1 || continue
+    mt="$(file_mtime "$c")"
+    case "$mt" in ''|*[!0-9]*) mt=0 ;; esac   # never let a stat surprise reach the integer tests
+    if [ "$mt" -gt "$best" ]; then best="$mt"; f="$c"; fi
   done
   [ -n "$f" ] || return 0
   pct="$(jq -r '.used_pct' "$f")"; pct="${pct%.*}"; [ -n "$pct" ] || pct=0
   budget="$(jq -r '.budget // 384000' "$f")"
   filled=$((pct * 20 / 100)); [ "$filled" -le 20 ] || filled=20; [ "$filled" -ge 0 ] || filled=0
   bar="$(printf '%*s' "$filled" '' | tr ' ' '█')$(printf '%*s' "$((20 - filled))" '' | tr ' ' '░')"
-  mt="$(file_mtime "$f")"
-  case "$mt" in ''|*[!0-9]*) mt=0 ;; esac   # never let a stat surprise reach the integer tests
-  printf 'budget:    %s %s%% of %s · updated %s ago\n' "$bar" "$pct" "$budget" "$(age_secs "$mt")"
+  printf 'budget:    %s %s%% of %s · updated %s ago\n' "$bar" "$pct" "$budget" "$(age_secs "$best")"
 }
 
 # plain (uncolored) blocks so the side-by-side column merge pads correctly
@@ -503,7 +567,8 @@ render_areas() {
   echo "AREAS"
   names="$(jq -r '(.areas//[])[].name' "$(OV)")"
   [ -n "$names" ] || { echo "  (no areas yet)"; return 0; }
-  for n in $names; do
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
     astatus="$(jq -r --arg n "$n" '[.areas[]|select(.name==$n)|(.status//"active")][0]' "$(OV)")"
     rel="$(jq -r --arg n "$n" '[.areas[]|select(.name==$n)|(.related//[])|join(", ")][0] // ""' "$(OV)")"
     aage="$(age_of "$(hdr_get "$DIR/.m2herd/context/$n/context.md" updated)")"
@@ -512,7 +577,7 @@ render_areas() {
     else
       printf '  %-14s active    %-5s %s\n' "$n" "$aage" "${rel:+(related: $rel)}"
     fi
-  done
+  done <<<"$names"
 }
 # desired vs observed: ONE `herdr agent list` query; mismatch marked "!"; degrades to "-"
 render_workers() {
@@ -578,13 +643,18 @@ self_update_cmd() {
 
 # header row rendered by dashboard: only when the cached check is fresh (<24h) and behind
 update_row() {
-  local Y="$1" R="$2" word n when age now
+  local Y="$1" R="$2" word n when age now ep
   [ -f "$UPDATE_CACHE" ] || return 0
   read -r word n when < "$UPDATE_CACHE" 2>/dev/null || return 0
   [ "$word" = "behind" ] || return 0
   now="$(date -u +%s)"
-  age="$(( now - $(epoch_of "$when") ))"
-  [ "$age" -le "$now" ] || age=0   # epoch_of returns 0 on parse failure → treat as fresh-unknown
+  ep="$(epoch_of "$when")"
+  # epoch_of returns 0 on parse failure → treat the check as fresh-unknown (age 0)
+  if [ "${ep:-0}" -gt 0 ] 2>/dev/null; then
+    age=$((now - ep)); [ "$age" -ge 0 ] || age=0
+  else
+    age=0
+  fi
   [ "$age" -lt 86400 ] || return 0
   printf 'update:    %s%s commit(s) behind — run: m2herd self-update%s\n' "$Y" "$n" "$R"
 }
@@ -593,21 +663,27 @@ update_row() {
 # Home-cursor redraw (no `clear` per frame → no blink); alt-screen + hidden
 # cursor, restored on exit. Refreshes the self-update check every 10 min.
 dashboard_watch() {
-  local iv="$INTERVAL" chk=600 last=0 now frame
+  local iv="$INTERVAL" chk=600 last=0 now frame stop=0
+  case "$iv" in ''|*[!0-9]*) echo "dashboard --interval must be an integer >= 1 (got: $INTERVAL)" >&2; exit 2 ;; esac
+  [ "$iv" -ge 1 ] || { echo "dashboard --interval must be an integer >= 1 (got: $INTERVAL)" >&2; exit 2; }
   if command -v tput >/dev/null 2>&1 && [ -t 1 ]; then
     tput smcup 2>/dev/null || true; tput civis 2>/dev/null || true
-    trap 'tput cnorm 2>/dev/null || true; tput rmcup 2>/dev/null || true' EXIT INT TERM
+    # screen restore ONLY on EXIT; INT/TERM just flag the loop to break so the
+    # last repaint can't race the restore (no repaint after rmcup)
+    trap 'tput cnorm 2>/dev/null || true; tput rmcup 2>/dev/null || true' EXIT
   fi
+  trap 'stop=1' INT TERM
   printf '\033[2J'
-  while :; do
+  while [ "$stop" -eq 0 ]; do
     now="$(date +%s)"
     if [ $((now - last)) -ge "$chk" ]; then
       ( CHECK=1 self_update_cmd >/dev/null 2>&1 ) || true
       last="$now"
     fi
     frame="$(M2HERD_FORCE_TTY=1 COLUMNS="${COLUMNS:-$(tput cols 2>/dev/null || echo 100)}" dashboard 2>&1 || true)"
+    [ "$stop" -eq 0 ] || break
     printf '\033[H%s\n\033[0J' "$frame"
-    sleep "$iv"
+    sleep "$iv" || true
   done
 }
 
@@ -717,6 +793,7 @@ resolve_run_id() {
       fi
       ls -1 "$RUNS_DIR" 2>/dev/null | grep '^r-' | sort | tail -1 || true ;;
     *)
+      validate_token "run id" "$want"
       [ -d "$RUNS_DIR/$want" ] && printf '%s' "$want" ;;
   esac
 }
@@ -731,14 +808,18 @@ Accepted lessons from the m2herd factory evolver. Do not hand-edit above the mar
 $MARKER
 EOF
 }
-# append "- [ts] (<proposal-id>) <lesson>" to LESSONS.md, once per proposal-id
+# append "- [ts] (<proposal-id>) <lesson>" to LESSONS.md, once per proposal-id;
+# the dedup-check + append is a read-modify-write → serialized per the locking convention
 append_lesson_once() {
   local pid="$1" lesson="$2" lf
   [ -n "$lesson" ] || return 0
   ensure_lessons_file
   lf="$EVO_DIR/LESSONS.md"
-  live_tail "$lf" | grep -qF "($pid)" && return 0
-  printf -- '- [%s] (%s) %s\n' "$(ts)" "$pid" "$lesson" >> "$lf"
+  with_lock "$lf.lock" append_lesson_locked "$pid" "$lesson" "$lf"
+}
+append_lesson_locked() {
+  live_tail "$3" | grep -qF "($1)" && return 0
+  printf -- '- [%s] (%s) %s\n' "$(ts)" "$1" "$2" >> "$3"
 }
 
 # kebab slug from a signature kind + its "slice:<name>" where field
@@ -790,7 +871,8 @@ evolve_analyze() {
   local sigs="[]" slices slice sdir status_f report_f fail_f
 
   slices="$(jq -r '.slices[]? // empty' "$run_json" 2>/dev/null || true)"
-  for slice in $slices; do
+  while IFS= read -r slice; do
+    [ -n "$slice" ] || continue
     sdir="$run_dir/slices/$slice"
     status_f="$sdir/status.json"; report_f="$sdir/report.md"; fail_f="$sdir/failures.json"
     if [ ! -d "$sdir" ] || [ ! -f "$status_f" ]; then
@@ -810,9 +892,10 @@ evolve_analyze() {
       sigs="$(jq --slurpfile extra "$fail_f" \
         '. + ([$extra[0][]? | {kind, severity, where, evidence, confidence:"high", source:"failures.json"}])' <<<"$sigs")"
     fi
-  done
+  done <<<"$slices"
 
-  printf '%s' "$sigs" | jq '.' > "$sig_file"
+  local sig_tmp; sig_tmp="$(mktemp "$EVO_DIR/signatures/.sig.XXXXXX")"
+  if printf '%s' "$sigs" | jq '.' > "$sig_tmp"; then mv "$sig_tmp" "$sig_file"; else rm -f "$sig_tmp"; return 1; fi
   local n; n="$(jq 'length' <<<"$sigs")"
   log "wrote signatures → .m2herd/evolver/signatures/$run_id.json ($n signature(s))"
 
@@ -828,7 +911,7 @@ evolve_analyze() {
       pid="${today}-${run_id}-${slug}"
       # distinct signatures may share (kind, slice) — suffix the within-pass ordinal so
       # every signature gets its own proposal file and re-runs regenerate the SAME ids
-      dup="$(printf '%s' "$seen_pids" | grep -cx "$pid" || true)"
+      dup="$(printf '%s' "$seen_pids" | grep -cxF "$pid" || true)"   # -F: ids contain dots — never regex-match
       seen_pids="$seen_pids$pid
 "
       [ "$dup" -gt 0 ] && pid="$pid-$((dup + 1))"
@@ -863,6 +946,8 @@ $(printf '%-46s %-16s %-6s %s' "$id" "$kind" "$risk" "$status")"
 evolve_show() {
   resolve_dir; need_init; evolve_dirs
   [ -n "$TEXT" ] || { echo "evolve show needs a proposal id: m2herd evolve show <id>" >&2; exit 2; }
+  # token has no '/' or '..' → resolved path stays under .m2herd/evolver/proposals/
+  validate_token "proposal id" "$TEXT"
   local f="$EVO_DIR/proposals/$TEXT.md"
   [ -f "$f" ] || { echo "no such proposal: $TEXT" >&2; exit 1; }
   cat "$f"
@@ -871,6 +956,8 @@ evolve_show() {
 evolve_apply() {
   resolve_dir; need_init; evolve_dirs
   [ -n "$TEXT" ] || { echo "evolve apply needs a proposal id: m2herd evolve apply <id>" >&2; exit 2; }
+  # token has no '/' or '..' → resolved path stays under .m2herd/evolver/proposals/
+  validate_token "proposal id" "$TEXT"
   local f="$EVO_DIR/proposals/$TEXT.md"
   [ -f "$f" ] || { echo "no such proposal: $TEXT" >&2; exit 1; }
   local kind target status lesson
@@ -908,6 +995,8 @@ evolve_apply() {
 evolve_reject() {
   resolve_dir; need_init; evolve_dirs
   [ -n "$TEXT" ] || { echo "evolve reject needs a proposal id: m2herd evolve reject <id>" >&2; exit 2; }
+  # token has no '/' or '..' → resolved path stays under .m2herd/evolver/proposals/
+  validate_token "proposal id" "$TEXT"
   local f="$EVO_DIR/proposals/$TEXT.md"
   [ -f "$f" ] || { echo "no such proposal: $TEXT" >&2; exit 1; }
   set_status "$f" "rejected"
@@ -920,9 +1009,12 @@ selftest() {
   # tmpdir fixtures have no machineroom; suppress the room nudge so the other
   # next-cases stay assertable (the room case is verified live, not here).
   export M2HERD_SKIP_ROOM_CHECK=1
-  local self td ov rc
+  local self ov rc
   self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
-  td="$(mktemp -d)"; trap "rm -rf '$td'" EXIT
+  # td/td2/td3 stay global (NOT local): the EXIT trap fires after this function
+  # returns, so locals would already be gone — all three are registered here
+  td="$(mktemp -d)"; td2=""; td3=""
+  trap 'rm -rf "$td" ${td2:+"$td2"} ${td3:+"$td3"}' EXIT
   echo "selftest: workdir $td"
   step() { echo "+ m2herd.sh $*"; "$self" "$@" >/dev/null || { echo "selftest FAIL at: $*" >&2; exit 1; }; }
   fail() { echo "selftest FAIL: $*" >&2; exit 1; }
@@ -1006,6 +1098,11 @@ selftest() {
   jq '.open_questions=["which DB backs the demo area?"]' "$ov" > "$ov.tmp" && mv "$ov.tmp" "$ov"
   "$self" next --dir "$td" | grep -q '^NEXT: resolve open question: which DB' || fail "next(5): want open-question"
   jq '.open_questions=[]' "$ov" > "$ov.tmp" && mv "$ov.tmp" "$ov"
+  # next case 5b: a failed worker outranks open questions and the steady state
+  jq '.workers=[{slice:"sliceX", state:"failed", pane_id:"-", branch:"wip/m2herd-sliceX"}]' "$ov" > "$ov.tmp" && mv "$ov.tmp" "$ov"
+  "$self" next --dir "$td" | grep -q '^NEXT: worker sliceX failed — read dispatch/sliceX.out.md' \
+    || fail "next(5b): want failed-worker line"
+  jq '.workers=[]' "$ov" > "$ov.tmp" && mv "$ov.tmp" "$ov"
   # next case 6: nothing pending → compare and dispatch/finish; exactly one NEXT line
   "$self" next --dir "$td" | grep -q '^NEXT: compare RESUME.md against goal/done_when' || fail "next(6): want compare/dispatch"
   [ "$("$self" next --dir "$td" | wc -l | tr -d ' ')" = "1" ] || fail "next printed more than one line"
@@ -1022,8 +1119,25 @@ selftest() {
   printf '%s\n' "$dash" | grep -q '^m2herd · .* · drift' || fail "dashboard missing the boxed header line"
   printf '%s\n' "$dash" | grep -q '^read-only · steering: .m2herd/inbox/STEER.md$' || fail "dashboard missing the footer"
 
+  # locking: two concurrent overview.json writers must BOTH land (flock convention)
+  local lp1 lp2
+  "$self" refile --dir "$td" --area lockA >/dev/null 2>&1 & lp1=$!
+  "$self" refile --dir "$td" --area lockB >/dev/null 2>&1 & lp2=$!
+  wait "$lp1" || fail "concurrent writer A (refile lockA) exited non-zero"
+  wait "$lp2" || fail "concurrent writer B (refile lockB) exited non-zero"
+  jq -e 'any(.areas[]?; .name=="lockA") and any(.areas[]?; .name=="lockB")' "$ov" >/dev/null \
+    || fail "concurrent locked writers lost an overview.json update"
+  step sync --dir "$td"   # fold the new areas in so later drift checks stay clean
+
+  # validation: traversal --area is rejected (one-line error, exit 2, nothing written)
+  rc=0; "$self" refile --dir "$td" --area '../escape' >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || fail "refile --area ../escape exited $rc (want 2)"
+  [ ! -e "$td/.m2herd/escape" ] || fail "refile --area ../escape wrote outside context/"
+  rc=0; "$self" archive --dir "$td" --area '../escape' >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || fail "archive --area ../escape exited $rc (want 2)"
+
   # boot: non-git dir → colorful (but non-fatal) warning; still scaffolds + boots clean
-  local td2 td3 boot_out
+  local boot_out
   td2="$(mktemp -d)"
   boot_out="$("$self" boot --dir "$td2" --goal "boot selftest goal" 2>&1)" || fail "boot exited non-zero on a non-git dir"
   printf '%s\n' "$boot_out" | grep -qi 'not a git repository' || fail "boot(non-git): missing warning text"
@@ -1077,6 +1191,14 @@ selftest() {
   pid_other="$(basename "$(ls "$td/.m2herd/evolver/proposals"/*.md | sed -n '2p')" .md)"
   "$self" evolve show "$pid_memory" --dir "$td" | grep -q '^kind: memory' || fail "evolve show: missing expected frontmatter"
 
+  # validation: traversal proposal ids are rejected before any path is resolved
+  rc=0; "$self" evolve show '../../evolver/LESSONS' --dir "$td" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || fail "evolve show traversal id exited $rc (want 2)"
+  rc=0; "$self" evolve apply '../LESSONS' --dir "$td" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || fail "evolve apply traversal id exited $rc (want 2)"
+  rc=0; "$self" evolve reject '..' --dir "$td" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || fail "evolve reject traversal id exited $rc (want 2)"
+
   step evolve apply "$pid_memory" --dir "$td"
   grep -qF "($pid_memory)" "$td/.m2herd/evolver/LESSONS.md" || fail "evolve apply: lesson not recorded in LESSONS.md"
   grep -q '^status: applied' "$td/.m2herd/evolver/proposals/$pid_memory.md" || fail "evolve apply: status not flipped to applied"
@@ -1126,5 +1248,5 @@ case "$CMD" in
     elif [ "$WATCH" -eq 1 ]; then dashboard_watch; else dashboard; fi ;;
   self-update) self_update_cmd ;;
   selftest)  selftest ;;
-  help|*)    sed -n '2,45p' "$0" ;;
+  help|*)    sed -n '2,46p' "$0" ;;
 esac
