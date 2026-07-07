@@ -13,10 +13,11 @@
 #                                                   # ensure herdr workspace: ONE orchestrator pane (claude) + ONE machineroom pane; m2herd.sh init if missing
 #                                                   # --room-only: workspace + machineroom ONLY, never spawn an orchestrator — for the
 #                                                   #   auto-kick path where the calling Claude Code session IS the orchestrator
-#   m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor]
-#                         [--headless [--model M]]  # worktree wip/m2herd-<S> off BASE (default: current branch), spawn worker,
+#   m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor|opencode]
+#                         [--runner pane|headless] [--headless [--model M]]
+#                                                   # worktree wip/m2herd-<S> off BASE (default: workers.base, else current branch), spawn worker,
 #                                                   # file-protocol dispatch of .m2herd/dispatch/S.task.md, record in overview.json workers[]
-#                                                   # --headless: no pane/TUI — `claude -p --model M` (default sonnet) or `codex exec`
+#                                                   # --headless: no pane/TUI — `claude -p --model M` (default sonnet), `codex exec`, or `opencode run`
 #                                                   #   in the worktree via nohup; log → dispatch/S.log, stderr → dispatch/S.stderr.log,
 #                                                   #   answer → dispatch/S.out.md;
 #                                                   #   usage (tokens/cost) parsed into workers[] at collect. Cheap hands, Fable judgment.
@@ -29,10 +30,14 @@
 #                                                   #   retry a slice = clean `down --slice S`, then dispatch it again.
 #   m2herd-up.sh --dry-run <same args>              # print every herdr/git command instead of running it
 #
+# Settings: .m2herd/settings.json is read-only config here; missing/invalid
+# values fall back to built-ins. routing[].match uses bash `case "$slice" in
+# $pattern)` glob semantics, and the first matching routing rule wins.
+#
 # Binding herdr rules (from CONTRACT-m2herd.md): identify $SELF first and never
 # touch it; after `agent start` RE-RESOLVE the pane by cwd from `herdr agent list`
 # (the returned pane_id can be off by one); no `--split` (stray-pane bug); settle
-# ~1s between `agent send` and the Enter. Idempotent. Safe to re-run.
+# before `agent send` Enter submission. Idempotent. Safe to re-run.
 #
 # Trace bundles (evolver contract §1): dispatch ensures a run under
 # .m2herd/runs/<run-id>/ (CURRENT pointer + run.json), records the slice into
@@ -52,20 +57,22 @@ set -euo pipefail
 DRY_RUN=0
 while [ "${1:-}" = "--dry-run" ]; do DRY_RUN=1; shift; done
 CMD="${1:-help}"; shift || true
-REPO=""; GOAL=""; SLICE=""; BASE=""; AGENT="claude"; HEADLESS=0; MODEL=""; ROOM_ONLY=0
+REPO=""; GOAL=""; SLICE=""; BASE=""; AGENT=""; HEADLESS=0; MODEL=""; RUNNER=""; ROOM_ONLY=0
 ALL=0; FORCE=0
+BASE_EXPLICIT=0; AGENT_EXPLICIT=0; MODEL_EXPLICIT=0; RUNNER_EXPLICIT=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO="$2"; shift 2 ;;
     --goal) GOAL="$2"; shift 2 ;;
     --slice) SLICE="$2"; shift 2 ;;
-    --base) BASE="$2"; shift 2 ;;
-    --agent) AGENT="$2"; shift 2 ;;
-    --headless) HEADLESS=1; shift ;;
+    --base) BASE="$2"; BASE_EXPLICIT=1; shift 2 ;;
+    --agent) AGENT="$2"; AGENT_EXPLICIT=1; shift 2 ;;
+    --headless) HEADLESS=1; RUNNER="headless"; RUNNER_EXPLICIT=1; shift ;;
+    --runner) RUNNER="$2"; RUNNER_EXPLICIT=1; shift 2 ;;
     --room-only) ROOM_ONLY=1; shift ;;
     --all) ALL=1; shift ;;
     --force) FORCE=1; shift ;;
-    --model) MODEL="$2"; shift 2 ;;
+    --model) MODEL="$2"; MODEL_EXPLICIT=1; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) CMD="help"; shift ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
@@ -86,8 +93,13 @@ SCRIPT_DIR="$(cd "$(dirname "$(self_path)")" && pwd)"
 NOTES_TAB_LABEL="machineroom"
 # pre-rename installs used this label; still honored for idempotence
 NOTES_TAB_LABEL_OLD="m2herd-notes"
-SUBMIT_SETTLE="${SUBMIT_SETTLE:-1}"                 # settle between `agent send` and Enter
-WAIT_TIMEOUT="${M2HERD_WAIT_TIMEOUT:-1800000}"      # collect: ms to wait for worker idle
+BUILTIN_AGENT="claude"
+BUILTIN_RUNNER="pane"
+BUILTIN_MAX_CONCURRENT=4
+BUILTIN_SETTLE_SECONDS=2
+BUILTIN_WAIT_TIMEOUT_MINUTES=30
+SUBMIT_SETTLE="$BUILTIN_SETTLE_SECONDS"             # settle between `agent send` and Enter
+WAIT_TIMEOUT=$((BUILTIN_WAIT_TIMEOUT_MINUTES * 60 * 1000)) # collect: ms to wait for worker idle
 
 log()        { printf '  %s\n' "$*"; }
 plan()       { log "[dry-run] $*"; }
@@ -141,6 +153,126 @@ resolve_repo() {
   REPO="$(cd "$REPO" 2>/dev/null && pwd)" || { echo "no such repo dir: $REPO" >&2; exit 1; }
   git -C "$REPO" rev-parse --git-dir >/dev/null 2>&1 || { echo "not a git repo: $REPO" >&2; exit 1; }
   OV="$REPO/.m2herd/overview.json"
+}
+
+# Read-only settings.json helper. Missing file, invalid JSON, missing path,
+# null/empty, object/array, or jq failure all return the caller's default.
+settings_get() { # settings_get <jq-path> <default>
+  local path="$1" default="$2" sf="$REPO/.m2herd/settings.json" v
+  [ -f "$sf" ] || { printf '%s' "$default"; return 0; }
+  v="$(jq -er "$path // empty | select(type == \"string\" or type == \"number\")" "$sf" 2>/dev/null || true)"
+  [ -n "$v" ] || { printf '%s' "$default"; return 0; }
+  printf '%s' "$v"
+}
+
+valid_agent() {
+  case "$1" in claude|codex|cursor|opencode) return 0 ;; *) return 1 ;; esac
+}
+
+valid_runner() {
+  case "$1" in pane|headless) return 0 ;; *) return 1 ;; esac
+}
+
+positive_int_or_default() { # positive_int_or_default <value> <default>
+  case "$1" in ''|*[!0-9]*) printf '%s' "$2"; return 0 ;; esac
+  [ "$1" -gt 0 ] 2>/dev/null && printf '%s' "$1" || printf '%s' "$2"
+}
+
+settings_first_route() { # settings_first_route <slice> -> first matching routing object, or empty
+  local slice="$1" sf="$REPO/.m2herd/settings.json" r pat
+  [ -f "$sf" ] || return 0
+  jq -e . "$sf" >/dev/null 2>&1 || return 0
+  while IFS= read -r r; do
+    pat="$(printf '%s' "$r" | jq -r '.match // empty' 2>/dev/null || true)"
+    [ -n "$pat" ] || continue
+    case "$slice" in
+      $pat) printf '%s' "$r"; return 0 ;;
+    esac
+  done <<EOF
+$(jq -c '.routing[]? | objects' "$sf" 2>/dev/null || true)
+EOF
+  return 0
+}
+
+resolve_dispatch_settings() {
+  local route="" route_match="" route_agent="" route_model="" route_runner=""
+  local def_agent def_model def_runner base_setting max_raw wait_raw settle_raw wait_min
+
+  def_agent="$(settings_get '.workers.default_agent' "$BUILTIN_AGENT")"
+  valid_agent "$def_agent" || def_agent="$BUILTIN_AGENT"
+  def_model="$(settings_get '.workers.default_model' "")"
+  def_runner="$(settings_get '.workers.runner' "$BUILTIN_RUNNER")"
+  valid_runner "$def_runner" || def_runner="$BUILTIN_RUNNER"
+
+  if [ -n "$SLICE" ]; then
+    route="$(settings_first_route "$SLICE")"
+    if [ -n "$route" ]; then
+      route_match="$(printf '%s' "$route" | jq -r '.match // empty')"
+      route_agent="$(printf '%s' "$route" | jq -r '.agent // empty')"
+      route_model="$(printf '%s' "$route" | jq -r '.model // empty')"
+      route_runner="$(printf '%s' "$route" | jq -r '.runner // empty')"
+      valid_agent "$route_agent" || route_agent=""
+      valid_runner "$route_runner" || route_runner=""
+    fi
+  fi
+
+  if [ "$AGENT_EXPLICIT" -eq 1 ]; then
+    valid_agent "$AGENT" || { echo "invalid --agent '$AGENT' (expected claude|codex|cursor|opencode)" >&2; exit 2; }
+    AGENT_SOURCE="cli"
+  elif [ -n "$route_agent" ]; then
+    AGENT="$route_agent"; AGENT_SOURCE="routing: $route_match"
+  else
+    AGENT="$def_agent"; AGENT_SOURCE="workers.default_agent"
+  fi
+
+  if [ "$MODEL_EXPLICIT" -eq 1 ]; then
+    MODEL_SOURCE="cli"
+  elif [ -n "$route_model" ]; then
+    MODEL="$route_model"; MODEL_SOURCE="routing: $route_match"
+  else
+    MODEL="$def_model"; MODEL_SOURCE="workers.default_model"
+  fi
+
+  if [ "$RUNNER_EXPLICIT" -eq 1 ]; then
+    valid_runner "$RUNNER" || { echo "invalid --runner '$RUNNER' (expected pane|headless)" >&2; exit 2; }
+    RUNNER_SOURCE="cli"
+  elif [ -n "$route_runner" ]; then
+    RUNNER="$route_runner"; RUNNER_SOURCE="routing: $route_match"
+  else
+    RUNNER="$def_runner"; RUNNER_SOURCE="workers.runner"
+  fi
+  case "$RUNNER" in
+    headless) HEADLESS=1 ;;
+    pane) HEADLESS=0 ;;
+  esac
+
+  if [ "$BASE_EXPLICIT" -eq 0 ] && [ -z "$BASE" ]; then
+    base_setting="$(settings_get '.workers.base' "")"
+    [ -n "$base_setting" ] && BASE="$base_setting"
+  fi
+
+  settle_raw="$(settings_get '.workers.settle_seconds' "$BUILTIN_SETTLE_SECONDS")"
+  SUBMIT_SETTLE="$(positive_int_or_default "$settle_raw" "$BUILTIN_SETTLE_SECONDS")"
+  wait_raw="$(settings_get '.workers.wait_timeout_minutes' "$BUILTIN_WAIT_TIMEOUT_MINUTES")"
+  wait_min="$(positive_int_or_default "$wait_raw" "$BUILTIN_WAIT_TIMEOUT_MINUTES")"
+  WAIT_TIMEOUT=$((wait_min * 60 * 1000))
+
+  max_raw="$(settings_get '.workers.max_concurrent' "$BUILTIN_MAX_CONCURRENT")"
+  MAX_CONCURRENT="$(positive_int_or_default "$max_raw" "$BUILTIN_MAX_CONCURRENT")"
+}
+
+log_resolution() {
+  log "resolution: agent=$AGENT ($AGENT_SOURCE), runner=$RUNNER ($RUNNER_SOURCE), model=${MODEL:-<default>} ($MODEL_SOURCE)"
+  log "settings: settle_seconds=$SUBMIT_SETTLE, wait_timeout_minutes=$((WAIT_TIMEOUT / 60000)), max_concurrent=$MAX_CONCURRENT"
+}
+
+enforce_max_concurrent() {
+  local active=0
+  [ -f "$OV" ] && active="$(jq -r '[.workers[]? | select(.state == "spawned" or .state == "working")] | length' "$OV" 2>/dev/null || echo 0)"
+  if [ "${active:-0}" -ge "$MAX_CONCURRENT" ]; then
+    echo "max_concurrent=$MAX_CONCURRENT reached — collect or raise: m2herd config set workers.max_concurrent $((MAX_CONCURRENT + 1))" >&2
+    exit 1
+  fi
 }
 
 # Binding rule: identify the orchestrator's OWN pane BEFORE any send/close and
@@ -639,9 +771,16 @@ dispatch() {
   [ -n "$SLICE" ] || { echo "dispatch needs --slice S" >&2; exit 2; }
   validate_token slice "$SLICE"
   resolve_repo; resolve_self
+  resolve_dispatch_settings
   [ -n "$BASE" ] || BASE="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
   local branch="wip/m2herd-$SLICE" task="$REPO/.m2herd/dispatch/$SLICE.task.md"
+  if [ "$HEADLESS" -eq 1 ] && [ -z "$MODEL" ]; then
+    MODEL="sonnet"
+    MODEL_SOURCE="headless default"
+  fi
   log "dispatch: slice=$SLICE repo=$REPO base=$BASE agent=$AGENT (self pane: ${SELF:-<unknown>})"
+  log_resolution
+  enforce_max_concurrent
 
   run_ensure || true
   run_append_slice "$SLICE" || true
@@ -659,7 +798,6 @@ dispatch() {
       claude|codex|opencode) : ;;
       *) echo "--headless supports --agent claude|codex|opencode (cursor has no headless mode)" >&2; exit 2 ;;
     esac
-    [ -n "$MODEL" ] || MODEL="sonnet"   # cheap hands by default; Fable stays the judge
   fi
 
   local av bin flag; av="$(worker_argv "$AGENT")"; bin="${av%%$'\t'*}"; flag="${av##*$'\t'}"
@@ -830,6 +968,7 @@ collect() {
   [ -n "$SLICE" ] || { echo "collect needs --slice S" >&2; exit 2; }
   validate_token slice "$SLICE"
   resolve_repo; resolve_self
+  resolve_dispatch_settings
   local out="$REPO/.m2herd/dispatch/$SLICE.out.md" pane
   if [ "$DRY_RUN" -eq 1 ]; then
     pane="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .pane_id // empty' "$OV" 2>/dev/null || true)"
