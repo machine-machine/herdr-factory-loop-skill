@@ -38,6 +38,7 @@
 #                                             #   workers, open questions, NOTES tail; tput colors on a tty, plain when piped; NEVER
 #                                             #   writes to the fabric. --watch: flicker-free repaint loop (home-cursor redraw, no
 #                                             #   clear) every N s (default 2), refreshing the self-update check every 10 min
+#   m2herd.sh config list|get|set [--dir P] ... # read/write .m2herd/settings.json with defaults + validation
 #   m2herd.sh self-update [--check]           # --check: fetch the engine repo, cache behind-count in ~/.cache/m2herd/update-status
 #                                             #   (dashboard renders it); no flag: ff-only pull of the engine repo (refuses dirty tree)
 #   m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync (+--check drift) → archive → gist → next; jq asserts
@@ -53,6 +54,7 @@ CMD="${1:-help}"; shift || true
 # show/apply/reject) is consumed here as EVOLVE_ACTION, same idiom as CMD itself.
 EVOLVE_ACTION=""
 if [ "$CMD" = "evolve" ]; then EVOLVE_ACTION="${1:-}"; shift || true; fi
+CONFIG_ACTION=""; CONFIG_PATH=""; CONFIG_VALUE=""
 DIR="$PWD"; GOAL=""; AREA=""; TEXT=""; CHECK=0; PUSH=0; WATCH=0; INTERVAL=2; RUN=""; ACK_REPO=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -66,7 +68,14 @@ while [ $# -gt 0 ]; do
     --run)   RUN="$2"; shift 2 ;;
     --ack-repo) ACK_REPO=1; shift ;;
     -h|--help) CMD="help"; shift ;;
-    *) if [ -z "$TEXT" ]; then TEXT="$1"; shift; else echo "unknown arg: $1" >&2; exit 2; fi ;;
+    *)
+      if [ "$CMD" = "config" ]; then
+        if [ -z "$CONFIG_ACTION" ]; then CONFIG_ACTION="$1"; shift
+        elif [ -z "$CONFIG_PATH" ]; then CONFIG_PATH="$1"; shift
+        elif [ -z "$CONFIG_VALUE" ]; then CONFIG_VALUE="$1"; shift
+        else echo "unknown arg: $1" >&2; exit 2; fi
+      elif [ -z "$TEXT" ]; then TEXT="$1"; shift
+      else echo "unknown arg: $1" >&2; exit 2; fi ;;
   esac
 done
 
@@ -75,6 +84,7 @@ MARKER='<!-- === M2HERD:LIVE === -->'
 ts()       { date -u +%Y-%m-%dT%H:%M:%SZ; }
 log()      { printf '  %s\n' "$*"; }
 OV()       { echo "$DIR/.m2herd/overview.json"; }
+SETTINGS(){ echo "$DIR/.m2herd/settings.json"; }
 # Resolve through symlinks ($0 may be ~/.local/bin/m2herd → scripts/m2herd.sh);
 # macOS has no readlink -f, so walk the link chain by hand.
 self_path() {
@@ -112,6 +122,77 @@ ov_put_locked() {
   local ov tmp; ov="$(OV)"
   tmp="$(mktemp "$(dirname "$ov")/.overview.XXXXXX")"
   if jq "$@" "$ov" > "$tmp"; then mv "$tmp" "$ov"; else rm -f "$tmp"; return 1; fi
+}
+
+settings_defaults_json() {
+  jq -n '{
+    schema_version: 1,
+    _doc: ".m2herd/context/settings-ux/context.md",
+    orchestrator: {agent: "claude", runner: "pane"},
+    workers: {agent: "claude", runner: "pane", max: 3},
+    routing: []
+  }'
+}
+
+# settings_get <jq-path> <default>
+# Internal primitive for shell callers: absent file/field or invalid JSON returns
+# the caller default and never terminates the process.
+settings_get() {
+  local path="${1:?settings_get needs a jq path}" default="${2:-}" f
+  f="$(SETTINGS)"
+  if [ ! -f "$f" ]; then printf '%s\n' "$default"; return 0; fi
+  jq -er --arg default "$default" "$path // \$default" "$f" 2>/dev/null || printf '%s\n' "$default"
+}
+
+settings_effective_json() {
+  local f; f="$(SETTINGS)"
+  if [ -f "$f" ] && jq -e 'type=="object"' "$f" >/dev/null 2>&1; then
+    jq -s '
+      .[0] as $d | .[1] as $u
+      | $d
+      | .schema_version = ($u.schema_version // $d.schema_version)
+      | ._doc = ($u._doc // $d._doc)
+      | .orchestrator = ($d.orchestrator * ($u.orchestrator // {}))
+      | .workers = ($d.workers * ($u.workers // {}))
+      | .routing = ($u.routing // $d.routing)
+    ' <(settings_defaults_json) "$f"
+  else
+    settings_defaults_json
+  fi
+}
+
+settings_validate_agent() {
+  case "$2" in claude|codex|cursor|opencode) return 0 ;; esac
+  echo "config set: $1 must be one of: claude, codex, cursor, opencode" >&2; exit 2
+}
+settings_validate_runner() {
+  case "$2" in pane|headless) return 0 ;; esac
+  echo "config set: $1 must be one of: pane, headless" >&2; exit 2
+}
+settings_validate_nonneg() {
+  jq -en --argjson n "$2" '$n | (type=="number") and (. >= 0)' >/dev/null 2>&1 \
+    || { echo "config set: $1 must be numeric and >= 0" >&2; exit 2; }
+}
+settings_validate_routing() {
+  jq -e '
+    type=="array" and all(.[]; type=="object"
+      and ((.pattern // "") | type=="string" and length > 0)
+      and (.agent | IN("claude","codex","cursor","opencode")))
+  ' >/dev/null 2>&1 || { echo "config set: routing must be a JSON array of {pattern, agent} rules" >&2; exit 2; }
+}
+
+settings_jq_path() {
+  case "$1" in
+    schema_version) echo '.schema_version' ;;
+    _doc) echo '._doc' ;;
+    orchestrator.agent) echo '.orchestrator.agent' ;;
+    orchestrator.runner) echo '.orchestrator.runner' ;;
+    workers.agent) echo '.workers.agent' ;;
+    workers.runner) echo '.workers.runner' ;;
+    workers.max) echo '.workers.max' ;;
+    routing) echo '.routing' ;;
+    *) echo "unknown config path: $1" >&2; exit 2 ;;
+  esac
 }
 
 live_tail() { awk -v m="$MARKER" 'p{print} index($0,m){p=1}' "$1"; }   # content below the marker
@@ -179,6 +260,7 @@ init() {
   [ -f "$m2/evolver/README.md" ]  || cp "$tmpl/evolver/README.md"  "$m2/evolver/README.md"  2>/dev/null || true
   [ -f "$m2/evolver/LESSONS.md" ] || cp "$tmpl/evolver/LESSONS.md" "$m2/evolver/LESSONS.md" 2>/dev/null || true
   [ -f "$m2/runs/README.md" ]     || cp "$tmpl/runs/README.md"     "$m2/runs/README.md"     2>/dev/null || true
+  [ -f "$m2/settings.json" ]       || cp "$tmpl/settings.json"      "$m2/settings.json"      2>/dev/null || settings_defaults_json > "$m2/settings.json"
   if [ ! -f "$m2/overview.json" ]; then
     local tmp; tmp="$(mktemp "$m2/.overview.XXXXXX")"
     if jq --arg g "$GOAL" --arg ts "$(ts)" '.goal=$g | .updated_at=$ts' "$tmpl/overview.json" > "$tmp"
@@ -364,6 +446,69 @@ status_cmd() {
     ((.workers//[])[] | "  - " + .slice + "  [" + (.state//"?") + "]  pane=" + (.pane_id//"-") + "  branch=" + (.branch//"-")),
     (if (arch|length)>0 then "archived: " + (arch|map(.name)|join(", ")) else empty end)
   ' "$(OV)"
+}
+
+# ---------- config: .m2herd/settings.json -----------------------------------
+config_list() {
+  local eff
+  eff="$(settings_effective_json)"
+  jq -r --argjson d "$(settings_defaults_json)" '
+    def mark($p; $v): if $v != ($d | getpath($p)) then "* " else "  " end;
+    (mark(["schema_version"]; .schema_version) + "schema_version=" + (.schema_version|tostring)),
+    (mark(["orchestrator","agent"]; .orchestrator.agent) + "orchestrator.agent=" + .orchestrator.agent),
+    (mark(["orchestrator","runner"]; .orchestrator.runner) + "orchestrator.runner=" + .orchestrator.runner),
+    (mark(["workers","agent"]; .workers.agent) + "workers.agent=" + .workers.agent),
+    (mark(["workers","runner"]; .workers.runner) + "workers.runner=" + .workers.runner),
+    (mark(["workers","max"]; .workers.max) + "workers.max=" + (.workers.max|tostring)),
+    (mark(["routing"]; .routing) + "routing=" + (.routing|tojson))
+  ' <<<"$eff"
+}
+
+config_get() {
+  [ -n "$CONFIG_PATH" ] || { echo "usage: m2herd.sh config get <dotted.path> [--dir P]" >&2; exit 2; }
+  local filter; filter="$(settings_jq_path "$CONFIG_PATH")"
+  settings_effective_json | jq -cr "$filter"
+}
+
+settings_set_locked() {
+  local key="$1" value="$2" f tmp eff
+  f="$(SETTINGS)"
+  mkdir -p "$(dirname "$f")"
+  case "$key" in
+    orchestrator.agent|workers.agent) settings_validate_agent "$key" "$value" ;;
+    orchestrator.runner|workers.runner) settings_validate_runner "$key" "$value" ;;
+    workers.max) settings_validate_nonneg "$key" "$value" ;;
+    routing) printf '%s' "$value" | settings_validate_routing ;;
+    *) echo "unknown or read-only config path: $key" >&2; exit 2 ;;
+  esac
+  eff="$(settings_effective_json)"
+  tmp="$(mktemp "$(dirname "$f")/.settings.json.XXXXXX")"
+  case "$key" in
+    orchestrator.agent)  jq --arg v "$value" '.orchestrator.agent=$v' <<<"$eff" > "$tmp" ;;
+    orchestrator.runner) jq --arg v "$value" '.orchestrator.runner=$v' <<<"$eff" > "$tmp" ;;
+    workers.agent)       jq --arg v "$value" '.workers.agent=$v' <<<"$eff" > "$tmp" ;;
+    workers.runner)      jq --arg v "$value" '.workers.runner=$v' <<<"$eff" > "$tmp" ;;
+    workers.max)         jq --argjson v "$value" '.workers.max=$v' <<<"$eff" > "$tmp" ;;
+    routing)             jq --argjson v "$value" '.routing=$v' <<<"$eff" > "$tmp" ;;
+  esac
+  if jq '.' "$tmp" > "$tmp.pretty"; then mv "$tmp.pretty" "$tmp"; else rm -f "$tmp" "$tmp.pretty"; return 1; fi
+  mv "$tmp" "$f"
+}
+
+config_set() {
+  [ -n "$CONFIG_PATH" ] && [ -n "$CONFIG_VALUE" ] \
+    || { echo "usage: m2herd.sh config set <dotted.path> <value> [--dir P]" >&2; exit 2; }
+  with_lock "$(SETTINGS).lock" settings_set_locked "$CONFIG_PATH" "$CONFIG_VALUE"
+}
+
+config_cmd() {
+  resolve_dir; need_init
+  case "${CONFIG_ACTION:-}" in
+    list) config_list ;;
+    get)  config_get ;;
+    set)  config_set ;;
+    *) echo "usage: m2herd.sh config {list|get|set} ... [--dir P]" >&2; exit 2 ;;
+  esac
 }
 
 # ---------- resume -----------------------------------------------------------
@@ -561,6 +706,13 @@ budget_row() {
   printf 'budget:    %s %s%% of %s · updated %s ago\n' "$bar" "$pct" "$budget" "$(age_secs "$best")"
 }
 
+settings_row() {
+  [ -f "$(SETTINGS)" ] || return 0
+  settings_effective_json | jq -r '"settings: workers=" + .workers.agent + "/" + .workers.runner
+    + " max=" + (.workers.max|tostring)
+    + " rules=" + ((.routing//[])|length|tostring)'
+}
+
 # plain (uncolored) blocks so the side-by-side column merge pads correctly
 render_areas() {
   local names n astatus rel aage
@@ -721,6 +873,7 @@ dashboard() {
   printf '%sgoal:%s      %s\n' "$D" "$R" "$goal"
   printf '%sdone_when:%s %s\n' "$D" "$R" "$dw"
   budget_row
+  settings_row | while IFS= read -r line; do [ -n "$line" ] && printf '%s%s%s\n' "$D" "$line" "$R"; done
   update_row "$Y" "$R"
   echo
   # the self-prompt (same code path as `next`) — bold magenta prefix
@@ -1009,7 +1162,7 @@ selftest() {
   # tmpdir fixtures have no machineroom; suppress the room nudge so the other
   # next-cases stay assertable (the room case is verified live, not here).
   export M2HERD_SKIP_ROOM_CHECK=1
-  local self ov rc
+  local self ov rc lp1 lp2
   self="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
   # td/td2/td3 stay global (NOT local): the EXIT trap fires after this function
   # returns, so locals would already be gone — all three are registered here
@@ -1044,6 +1197,28 @@ selftest() {
   fi
   grep -qxF '.m2herd/' "$td/.gitignore" || fail ".m2herd/ not gitignored"
   [ -f "$td/.m2herd/inbox/STEER.md" ] || fail "init did not scaffold inbox/STEER.md"
+  [ -f "$td/.m2herd/settings.json" ] || fail "init did not seed settings.json"
+
+  # config: defaults, get/set round-trip, validation, missing-file fallback, JSON routing, locked writers
+  [ "$("$self" config get workers.agent --dir "$td")" = "claude" ] || fail "config get: default workers.agent"
+  rm -f "$td/.m2herd/settings.json"
+  [ "$("$self" config get workers.max --dir "$td")" = "3" ] || fail "config get: missing settings.json should return defaults"
+  printf '{not json\n' > "$td/.m2herd/settings.json"
+  [ "$("$self" config get workers.agent --dir "$td")" = "claude" ] || fail "config get: invalid settings.json should return defaults"
+  step config set workers.agent codex --dir "$td"
+  [ "$("$self" config get workers.agent --dir "$td")" = "codex" ] || fail "config set/get workers.agent round-trip"
+  "$self" config list --dir "$td" | grep -q '^\* workers.agent=codex$' || fail "config list did not mark non-default workers.agent"
+  rc=0; "$self" config set workers.agent bogus --dir "$td" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] || fail "config set invalid enum exited $rc (want 2)"
+  step config set workers.max 5 --dir "$td"
+  step config set routing '[{"pattern":"*.go","agent":"codex"},{"pattern":"docs/**","agent":"claude"}]' --dir "$td"
+  [ "$("$self" config get routing --dir "$td" | jq 'length')" = "2" ] || fail "config set/get routing JSON array"
+  "$self" config set orchestrator.agent cursor --dir "$td" >/dev/null 2>&1 & lp1=$!
+  "$self" config set workers.runner headless --dir "$td" >/dev/null 2>&1 & lp2=$!
+  wait "$lp1" || fail "concurrent config writer A exited non-zero"
+  wait "$lp2" || fail "concurrent config writer B exited non-zero"
+  [ "$("$self" config get orchestrator.agent --dir "$td")" = "cursor" ] || fail "concurrent config set lost orchestrator.agent"
+  [ "$("$self" config get workers.runner --dir "$td")" = "headless" ] || fail "concurrent config set lost workers.runner"
 
   # next STEER case: live steering outranks coach-intent (done_when is still empty here)
   printf 'PAUSE everything please\n' >> "$td/.m2herd/inbox/STEER.md"
@@ -1117,10 +1292,10 @@ selftest() {
   printf '%s\n' "$dash" | grep -q '^  demo .*active' || fail "dashboard missing the active area row"
   printf '%s\n' "$dash" | grep -q 'extra .*archived' || fail "dashboard missing the archived area row"
   printf '%s\n' "$dash" | grep -q '^m2herd · .* · drift' || fail "dashboard missing the boxed header line"
+  printf '%s\n' "$dash" | grep -q '^settings: workers=codex/headless max=5 rules=2$' || fail "dashboard missing settings summary line"
   printf '%s\n' "$dash" | grep -q '^read-only · steering: .m2herd/inbox/STEER.md$' || fail "dashboard missing the footer"
 
   # locking: two concurrent overview.json writers must BOTH land (flock convention)
-  local lp1 lp2
   "$self" refile --dir "$td" --area lockA >/dev/null 2>&1 & lp1=$!
   "$self" refile --dir "$td" --area lockB >/dev/null 2>&1 & lp2=$!
   wait "$lp1" || fail "concurrent writer A (refile lockA) exited non-zero"
@@ -1229,6 +1404,7 @@ case "$CMD" in
   archive)  archive ;;
   gist)     gist_cmd ;;
   next)      next_cmd ;;
+  config)   config_cmd ;;
   evolve)
     case "$EVOLVE_ACTION" in
       analyze)   evolve_analyze ;;
