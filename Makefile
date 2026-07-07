@@ -1,19 +1,30 @@
-HOST_GOOS  := $(shell go env GOOS)
-HOST_GOARCH:= $(shell go env GOARCH)
+HOST_GOOS  := $(shell go env GOOS 2>/dev/null)
+HOST_GOARCH:= $(shell go env GOARCH 2>/dev/null)
 LDFLAGS    := -s -w
-TARGETS    := darwin-arm64 linux-amd64 linux-arm64
+TARGETS    := darwin-amd64 darwin-arm64 linux-amd64 linux-arm64
 
-.PHONY: tui tui-release
+.PHONY: tui tui-release check-go lint test
+
+check-go:
+	@command -v go >/dev/null 2>&1 || { echo "error: go not found on PATH — install Go (https://go.dev/dl/) to build the TUI"; exit 1; }
 
 # host build — quick iteration loop
-tui:
+tui: check-go
 	mkdir -p prebuilt
-	go -C tui build -o ../prebuilt/m2herd-tui-$(HOST_GOOS)-$(HOST_GOARCH) .
+	go build -C tui -o ../prebuilt/m2herd-tui-$(HOST_GOOS)-$(HOST_GOARCH) .
 
 # cross-compiled release set + a copy of the host build for immediate use
-tui-release:
+tui-release: check-go
 	mkdir -p prebuilt
-	$(foreach t,$(TARGETS), \
-		GOOS=$(word 1,$(subst -, ,$(t))) GOARCH=$(word 2,$(subst -, ,$(t))) CGO_ENABLED=0 \
-			go -C tui build -ldflags "$(LDFLAGS)" -o ../prebuilt/m2herd-tui-$(t) . ;)
-	CGO_ENABLED=0 go -C tui build -ldflags "$(LDFLAGS)" -o ../prebuilt/m2herd-tui-$(HOST_GOOS)-$(HOST_GOARCH) .
+	set -e; for t in $(TARGETS); do \
+		echo "building m2herd-tui-$$t"; \
+		GOOS=$${t%-*} GOARCH=$${t#*-} CGO_ENABLED=0 \
+			go build -C tui -ldflags "$(LDFLAGS)" -o ../prebuilt/m2herd-tui-$$t . ; \
+	done
+	CGO_ENABLED=0 go build -C tui -ldflags "$(LDFLAGS)" -o ../prebuilt/m2herd-tui-$(HOST_GOOS)-$(HOST_GOARCH) .
+
+lint:
+	bash scripts/lint.sh
+
+test:
+	bash scripts/m2herd.sh selftest

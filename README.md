@@ -24,9 +24,14 @@ manage agent integrations.
 # pulls the latest version, symlinks the skill + hooks, and puts m2herd / m2herd-up / m2herd-tui on PATH
 curl -sSL https://raw.githubusercontent.com/machine-machine/herdr-factory-loop-skill/main/scripts/install.sh | bash
 
-# set up the whole factory: orchestrator choice + spec-kit + SDD loop
-./scripts/onboard.sh
+# the installer keeps its clone at ~/.cache/herdr-factory-loop-skill — run
+# onboarding from there to set up the whole factory (orchestrator choice +
+# spec-kit + SDD loop):
+bash ~/.cache/herdr-factory-loop-skill/scripts/onboard.sh
 ```
+
+(Working from a git checkout instead? `./scripts/install.sh` auto-detects the
+checkout and installs from it, and `./scripts/onboard.sh` works in place.)
 
 ## Typical command flow
 
