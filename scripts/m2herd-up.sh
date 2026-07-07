@@ -21,8 +21,16 @@
 #                                                   #   in the worktree via nohup; log → dispatch/S.log, stderr → dispatch/S.stderr.log,
 #                                                   #   answer → dispatch/S.out.md;
 #                                                   #   usage (tokens/cost) parsed into workers[] at collect. Cheap hands, Fable judgment.
-#   m2herd-up.sh collect  --slice S [--repo P]      # wait idle (pane) / exited (headless pid), keep/copy report to dispatch/S.out.md,
-#                                                   # update workers[] state (+tokens/cost for headless)
+#   m2herd-up.sh collect  --slice S [--repo P] [--no-verify]
+#                                                   # wait idle (pane) / exited (headless pid), keep/copy report to dispatch/S.out.md,
+#                                                   # update workers[] state (+tokens/cost for headless). Then the VERIFY GATE runs an
+#                                                   #   INDEPENDENT check in the worker's worktree (workers have fabricated "ALL_OK"
+#                                                   #   claims before — never trust the report alone): command = task-file `verify:`
+#                                                   #   line > settings workers.verify_cmd > `bash scripts/lint.sh` when that file
+#                                                   #   exists in the worktree; bounded (timeout 300s); output →
+#                                                   #   runs/<run>/slices/S/verify.log; verified true|false + verify_cmd recorded in
+#                                                   #   status.json; on fail the slice is FAILED (+ failures.json entry).
+#                                                   #   --no-verify skips the gate (logged loudly).
 #   m2herd-up.sh down     [--slice S | --all] [--repo P] [--force]
 #                                                   # tear worker(s) down: close pane (never $SELF; unknown self = fail safe),
 #                                                   #   remove worktree (dirty ones only with --force), delete branch when merged
@@ -31,8 +39,12 @@
 #   m2herd-up.sh --dry-run <same args>              # print every herdr/git command instead of running it
 #
 # Settings: .m2herd/settings.json is read-only config here; missing/invalid
-# values fall back to built-ins. routing[].match uses bash `case "$slice" in
-# $pattern)` glob semantics, and the first matching routing rule wins.
+# values fall back to built-ins. Keys follow the settled engine schema
+# (m2herd.sh config): workers.agent, workers.max, workers.model, workers.base,
+# workers.runner, workers.settle_seconds, workers.wait_timeout_minutes,
+# workers.verify_cmd. routing[].pattern uses bash `case "$slice" in $pattern)`
+# glob semantics (optional agent/runner/model per rule), and the first matching
+# routing rule wins. Precedence: CLI flag > routing > workers defaults.
 #
 # Binding herdr rules (from CONTRACT-m2herd.md): identify $SELF first and never
 # touch it; after `agent start` RE-RESOLVE the pane by cwd from `herdr agent list`
@@ -58,7 +70,7 @@ DRY_RUN=0
 while [ "${1:-}" = "--dry-run" ]; do DRY_RUN=1; shift; done
 CMD="${1:-help}"; shift || true
 REPO=""; GOAL=""; SLICE=""; BASE=""; AGENT=""; HEADLESS=0; MODEL=""; RUNNER=""; ROOM_ONLY=0
-ALL=0; FORCE=0
+ALL=0; FORCE=0; NO_VERIFY=0
 BASE_EXPLICIT=0; AGENT_EXPLICIT=0; MODEL_EXPLICIT=0; RUNNER_EXPLICIT=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -72,6 +84,7 @@ while [ $# -gt 0 ]; do
     --room-only) ROOM_ONLY=1; shift ;;
     --all) ALL=1; shift ;;
     --force) FORCE=1; shift ;;
+    --no-verify) NO_VERIFY=1; shift ;;
     --model) MODEL="$2"; MODEL_EXPLICIT=1; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) CMD="help"; shift ;;
@@ -183,7 +196,7 @@ settings_first_route() { # settings_first_route <slice> -> first matching routin
   [ -f "$sf" ] || return 0
   jq -e . "$sf" >/dev/null 2>&1 || return 0
   while IFS= read -r r; do
-    pat="$(printf '%s' "$r" | jq -r '.match // empty' 2>/dev/null || true)"
+    pat="$(printf '%s' "$r" | jq -r '.pattern // empty' 2>/dev/null || true)"
     [ -n "$pat" ] || continue
     case "$slice" in
       $pat) printf '%s' "$r"; return 0 ;;
@@ -195,19 +208,19 @@ EOF
 }
 
 resolve_dispatch_settings() {
-  local route="" route_match="" route_agent="" route_model="" route_runner=""
+  local route="" route_pattern="" route_agent="" route_model="" route_runner=""
   local def_agent def_model def_runner base_setting max_raw wait_raw settle_raw wait_min
 
-  def_agent="$(settings_get '.workers.default_agent' "$BUILTIN_AGENT")"
+  def_agent="$(settings_get '.workers.agent' "$BUILTIN_AGENT")"
   valid_agent "$def_agent" || def_agent="$BUILTIN_AGENT"
-  def_model="$(settings_get '.workers.default_model' "")"
+  def_model="$(settings_get '.workers.model' "")"
   def_runner="$(settings_get '.workers.runner' "$BUILTIN_RUNNER")"
   valid_runner "$def_runner" || def_runner="$BUILTIN_RUNNER"
 
   if [ -n "$SLICE" ]; then
     route="$(settings_first_route "$SLICE")"
     if [ -n "$route" ]; then
-      route_match="$(printf '%s' "$route" | jq -r '.match // empty')"
+      route_pattern="$(printf '%s' "$route" | jq -r '.pattern // empty')"
       route_agent="$(printf '%s' "$route" | jq -r '.agent // empty')"
       route_model="$(printf '%s' "$route" | jq -r '.model // empty')"
       route_runner="$(printf '%s' "$route" | jq -r '.runner // empty')"
@@ -220,24 +233,24 @@ resolve_dispatch_settings() {
     valid_agent "$AGENT" || { echo "invalid --agent '$AGENT' (expected claude|codex|cursor|opencode)" >&2; exit 2; }
     AGENT_SOURCE="cli"
   elif [ -n "$route_agent" ]; then
-    AGENT="$route_agent"; AGENT_SOURCE="routing: $route_match"
+    AGENT="$route_agent"; AGENT_SOURCE="routing: $route_pattern"
   else
-    AGENT="$def_agent"; AGENT_SOURCE="workers.default_agent"
+    AGENT="$def_agent"; AGENT_SOURCE="workers.agent"
   fi
 
   if [ "$MODEL_EXPLICIT" -eq 1 ]; then
     MODEL_SOURCE="cli"
   elif [ -n "$route_model" ]; then
-    MODEL="$route_model"; MODEL_SOURCE="routing: $route_match"
+    MODEL="$route_model"; MODEL_SOURCE="routing: $route_pattern"
   else
-    MODEL="$def_model"; MODEL_SOURCE="workers.default_model"
+    MODEL="$def_model"; MODEL_SOURCE="workers.model"
   fi
 
   if [ "$RUNNER_EXPLICIT" -eq 1 ]; then
     valid_runner "$RUNNER" || { echo "invalid --runner '$RUNNER' (expected pane|headless)" >&2; exit 2; }
     RUNNER_SOURCE="cli"
   elif [ -n "$route_runner" ]; then
-    RUNNER="$route_runner"; RUNNER_SOURCE="routing: $route_match"
+    RUNNER="$route_runner"; RUNNER_SOURCE="routing: $route_pattern"
   else
     RUNNER="$def_runner"; RUNNER_SOURCE="workers.runner"
   fi
@@ -257,20 +270,20 @@ resolve_dispatch_settings() {
   wait_min="$(positive_int_or_default "$wait_raw" "$BUILTIN_WAIT_TIMEOUT_MINUTES")"
   WAIT_TIMEOUT=$((wait_min * 60 * 1000))
 
-  max_raw="$(settings_get '.workers.max_concurrent' "$BUILTIN_MAX_CONCURRENT")"
+  max_raw="$(settings_get '.workers.max' "$BUILTIN_MAX_CONCURRENT")"
   MAX_CONCURRENT="$(positive_int_or_default "$max_raw" "$BUILTIN_MAX_CONCURRENT")"
 }
 
 log_resolution() {
   log "resolution: agent=$AGENT ($AGENT_SOURCE), runner=$RUNNER ($RUNNER_SOURCE), model=${MODEL:-<default>} ($MODEL_SOURCE)"
-  log "settings: settle_seconds=$SUBMIT_SETTLE, wait_timeout_minutes=$((WAIT_TIMEOUT / 60000)), max_concurrent=$MAX_CONCURRENT"
+  log "settings: settle_seconds=$SUBMIT_SETTLE, wait_timeout_minutes=$((WAIT_TIMEOUT / 60000)), max=$MAX_CONCURRENT"
 }
 
 enforce_max_concurrent() {
   local active=0
   [ -f "$OV" ] && active="$(jq -r '[.workers[]? | select(.state == "spawned" or .state == "working")] | length' "$OV" 2>/dev/null || echo 0)"
   if [ "${active:-0}" -ge "$MAX_CONCURRENT" ]; then
-    echo "max_concurrent=$MAX_CONCURRENT reached — collect or raise: m2herd config set workers.max_concurrent $((MAX_CONCURRENT + 1))" >&2
+    echo "workers.max=$MAX_CONCURRENT reached — collect or raise: m2herd config set workers.max $((MAX_CONCURRENT + 1))" >&2
     exit 1
   fi
 }
@@ -963,7 +976,115 @@ dispatch() {
   log "dispatch: done — $SLICE recorded in overview.json (state=spawned)"
 }
 
-# ---------- collect: wait idle, copy report, update state ----------------------
+# ---------- verify gate (collect) ----------------------------------------------
+# Independent verification AFTER the report lands and BEFORE any down: workers
+# have fabricated "go build/vet ALL_OK" with no go toolchain on the machine —
+# never trust the report alone. Command source, first hit wins:
+#   1. a literal `verify: <command>` line near the top of the slice's task file
+#   2. settings workers.verify_cmd
+#   3. `bash scripts/lint.sh` when scripts/lint.sh exists in the worktree
+verify_cmd_for_slice() { # verify_cmd_for_slice <slice> <wt> -> echoes command, or empty
+  local slice="$1" wt="$2" task="$REPO/.m2herd/dispatch/$slice.task.md" cmd=""
+  [ -f "$task" ] && cmd="$(head -20 "$task" | sed -n 's/^[Vv]erify:[[:space:]]*//p' | head -1)"
+  [ -n "$cmd" ] || cmd="$(settings_get '.workers.verify_cmd' "")"
+  if [ -z "$cmd" ] && [ -n "$wt" ] && [ -f "$wt/scripts/lint.sh" ]; then cmd="bash scripts/lint.sh"; fi
+  printf '%s' "$cmd"
+}
+
+# Run the verify command in the worker's worktree, bounded, output captured to
+# runs/<run>/slices/<slice>/verify.log (dispatch/<slice>.verify.log when no run
+# bundle exists). Returns the command's exit code; a missing worktree is a fail.
+run_verify_cmd() { # run_verify_cmd <slice> <wt> <cmd> -> exit code of <cmd>
+  local slice="$1" wt="$2" cmd="$3" rid vlog rc=0
+  rid="$(trace_find_run_for_slice "$slice")"
+  if [ -n "$rid" ] && mkdir -p "$REPO/.m2herd/runs/$rid/slices/$slice" 2>/dev/null; then
+    vlog="$REPO/.m2herd/runs/$rid/slices/$slice/verify.log"
+  else
+    trace_warn "no run bundle for $slice — verify.log falls back to dispatch/"
+    vlog="$REPO/.m2herd/dispatch/$slice.verify.log"
+  fi
+  VERIFY_LOG="$vlog"
+  if [ -z "$wt" ] || [ ! -d "$wt" ]; then
+    printf 'VERIFY FAILED: worktree %s is gone at collect time (%s) — cannot run: %s\n' \
+      "${wt:-<none recorded>}" "$(utc_now)" "$cmd" > "$vlog" 2>/dev/null || true
+    return 1
+  fi
+  log "collect: VERIFY GATE — running '$cmd' in $wt (timeout 300s) → $vlog"
+  if command -v timeout >/dev/null 2>&1; then
+    ( cd "$wt" && timeout 300 bash -c "$cmd" ) > "$vlog" 2>&1 || rc=$?
+  else
+    # stock macOS has no timeout(1) — run unbounded rather than not at all
+    ( cd "$wt" && bash -c "$cmd" ) > "$vlog" 2>&1 || rc=$?
+  fi
+  [ "$rc" -eq 124 ] && printf '\nVERIFY TIMEOUT: command exceeded 300s\n' >> "$vlog" 2>/dev/null
+  return "$rc"
+}
+
+# Record verified true|false + verify_cmd into the trace status.json (best-effort,
+# same idiom as the other trace writers).
+trace_set_verified() { # trace_set_verified <slice> <true|false> <cmd>
+  local slice="$1" v="$2" cmd="$3" rid sj tmp
+  rid="$(trace_find_run_for_slice "$slice")"
+  [ -n "$rid" ] || { trace_warn "no run bundle for $slice — verified flag not recorded"; return 1; }
+  sj="$REPO/.m2herd/runs/$rid/slices/$slice/status.json"
+  [ -f "$sj" ] || { trace_warn "no status.json at $sj — verified flag not recorded"; return 1; }
+  tmp="$(mktemp "$(dirname "$sj")/.status.json.tmp.XXXXXX")" || { trace_warn "mktemp for $sj failed"; return 1; }
+  jq --argjson v "$v" --arg c "$cmd" '.verified = $v | .verify_cmd = $c' "$sj" > "$tmp" 2>/dev/null \
+    && mv "$tmp" "$sj" || { rm -f "$tmp"; trace_warn "verified update to $sj failed"; return 1; }
+}
+
+# Append one failure entry to the slice's failures.json (the evolver reads
+# {kind, severity, where, evidence} — same shape m2herd.sh evolve analyze maps).
+trace_append_failure() { # trace_append_failure <slice> <kind> <evidence>
+  local slice="$1" kind="$2" evidence="$3" rid dir ff tmp
+  rid="$(trace_find_run_for_slice "$slice")"
+  [ -n "$rid" ] || { trace_warn "no run bundle for $slice — failures.json not written"; return 1; }
+  dir="$REPO/.m2herd/runs/$rid/slices/$slice"; ff="$dir/failures.json"
+  mkdir -p "$dir" 2>/dev/null || { trace_warn "mkdir $dir failed"; return 1; }
+  [ -s "$ff" ] || printf '[]' > "$ff"
+  tmp="$(mktemp "$dir/.failures.json.tmp.XXXXXX")" || { trace_warn "mktemp for $ff failed"; return 1; }
+  jq --arg k "$kind" --arg w "slice:$slice" --arg e "$evidence" --arg ts "$(utc_now)" \
+    '. + [{kind:$k, severity:"high", where:$w, evidence:$e, at:$ts}]' "$ff" > "$tmp" 2>/dev/null \
+    && mv "$tmp" "$ff" || { rm -f "$tmp"; trace_warn "append to $ff failed"; return 1; }
+}
+
+# Verify gate + final state for a collect whose report landed. Every successful
+# collect path funnels through here. On verify FAIL the slice is marked failed
+# in BOTH overview.json and the trace status.json and collect exits 1 — a report
+# that doesn't survive independent verification is not "done".
+finish_collect() { # finish_collect <slice> <wt> [tokens] [cost_usd]
+  local slice="$1" wt="$2" tok="${3:-}" cost="${4:-}" vcmd="" vrc=0
+  VERIFY_LOG=""
+  if [ "$NO_VERIFY" -eq 1 ]; then
+    log "!! verification SKIPPED for $slice (--no-verify)"
+    set_worker_state "$slice" "done"
+    trace_collect_write "$slice" "done" "$tok" "$cost" || true
+    return 0
+  fi
+  vcmd="$(verify_cmd_for_slice "$slice" "$wt")"
+  if [ -z "$vcmd" ]; then
+    log "!! verification SKIPPED for $slice — no verify command (no task 'verify:' line, no workers.verify_cmd, no scripts/lint.sh in worktree)"
+    set_worker_state "$slice" "done"
+    trace_collect_write "$slice" "done" "$tok" "$cost" || true
+    return 0
+  fi
+  run_verify_cmd "$slice" "$wt" "$vcmd" || vrc=$?
+  if [ "$vrc" -eq 0 ]; then
+    set_worker_state "$slice" "done"
+    trace_collect_write "$slice" "done" "$tok" "$cost" || true
+    trace_set_verified "$slice" true "$vcmd" || true
+    log "collect: verify PASSED for $slice ('$vcmd')"
+    return 0
+  fi
+  echo "!! VERIFY FAILED for $slice: '$vcmd' exited $vrc — report landed but the slice is FAILED; see ${VERIFY_LOG:-verify.log}" >&2
+  set_worker_state "$slice" "failed"
+  trace_collect_write "$slice" "failed" "$tok" "$cost" || true
+  trace_set_verified "$slice" false "$vcmd" || true
+  trace_append_failure "$slice" "verify_failed" "verify command '$vcmd' exited $vrc in ${wt:-<no worktree>} (see verify.log)" || true
+  exit 1
+}
+
+# ---------- collect: wait idle, copy report, verify, update state ---------------
 collect() {
   [ -n "$SLICE" ] || { echo "collect needs --slice S" >&2; exit 2; }
   validate_token slice "$SLICE"
@@ -975,6 +1096,13 @@ collect() {
     pane="${pane:-PANE-DRYRUN}"
     plan "herdr agent wait '$pane' --status idle --timeout $WAIT_TIMEOUT"
     plan "herdr agent read '$pane' --source recent-unwrapped --lines 300  # → $out (unless worker already wrote it)"
+    if [ "$NO_VERIFY" -eq 1 ]; then
+      plan "verification SKIPPED (--no-verify)"
+    else
+      plan "VERIFY GATE: cmd = task 'verify:' line > workers.verify_cmd > 'bash scripts/lint.sh' (when present in worktree);"
+      plan "  run in the worker's worktree (timeout 300s) → runs/<run>/slices/$SLICE/verify.log;"
+      plan "  record verified true|false + verify_cmd in status.json; on fail: failures.json entry + state=failed"
+    fi
     set_worker_state "$SLICE" "done"
     trace_collect_write "$SLICE" "done" "" ""
     log "collect: dry-run plan complete for $SLICE"
@@ -982,8 +1110,9 @@ collect() {
   fi
 
   [ -f "$OV" ] || { echo "no overview.json at $OV" >&2; exit 1; }
-  local wmode wpid
+  local wmode wpid wwt
   wmode="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .mode // "tui"' "$OV")"
+  wwt="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .worktree // empty' "$OV")"
 
   # HEADLESS collect: wait for the pid to exit — but only after proving it is
   # still OUR worker (start-time recorded at dispatch; a recycled pid must not
@@ -1043,9 +1172,8 @@ collect() {
       tok="$(jq -r '[.modelUsage[]?.outputTokens] | add // empty' "$lg" 2>/dev/null || true)"
       cost="$(jq -r '[.modelUsage[]?.costUSD] | add // empty' "$lg" 2>/dev/null || true)"
     fi
-    set_worker_state "$SLICE" "done"
     set_worker_usage "$SLICE" "${tok:-}" "${cost:-}"
-    trace_collect_write "$SLICE" "done" "${tok:-}" "${cost:-}" || true
+    finish_collect "$SLICE" "$wwt" "${tok:-}" "${cost:-}"
     log "collect: done — $SLICE headless state=done${tok:+, ${tok} out-tokens}${cost:+, \$${cost}}, report at $out"
     return 0
   fi
@@ -1063,8 +1191,7 @@ collect() {
   if [ -n "$known_panes" ] && ! printf '%s\n' "$known_panes" | grep -qxF "$pane"; then
     if [ -s "$out" ]; then
       log "pane $pane is gone but the worker already wrote $out — keeping it"
-      set_worker_state "$SLICE" "done"
-      trace_collect_write "$SLICE" "done" "" "" || true
+      finish_collect "$SLICE" "$wwt"
       log "collect: done — $SLICE state=done (pane closed after writing its report)"
       return 0
     fi
@@ -1099,8 +1226,7 @@ collect() {
   # State honesty: an empty report is a FAILED collect — say so in BOTH
   # overview.json and the trace status.json, never a hollow "done".
   if [ -s "$out" ]; then
-    set_worker_state "$SLICE" "done"
-    trace_collect_write "$SLICE" "done" "" "" || true
+    finish_collect "$SLICE" "$wwt"
     log "collect: done — $SLICE state=done, report at $out"
   else
     echo "worker $SLICE went idle but produced no report ($out empty)" >&2
@@ -1121,16 +1247,52 @@ down_one() { # down_one <slice> -> 0 ok, 1 something refused/failed
   wt="$(printf '%s' "$w" | jq -r '.worktree // empty')"
   branch="$(printf '%s' "$w" | jq -r '.branch // empty')"
 
-  # 1. pane — never $SELF; unknown $SELF counts as "could be me" (fail safe)
-  if [ -n "$pane" ] && [ "$pane" != "-" ]; then
-    if maybe_self "$pane"; then
-      log "down: NOT closing pane $pane (is or could be \$SELF) — close it by hand"
+  # 1. pane — resolve LIVE by the worktree cwd first (observed: down left 8 of 9
+  #    panes open — the pane_id recorded at dispatch goes stale, and the old
+  #    `|| true`d close swallowed every failure). The worktree path is unique,
+  #    so an agent-list/pane-list cwd match is authoritative; the recorded
+  #    pane_id is only the fallback. Check the close RESULT and report
+  #    closed / not-found / FAILED per pane. Never $SELF; unknown $SELF counts
+  #    as "could be me" (fail safe).
+  local mode live_pane="" target="" known
+  mode="$(printf '%s' "$w" | jq -r '.mode // "tui"')"
+  if [ "$mode" != "headless" ] && [ -n "$wt" ]; then
+    live_pane="$(herdr agent list 2>/dev/null | jq -r --arg c "$wt" \
+      '[.result.agents[]? | select(.cwd==$c)] | last | .pane_id // empty' 2>/dev/null || true)"
+    [ -n "$live_pane" ] || live_pane="$(herdr pane list 2>/dev/null | jq -r --arg c "$wt" \
+      '[.result.panes[]? | select(.cwd==$c)] | last | .pane_id // empty' 2>/dev/null || true)"
+  fi
+  target="$live_pane"
+  if [ -z "$target" ] && [ -n "$pane" ] && [ "$pane" != "-" ]; then target="$pane"; fi
+  if [ -n "$live_pane" ] && [ -n "$pane" ] && [ "$pane" != "-" ] && [ "$live_pane" != "$pane" ]; then
+    log "down: recorded pane_id $pane is stale — live pane for $wt is $live_pane (closing that)"
+  fi
+  if [ -n "$target" ]; then
+    if maybe_self "$target"; then
+      log "down: NOT closing pane $target (is or could be \$SELF) — close it by hand"
     elif [ "$DRY_RUN" -eq 1 ]; then
-      plan "herdr pane close '$pane'"
+      plan "herdr pane close '$target'   # ${live_pane:+resolved live by cwd $wt; }recorded=$pane; verify it left 'herdr pane list'"
     else
-      herdr pane close "$pane" >/dev/null 2>&1 || true   # already-gone is fine
-      log "down: pane $pane closed (or already gone)"
+      known="$(herdr pane list 2>/dev/null | jq -r '.result.panes[]?.pane_id' 2>/dev/null || true)"
+      if [ -n "$known" ] && ! printf '%s\n' "$known" | grep -qxF "$target"; then
+        log "down: pane $target not-found (already gone)"
+      elif herdr pane close "$target" >/dev/null 2>&1; then
+        # trust but verify: the close used to be || true'd and panes survived
+        sleep 1
+        known="$(herdr pane list 2>/dev/null | jq -r '.result.panes[]?.pane_id' 2>/dev/null || true)"
+        if [ -n "$known" ] && printf '%s\n' "$known" | grep -qxF "$target"; then
+          log "! down: pane close reported ok but $target is STILL LISTED — close it by hand"; rc=1
+        else
+          log "down: pane $target closed"
+        fi
+      else
+        log "! down: pane close FAILED for $target — close it by hand"; rc=1
+      fi
     fi
+  elif [ "$mode" = "headless" ]; then
+    : # headless worker — no pane to close
+  else
+    log "down: no pane resolved for $s (recorded='${pane:-}', no live match for ${wt:-<no worktree>})"
   fi
 
   # 2. worktree — git itself refuses a dirty one; --force forwards to git
