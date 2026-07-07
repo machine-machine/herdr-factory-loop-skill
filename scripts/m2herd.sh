@@ -21,7 +21,7 @@
 #   m2herd.sh gist    [--dir P] [--push]      # one-paragraph project gist; --push pipes it to $M2HERD_GIST_CMD if set
 #   m2herd.sh next    [--dir P]               # self-prompting primitive: mechanical priority walk, prints exactly one "NEXT: " line
 #                                             #   (drift → context budget ≥75% → steer → machineroom → coach intent → refile notes
-#                                             #    → collect worker → failed worker → open question → compare/dispatch)
+#                                             #    → collect worker → failed worker → reap panes → open question → compare/dispatch)
 #   m2herd.sh evolve analyze  [--dir P] [--run <id|latest|current>]
 #                                             # mechanical: read .m2herd/runs/<run-id>/, write signatures + skeleton
 #                                             #   proposals under .m2herd/evolver/; no LLM, no network; idempotent
@@ -41,6 +41,8 @@
 #   m2herd.sh config list|get|set [--dir P] ... # read/write .m2herd/settings.json with defaults + validation
 #   m2herd.sh doctor  [--dir P]               # "why is it not working": jq/git/herdr/symlinks/node/hooks/statusline-bridge/
 #                                             #   .m2herd-drift/go checks — ok|warn|FAIL + one-line remedy; exit 1 iff any FAIL
+#   m2herd.sh reap    [--dir P] [--dry-run]   # close herdr panes of FINISHED (done|failed) workers so idle claude/codex
+#                                             #   sessions stop holding API connections — never $SELF, never a working pane
 #   m2herd.sh self-update [--check]           # --check: fetch the engine repo, cache behind-count in ~/.cache/m2herd/update-status
 #                                             #   (dashboard renders it); no flag: ff-only pull of the engine repo (refuses dirty tree)
 #   m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync (+--check drift) → archive → gist → next; jq asserts
@@ -57,10 +59,11 @@ CMD="${1:-help}"; shift || true
 EVOLVE_ACTION=""
 if [ "$CMD" = "evolve" ]; then EVOLVE_ACTION="${1:-}"; shift || true; fi
 CONFIG_ACTION=""; CONFIG_PATH=""; CONFIG_VALUE=""
-DIR="$PWD"; GOAL=""; AREA=""; TEXT=""; CHECK=0; PUSH=0; WATCH=0; INTERVAL=2; RUN=""; ACK_REPO=0
+DIR="$PWD"; GOAL=""; AREA=""; TEXT=""; CHECK=0; PUSH=0; WATCH=0; INTERVAL=2; RUN=""; ACK_REPO=0; DRYRUN=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --dir)   DIR="$2"; shift 2 ;;
+    --dry-run) DRYRUN=1; shift ;;
     --goal)  GOAL="$2"; shift 2 ;;
     --area)  AREA="$2"; shift 2 ;;
     --check) CHECK=1; shift ;;
@@ -659,7 +662,8 @@ largest_area() {
 # mechanical priority walk — NO LLM, exactly one "NEXT: " line.
 # Ladder order (first hit wins): drift → context budget (fresh bridge ≥75%) →
 # steer inbox → machineroom up → coach intent (done_when) → refile notes →
-# collect stale worker → failed worker → open question → compare/dispatch.
+# collect stale worker → failed worker → reap finished panes → open question →
+# compare/dispatch.
 next_cmd() {
   resolve_dir; need_init
   local m2="$DIR/.m2herd" w q bf pct mt big
@@ -697,6 +701,10 @@ next_cmd() {
   w="$(jq -r '[(.workers // [])[] | select((.state//"")=="failed") | .slice][0] // ""' "$(OV)")"
   if [ -n "$w" ]; then
     echo "NEXT: worker $w failed — read dispatch/$w.out.md, then retry or clean up"; return 0
+  fi
+  w="$(reapable_count)"
+  if [ "${w:-0}" -gt 0 ] 2>/dev/null; then
+    echo "NEXT: reap $w finished worker pane(s) — run: m2herd reap (idle agents hold API connections)"; return 0
   fi
   q="$(jq -r '(.open_questions // [])[0] // ""' "$(OV)")"
   if [ -n "$q" ]; then
@@ -1236,6 +1244,119 @@ evolve_reject() {
   log "rejected $TEXT"
 }
 
+# ---------- reap: close panes of finished workers ------------------------------
+# A pane worker that reached done|failed keeps its claude/codex TUI session
+# alive — an idle process still holding an API connection slot. reap closes
+# those panes mechanically and clears the pane_id bookkeeping in overview.json.
+# Safety mirrors m2herd-up.sh: NEVER $SELF (unknown self = fail safe, skip),
+# never a pane whose LIVE agent_status is still "working" (state mismatch —
+# collect first), headless workers untouched (no pane to close).
+#
+# Self resolution (same idiom as m2herd-up.sh): walk THIS process's ancestry
+# and match agent-binary ancestors' cwd against `herdr agent list`. Ambiguous
+# or unreachable → $SELF stays EMPTY = UNKNOWN, and maybe_self() treats
+# unknown as "could be me".
+SELF=""
+resolve_self() {
+  SELF=""
+  local agents pid=$$ hops=0 comm cwd ppid n
+  agents="$(herdr agent list 2>/dev/null | jq -c '[.result.agents[]? | {pane_id, cwd}]' 2>/dev/null || true)"
+  if [ -z "$agents" ] || [ "$agents" = "[]" ] || [ "$agents" = "null" ]; then
+    return 0   # fleet unreachable or no agents — $SELF stays unknown
+  fi
+  while [ "$hops" -lt 15 ]; do
+    comm="$(ps -o comm= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    cwd="$(readlink "/proc/$pid/cwd" 2>/dev/null || true)"
+    if [ -n "$cwd" ]; then
+      case "$comm" in
+        *claude*|*codex*|*cursor*|*opencode*|*hermes*)
+          n="$(printf '%s' "$agents" | jq -r --arg c "$cwd" '[.[] | select(.cwd==$c)] | length' 2>/dev/null || echo 0)"
+          if [ "${n:-0}" -eq 1 ]; then
+            SELF="$(printf '%s' "$agents" | jq -r --arg c "$cwd" \
+              '[.[] | select(.cwd==$c)] | first | .pane_id // empty' 2>/dev/null || true)"
+            return 0
+          elif [ "${n:-0}" -gt 1 ]; then
+            log "! self resolution ambiguous: $n agents share cwd $cwd — \$SELF stays unknown (fail safe)"
+            return 0
+          fi
+          ;;
+      esac
+    fi
+    ppid="$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ' || true)"
+    [ -n "$ppid" ] || break
+    [ "$ppid" -le 1 ] 2>/dev/null && break
+    pid="$ppid"; hops=$((hops + 1))
+  done
+  return 0
+}
+maybe_self() {
+  if [ -z "$SELF" ]; then
+    log "! \$SELF unresolved — treating pane $1 as possibly-self (fail safe)"
+    return 0
+  fi
+  [ "$1" = "$SELF" ]
+}
+
+# count of finished pane workers whose pane still exists in the fleet — the
+# `next` reap rung; 0 when herdr is absent/unreachable (nothing actionable)
+reapable_count() {
+  command -v herdr >/dev/null 2>&1 || { echo 0; return 0; }
+  local agents panes
+  agents="$(herdr agent list 2>/dev/null || true)"
+  [ -n "$agents" ] || { echo 0; return 0; }
+  panes="$(jq -c '[.result.agents[]?.pane_id]' <<<"$agents" 2>/dev/null || echo '[]')"
+  jq -r --argjson p "$panes" '
+    [ (.workers//[])[]
+      | select((.state//"")=="done" or (.state//"")=="failed")
+      | select((.mode//"tui")!="headless")
+      | select(((.pane_id//"") != "") and ((.pane_id//"") != "-"))
+      | select(.pane_id | IN($p[])) ] | length' "$(OV)" 2>/dev/null || echo 0
+}
+
+reap_cmd() {
+  resolve_dir; need_init
+  command -v herdr >/dev/null 2>&1 || { log "reap: herdr not on PATH — no panes to close"; return 0; }
+  local agents; agents="$(herdr agent list 2>/dev/null || true)"
+  [ -n "$agents" ] || { log "reap: herdr server unreachable — no panes to close"; return 0; }
+  resolve_self
+  local closed=0 gone=0 skipped=0 slice state pane mode obs
+  # the jq snapshot streams from the pre-rewrite inode; ov_put's atomic rename
+  # inside the loop cannot corrupt this read
+  while IFS=$'\x1f' read -r slice state pane mode; do
+    [ -n "$slice" ] || continue
+    case "$state" in done|failed) : ;; *) continue ;; esac
+    if [ "$mode" = "headless" ] || [ "$pane" = "-" ] || [ -z "$pane" ]; then continue; fi
+    obs="$(jq -r --arg p "$pane" '[.result.agents[]? | select(.pane_id==$p) | .agent_status][0] // "gone"' <<<"$agents")"
+    if [ "$obs" = "gone" ]; then
+      if [ "$DRYRUN" -eq 1 ]; then
+        log "reap: would clear pane bookkeeping for $slice (pane $pane already gone)"
+      else
+        ov_put --arg s "$slice" '.workers = [ .workers[] | if .slice==$s then .pane_id="-" else . end ]'
+        log "reap: pane $pane already gone — cleared bookkeeping for $slice"
+      fi
+      gone=$((gone + 1)); continue
+    fi
+    if [ "$obs" = "working" ]; then
+      log "reap: SKIP $slice — pane $pane still working (state=$state mismatch; collect first)"
+      skipped=$((skipped + 1)); continue
+    fi
+    if maybe_self "$pane"; then
+      log "reap: SKIP $slice — pane $pane is (or could be) \$SELF"
+      skipped=$((skipped + 1)); continue
+    fi
+    if [ "$DRYRUN" -eq 1 ]; then
+      log "reap: would close pane $pane ($slice, state=$state, observed=$obs)"
+    else
+      herdr pane close "$pane" >/dev/null 2>&1 || true   # already-gone is fine
+      ov_put --arg s "$slice" '.workers = [ .workers[] | if .slice==$s then .pane_id="-" else . end ]'
+      log "reap: closed pane $pane ($slice, state=$state)"
+    fi
+    closed=$((closed + 1))
+  done < <(jq -r '(.workers//[])[] | [.slice, (.state//"?"), (.pane_id//""), (.mode//"tui")] | join("\u001f")' "$(OV)")
+  local suffix=""; [ "$DRYRUN" -eq 1 ] && suffix=" (dry-run — nothing touched)"
+  log "reap: $closed closed, $gone already gone, $skipped skipped$suffix"
+}
+
 # ---------- doctor: one command answering "why is it not working" -------------
 # Each check prints ok|warn|FAIL|note + a one-line remedy. Exit 1 iff any FAIL
 # (warns don't fail). FAIL is reserved for hard breakage: jq/git missing, herdr
@@ -1499,6 +1620,20 @@ selftest() {
   rm -f "$td/bridge/claude-ctx-selftest.json"
   "$self" next --dir "$td" | grep -q '^NEXT: compare RESUME.md' || fail "next(budget): rung did not clear with the bridge file"
 
+  # reap: a done worker whose pane vanished → exit 0, bookkeeping cleared;
+  # --dry-run touches nothing. Needs a live fleet — skipped gracefully without one.
+  if command -v herdr >/dev/null 2>&1 && herdr status >/dev/null 2>&1; then
+    jq '.workers=[{slice:"reapX", state:"done", pane_id:"pane-selftest-gone", branch:"wip/m2herd-reapX", mode:"tui"}]' \
+      "$ov" > "$ov.tmp" && mv "$ov.tmp" "$ov"
+    "$self" reap --dir "$td" --dry-run >/dev/null || fail "reap --dry-run exited non-zero"
+    jq -e '.workers[0].pane_id=="pane-selftest-gone"' "$ov" >/dev/null || fail "reap --dry-run mutated overview.json"
+    step reap --dir "$td"
+    jq -e '.workers[0].pane_id=="-"' "$ov" >/dev/null || fail "reap did not clear the gone pane's bookkeeping"
+    jq '.workers=[]' "$ov" > "$ov.tmp" && mv "$ov.tmp" "$ov"
+  else
+    echo "  (reap case skipped — herdr absent or server unreachable)"
+  fi
+
   # dashboard: read-only render — NEXT line + area rows present, and NO writes to the fabric
   local before after dash
   before="$(find "$td/.m2herd" -type f -exec cksum {} + | sort)"
@@ -1648,6 +1783,7 @@ case "$CMD" in
   next)      next_cmd ;;
   config)   config_cmd ;;
   doctor)   doctor_cmd ;;
+  reap)     reap_cmd ;;
   evolve)
     case "$EVOLVE_ACTION" in
       analyze)   evolve_analyze ;;
@@ -1667,5 +1803,5 @@ case "$CMD" in
     elif [ "$WATCH" -eq 1 ]; then dashboard_watch; else dashboard; fi ;;
   self-update) self_update_cmd ;;
   selftest)  selftest ;;
-  help|*)    sed -n '2,48p' "$0" ;;
+  help|*)    sed -n '2,50p' "$0" ;;
 esac
