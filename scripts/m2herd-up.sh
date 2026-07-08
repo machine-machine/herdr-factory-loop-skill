@@ -225,6 +225,8 @@ settings_first_route() { # settings_first_route <slice> -> first matching routin
   while IFS= read -r r; do
     pat="$(printf '%s' "$r" | jq -r '.pattern // empty' 2>/dev/null || true)"
     [ -n "$pat" ] || continue
+    # $pat is a routing glob from settings.json; unquoted glob matching is the feature
+    # shellcheck disable=SC2254
     case "$slice" in
       $pat) printf '%s' "$r"; return 0 ;;
     esac
@@ -370,8 +372,8 @@ maybe_self() {
 # Binding rule: the pane_id returned by `agent start` can be off by one — always
 # RE-RESOLVE by cwd from `herdr agent list` (prefer a name match when given).
 resolve_pane_by_cwd() { # resolve_pane_by_cwd <cwd> [name] -> pane_id (retries; list can lag)
-  local cwd="$1" name="${2:-}" i pane=""
-  for i in 1 2 3 4 5; do
+  local cwd="$1" name="${2:-}" pane=""
+  for _ in 1 2 3 4 5; do
     if [ -n "$name" ]; then
       pane="$(herdr agent list 2>/dev/null | jq -r --arg c "$cwd" --arg n "$name" \
         '[.result.agents[] | select(.cwd==$c and .name==$n)] | last | .pane_id // empty' 2>/dev/null || true)"
@@ -388,7 +390,7 @@ resolve_pane_by_cwd() { # resolve_pane_by_cwd <cwd> [name] -> pane_id (retries; 
 # whose name is m2herd-orch-<basename> (or a bare "claude"). Empty if unresolved
 # (no workspace, up never ran, fleet unreachable) — callers fall back gracefully.
 resolve_orch_pane() { # -> pane_id
-  local orch_name="m2herd-orch-$(basename "$REPO")"
+  local orch_name; orch_name="m2herd-orch-$(basename "$REPO")"
   herdr agent list 2>/dev/null | jq -r --arg c "$REPO" --arg n "$orch_name" \
     '[.result.agents[] | select(.cwd==$c and ((.name // "")==$n or (.name // "")=="claude"))] | first | .pane_id // empty' 2>/dev/null || true
 }
@@ -398,7 +400,7 @@ resolve_orch_pane() { # -> pane_id
 # The fallback `agent start` must ALWAYS pass --workspace — without it herdr
 # drops the worker into whatever workspace the human happens to have focused.
 resolve_repo_ws() { # -> workspace_id or empty
-  local label="m2herd:$(basename "$REPO")" ws
+  local label ws; label="m2herd:$(basename "$REPO")"
   ws="$(herdr workspace list 2>/dev/null | jq -r --arg l "$label" \
     '[.result.workspaces[]? | select((.label // "")==$l)] | first | .workspace_id // empty' 2>/dev/null || true)"
   [ -n "$ws" ] || ws="$(herdr pane list 2>/dev/null | jq -r --arg c "$REPO" \
@@ -430,8 +432,8 @@ worker_panes_in_tab() { # worker_panes_in_tab <tab_id> <orch_pane> -> pane ids, 
 # Resolve a freshly-split pane by cwd from `herdr pane list` (retries; the list
 # can lag the split). A slice's worktree path is unique, so cwd pins the pane.
 resolve_pane_by_cwd_panes() { # resolve_pane_by_cwd_panes <cwd> -> pane_id
-  local cwd="$1" i pane=""
-  for i in 1 2 3 4 5; do
+  local cwd="$1" pane=""
+  for _ in 1 2 3 4 5; do
     pane="$(herdr pane list 2>/dev/null | jq -r --arg c "$cwd" \
       '[.result.panes[] | select(.cwd==$c)] | last | .pane_id // empty' 2>/dev/null || true)"
     [ -n "$pane" ] && break
@@ -610,9 +612,10 @@ trace_find_run_for_slice() { # trace_find_run_for_slice <slice> -> echoes run-id
       printf '%s' "$rid"; return 0
     fi
   fi
-  rid="$(ls -1 "$runs" 2>/dev/null | grep '^r-' | sort -r | while IFS= read -r d; do
-    if [ -d "$runs/$d/slices/$slice" ]; then printf '%s' "$d"; break; fi
-  done)"
+  rid=""; local d
+  for d in "$runs"/r-*; do
+    if [ -d "$d/slices/$slice" ]; then rid="${d##*/}"; fi
+  done
   printf '%s' "$rid"
 }
 
@@ -799,7 +802,7 @@ up() {
   #    --room-only skips this entirely: the SESSION RUNNING THIS COMMAND is the
   #    orchestrator (the auto-kick path — a hook-nudged Claude Code session must
   #    never spawn a second orchestrator next to itself).
-  local orch_name="m2herd-orch-$(basename "$REPO")" orch n
+  local orch_name orch n; orch_name="m2herd-orch-$(basename "$REPO")"
   if [ "$ROOM_ONLY" -eq 1 ]; then
     orch="(this session)"
     log "room-only: skipping orchestrator ensure — the calling session is the orchestrator"
@@ -954,7 +957,7 @@ dispatch() {
     local out="$REPO/.m2herd/dispatch/$SLICE.out.md" lg="$REPO/.m2herd/dispatch/$SLICE.log"
     local errlg="$REPO/.m2herd/dispatch/$SLICE.stderr.log" hpid="" hstart="" hcomm="" wtask
     wtask="$(copy_task_into_wt "$wt")"
-    local hprompt="$(confinement_line "$wt" "$branch") Read $wtask and follow its instructions exactly. Write your complete report to $out when done (the report file is the ONLY thing you write outside the worktree).$(lessons_pointer_suffix)"
+    local hprompt; hprompt="$(confinement_line "$wt" "$branch") Read $wtask and follow its instructions exactly. Write your complete report to $out when done (the report file is the ONLY thing you write outside the worktree).$(lessons_pointer_suffix)"
     if [ "$DRY_RUN" -eq 1 ]; then
       case "$AGENT" in
         claude)   plan "cd '$wt' && nohup claude -p '<pointer>' --model '$MODEL' --dangerously-skip-permissions --output-format json > '$lg' 2> '$errlg' &" ;;
@@ -1084,7 +1087,7 @@ dispatch() {
 #   2. settings workers.verify_cmd
 #   3. `bash scripts/lint.sh` when scripts/lint.sh exists in the worktree
 verify_cmd_for_slice() { # verify_cmd_for_slice <slice> <wt> -> echoes command, or empty
-  local slice="$1" wt="$2" task="$REPO/.m2herd/dispatch/$slice.task.md" cmd=""
+  local slice="$1" wt="$2" cmd=""; local task="$REPO/.m2herd/dispatch/$slice.task.md"
   [ -f "$task" ] && cmd="$(head -20 "$task" | sed -n 's/^[Vv]erify:[[:space:]]*//p' | head -1)"
   [ -n "$cmd" ] || cmd="$(settings_get '.workers.verify_cmd' "")"
   if [ -z "$cmd" ] && [ -n "$wt" ] && [ -f "$wt/scripts/lint.sh" ]; then cmd="bash scripts/lint.sh"; fi

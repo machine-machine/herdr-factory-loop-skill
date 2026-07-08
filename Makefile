@@ -35,6 +35,12 @@ ci:
 	@set -e; \
 	for f in scripts/*.sh hooks/*.sh; do bash -n "$$f" || exit 1; done; \
 	echo "ok: bash -n scripts/*.sh hooks/*.sh"
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		echo "+ shellcheck -S warning scripts/*.sh hooks/*.sh"; \
+		shellcheck -S warning scripts/*.sh hooks/*.sh; \
+	else \
+		echo "skip: shellcheck not on PATH — shellcheck skipped (CI runs it)"; \
+	fi
 	bash scripts/lint.sh
 	bash scripts/m2herd.sh selftest
 	bash hooks/smoke.sh

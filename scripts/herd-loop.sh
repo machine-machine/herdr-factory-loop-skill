@@ -132,8 +132,8 @@ ledger_has()  { awk -F'\t' -v s="$1" 'NR>1 && $1==s {f=1} END{exit !f}' "$(LEDGE
 ledger_get()  { awk -F'\t' -v s="$1" -v c="$2" 'NR>1 && $1==s {print $c}' "$(LEDGER)" 2>/dev/null | head -1; }
 _ledger_append() { printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$@" >> "$(LEDGER)"; }
 ledger_add()  { # empty fields → "-" so IFS=$'\t' read never collapses adjacent tabs
-  local f=(); local a; for a in "$1" "$2" "$3" "$4" "$5" "$6" "$7"; do f+=("${a:--}"); done
-  with_lock "$(LEDGER)" _ledger_append "${f[@]}"; }
+  local fields=(); local a; for a in "$1" "$2" "$3" "$4" "$5" "$6" "$7"; do fields+=("${a:--}"); done
+  with_lock "$(LEDGER)" _ledger_append "${fields[@]}"; }
 _ledger_set() { # _ledger_set <slice> <col> <value> — runs under the ledger lock
   local led tmp; led="$(LEDGER)"
   tmp="$(mktemp "$(dirname "$led")/.ledger.XXXXXX")"
@@ -320,8 +320,8 @@ submit_prompt() {
 # by one — always RE-RESOLVE by cwd from `herdr agent list` (prefer a name match)
 # and use the re-resolved id for every send/Enter/close that follows.
 resolve_pane_by_cwd() { # resolve_pane_by_cwd <cwd> [name] -> pane_id (retries; list can lag)
-  local cwd="$1" name="${2:-}" i pane=""
-  for i in 1 2 3 4 5; do
+  local cwd="$1" name="${2:-}" pane=""
+  for _ in 1 2 3 4 5; do
     if [ -n "$name" ]; then
       pane="$(herdr agent list 2>/dev/null | jq -r --arg c "$cwd" --arg n "$name" \
         '[.result.agents[] | select(.cwd==$c and (.name // "")==$n)] | last | .pane_id // empty' 2>/dev/null || true)"
@@ -670,8 +670,8 @@ rotate() {
   herdr agent send "$new" "You are the herd orchestrator; resume from $WS/_fleet/context_pointer.md and $WS/_fleet/digest.md and continue the loop." >/dev/null 2>&1 || true
 
   # poll (a few tries) until the new pane is actually listed before retiring the old one.
-  local i listed=0
-  for i in 1 2 3 4 5; do
+  local listed=0
+  for _ in 1 2 3 4 5; do
     if herdr agent list 2>/dev/null | jq -e --arg p "$new" '.result.agents[]|select(.pane_id==$p)' >/dev/null 2>&1; then listed=1; break; fi
     sleep 1
   done
