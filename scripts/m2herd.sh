@@ -33,6 +33,8 @@
 #                                             #   repo: never edits target; prints a branch/patch recommendation;
 #                                             #   marks applied only with --ack-repo
 #   m2herd.sh evolve reject <id> [--dir P]    # flip proposal status to rejected
+#   m2herd.sh room    [--dir P]               # the machineroom viewer in THIS terminal: Go TUI (m2herd-tui) when installed,
+#                                             #   else the flicker-free bash watch — one command, always the best/latest viewer
 #   m2herd.sh dashboard [--dir P] [--watch [--interval N]]
 #                                             # tier-1 TUI: read-only render — header (drift dot, update line, ages), NEXT, areas,
 #                                             #   workers, open questions, NOTES tail; tput colors on a tty, plain when piped; NEVER
@@ -1801,6 +1803,13 @@ case "$CMD" in
     if [ "$WATCH" -eq 1 ] && [ "${M2HERD_NO_TUI:-}" != "1" ] && command -v m2herd-tui >/dev/null 2>&1; then
       exec m2herd-tui --dir "$DIR"
     elif [ "$WATCH" -eq 1 ]; then dashboard_watch; else dashboard; fi ;;
+  room)
+    # The machineroom viewer in THIS terminal: always the best available watcher
+    # (Go TUI when installed, else the flicker-free bash watch). Same read-only
+    # doctrine as dashboard. `m2herd-up room` runs this inside the herdr pane.
+    if [ "${M2HERD_NO_TUI:-}" != "1" ] && command -v m2herd-tui >/dev/null 2>&1; then
+      exec m2herd-tui --dir "$DIR"
+    else dashboard_watch; fi ;;
   self-update) self_update_cmd ;;
   selftest)  selftest ;;
   help|*)    sed -n '2,50p' "$0" ;;

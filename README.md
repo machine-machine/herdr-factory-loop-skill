@@ -65,7 +65,8 @@ m2herd note "…"                  # jot a thought into NOTES.md
 m2herd refile --area A           # move live notes into context/A/
 m2herd resume | status | next    # where are we / what now
 m2herd config list|get|set       # .m2herd/settings.json — who does the work (agents/runners/routing)
-m2herd dashboard --watch         # live TUI over the fabric (`,` opens the settings editor)
+m2herd room                      # live TUI over the fabric in THIS terminal (best available viewer)
+m2herd-up room                   # (re)start the herdr machineroom pane with a fresh viewer — always latest data (`,` opens the settings editor)
 m2herd evolve analyze|proposals|show|apply|reject   # turn failed runs into accepted factory lessons
 ```
 

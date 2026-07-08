@@ -13,6 +13,8 @@
 #                                                   # ensure herdr workspace: ONE orchestrator pane (claude) + ONE machineroom pane; m2herd.sh init if missing
 #                                                   # --room-only: workspace + machineroom ONLY, never spawn an orchestrator — for the
 #                                                   #   auto-kick path where the calling Claude Code session IS the orchestrator
+#   m2herd-up.sh room     [--repo P]                # ensure the machineroom pane AND (re)start its viewer fresh — guarantees the pane
+#                                                   #   runs the latest TUI/engine and shows live data (up alone assumes a running viewer)
 #   m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor|opencode]
 #                         [--runner pane|headless] [--headless [--model M]]
 #                                                   # worktree wip/m2herd-<S> off BASE (default: workers.base, else current branch), spawn worker,
@@ -89,7 +91,7 @@ set -euo pipefail
 DRY_RUN=0
 while [ "${1:-}" = "--dry-run" ]; do DRY_RUN=1; shift; done
 CMD="${1:-help}"; shift || true
-REPO=""; GOAL=""; SLICE=""; BASE=""; AGENT=""; HEADLESS=0; MODEL=""; RUNNER=""; ROOM_ONLY=0
+REPO=""; GOAL=""; SLICE=""; BASE=""; AGENT=""; HEADLESS=0; MODEL=""; RUNNER=""; ROOM_ONLY=0; ROOM_REFRESH=0
 ALL=0; FORCE=0; NO_VERIFY=0; INTERVAL=""; MAX_RESUMES=""; ONCE=0
 BASE_EXPLICIT=0; AGENT_EXPLICIT=0; MODEL_EXPLICIT=0; RUNNER_EXPLICIT=0
 while [ $# -gt 0 ]; do
@@ -837,7 +839,20 @@ up() {
   if [ -n "$tab" ]; then
     notes="$(herdr pane list --workspace "$ws" 2>/dev/null | jq -r --arg t "$tab" \
       '[.result.panes[] | select(.tab_id==$t)] | first | .pane_id // empty' 2>/dev/null || true)"
-    log "machineroom pane exists: ${notes:-<tab $tab, pane unresolved>} (viewer assumed running)"
+    if [ "$ROOM_REFRESH" -eq 1 ] && [ -n "$notes" ] && ! is_self "$notes"; then
+      # Restart the viewer so the pane runs the LATEST engine/TUI and shows live
+      # data (an old pane may still run a stale fallback viewer from a past install).
+      if [ "$DRY_RUN" -eq 1 ]; then
+        plan "herdr pane send-keys '$notes' C-c ; herdr pane run '$notes' '$viewer'"
+      else
+        herdr pane send-keys "$notes" C-c >/dev/null 2>&1 || true
+        sleep 1
+        herdr pane run "$notes" "clear; $viewer" >/dev/null 2>&1 || true
+        log "machineroom viewer refreshed: $notes ($viewer)"
+      fi
+    else
+      log "machineroom pane exists: ${notes:-<tab $tab, pane unresolved>} (viewer assumed running — 'm2herd-up room' restarts it)"
+    fi
   elif [ "$DRY_RUN" -eq 1 ]; then
     plan "herdr tab create --workspace '$ws' --cwd '$REPO' --label '$NOTES_TAB_LABEL' --no-focus"
     plan "herdr pane run '<notes-pane>' '$viewer'"
@@ -1714,6 +1729,7 @@ EOF
 need jq
 case "$CMD" in
   up)       up ;;
+  room)     ROOM_ONLY=1; ROOM_REFRESH=1; up ;;
   dispatch) dispatch ;;
   collect)  collect ;;
   watch)    watch ;;
