@@ -19,19 +19,41 @@ manage agent integrations.
 
 ## Quick start
 
-```bash
-# install AND update — same command, safe to re-run anytime (see Install for what it does):
-# pulls the latest version, symlinks the skill + hooks, and puts m2herd / m2herd-up / m2herd-tui on PATH
-curl -sSL https://raw.githubusercontent.com/machine-machine/herdr-factory-loop-skill/main/scripts/install.sh | bash
+**Install** — one copy-paste command, from anywhere (symlinks the skill + hooks,
+puts `m2herd` / `m2herd-up` / `m2herd-tui` on PATH):
 
-# the installer keeps its clone at ~/.cache/herdr-factory-loop-skill — run
-# onboarding from there to set up the whole factory (orchestrator choice +
-# spec-kit + SDD loop):
-bash ~/.cache/herdr-factory-loop-skill/scripts/onboard.sh
+```bash
+curl -sSL https://raw.githubusercontent.com/machine-machine/herdr-factory-loop-skill/main/scripts/install.sh | bash
 ```
 
-(Working from a git checkout instead? `./scripts/install.sh` auto-detects the
-checkout and installs from it, and `./scripts/onboard.sh` works in place.)
+**Upgrade** — the exact same command; safe to re-run anytime (ff-only pull of the
+existing clone, re-links everything):
+
+```bash
+curl -sSL https://raw.githubusercontent.com/machine-machine/herdr-factory-loop-skill/main/scripts/install.sh | bash
+```
+
+Or, once installed, upgrade the engine directly:
+
+```bash
+m2herd self-update            # pull latest (refuses a dirty tree)
+m2herd self-update --check    # only report how far behind you are
+```
+
+**Install from a git checkout** (development / air-gapped):
+
+```bash
+git clone https://github.com/machine-machine/herdr-factory-loop-skill.git
+cd herdr-factory-loop-skill
+./scripts/install.sh          # auto-detects the checkout and installs from it
+```
+
+Then set up the whole factory (orchestrator choice + spec-kit + SDD loop) —
+the installer keeps its clone at `~/.cache/herdr-factory-loop-skill`:
+
+```bash
+bash ~/.cache/herdr-factory-loop-skill/scripts/onboard.sh   # or ./scripts/onboard.sh in a checkout
+```
 
 ## Typical command flow
 
@@ -160,23 +182,10 @@ ln -s "$(pwd)/skill" ~/.claude/skills/herdr
 
 ### Update
 
-The install one-liner is also the updater — re-run it anytime to get the
-latest version (it `git pull --ff-only`s the existing clone and re-links
-everything):
-
-```bash
-curl -sSL https://raw.githubusercontent.com/machine-machine/herdr-factory-loop-skill/main/scripts/install.sh | bash
-```
-
-Once `m2herd` is on PATH there is also a built-in updater for the engine:
-
-```bash
-m2herd self-update           # ff-only pull of the engine repo (refuses a dirty tree)
-m2herd self-update --check   # just report how far behind you are (the dashboard shows this too)
-```
-
-For a manual clone, `cd herdr-factory-loop-skill && git pull` does the same —
-the symlinks stay valid and the skill is reloaded on the next session.
+See the **Upgrade** block in [Quick start](#quick-start): re-run the install
+one-liner, or `m2herd self-update`. For a manual clone,
+`cd herdr-factory-loop-skill && git pull` does the same — the symlinks stay
+valid and the skill is reloaded on the next session.
 
 ## Repository layout
 
