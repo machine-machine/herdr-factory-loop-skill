@@ -26,6 +26,7 @@ type Snapshot struct {
 	AreaAges   map[string]string
 	Agents     map[string]string
 	AgentsOK   bool
+	Resumes    map[string]int
 	Warnings   []string
 }
 
@@ -60,6 +61,7 @@ func BuildSnapshot(dir string) (*Snapshot, error) {
 		AreaAges:   ages,
 		Agents:     agents,
 		AgentsOK:   agentsOK,
+		Resumes:    SliceResumes(dir),
 		Warnings:   warnings,
 	}, nil
 }
@@ -189,7 +191,7 @@ func Render(s *Snapshot, width int) string {
 	lines = append(lines, notesBlock(s)...)
 
 	lines = append(lines, "")
-	lines = append(lines, styleDim.Render("read-only · [,] settings [r]esume [s]teer [q]uit"))
+	lines = append(lines, styleDim.Render("read-only · [,] settings [r]esume [s]teer [?] help [q]uit"))
 
 	// Long values (goal, done_when, notes, branches, …) must not wrap inside
 	// the box — a wrapped line breaks the border and the two-column layout.
@@ -277,8 +279,16 @@ func budgetRow(b BudgetInfo) string {
 	case pct >= 70:
 		barStyle = styleYellow
 	}
+	hint := "updated " + b.Age + " ago"
+	if b.Session != "" {
+		sid := b.Session
+		if len(sid) > 8 {
+			sid = sid[:8] + "…"
+		}
+		hint = "session " + sid + " · " + b.Age + " ago"
+	}
 	return styleDim.Render(padRight("budget:", 11)) + barStyle.Render(bar) +
-		fmt.Sprintf(" %d%% of %d · updated %s ago", pct, b.Budget, b.Age)
+		fmt.Sprintf(" %d%% of %d ", pct, b.Budget) + styleDim.Render("("+hint+")")
 }
 
 func nextLine(s *Snapshot) string {
@@ -338,8 +348,15 @@ func humanizeTokens(n int64) string {
 }
 
 func workersBlock(s *Snapshot) []string {
+	// resumes column appears only when some slice trace recorded resumes>0.
+	withResumes := len(s.Resumes) > 0
 	lines := []string{styleBold.Render("WORKERS")}
-	lines = append(lines, styleDim.Render("  "+padRight("slice", 10)+" "+padRight("desired", 9)+" "+padRight("observed", 10)+" "+padRight("runner", 14)+" branch"))
+	header := "  " + padRight("slice", 10) + " " + padRight("desired", 9) + " " + padRight("observed", 10)
+	if withResumes {
+		header += " " + padRight("resumes", 7)
+	}
+	header += " " + padRight("runner", 14) + " branch"
+	lines = append(lines, styleDim.Render(header))
 	for _, w := range s.Overview.Workers {
 		desired := w.State
 		if desired == "" {
@@ -378,10 +395,69 @@ func workersBlock(s *Snapshot) []string {
 			}
 		}
 		row := "  " + padRight(w.Slice, 10) + " " + stateStyle(desired).Render(padRight(desired, 9)) + " " +
-			padRight(observed+mark, 10) + " " + padRight(runner, 14) + " " + branch
+			padRight(observed+mark, 10)
+		if withResumes {
+			resumes := "-"
+			if n, ok := s.Resumes[w.Slice]; ok {
+				resumes = fmt.Sprintf("%d", n)
+			}
+			row += " " + padRight(resumes, 7)
+		}
+		row += " " + padRight(runner, 14) + " " + branch
 		lines = append(lines, row)
 	}
 	return lines
+}
+
+// RenderHelp draws the '?' overlay: every key across dashboard, settings and
+// the modals. Esc closes.
+func RenderHelp(width int) string {
+	if width < minWidth {
+		width = minWidth
+	}
+	contentWidth := width - 4
+	if contentWidth < minWidth-4 {
+		contentWidth = minWidth - 4
+	}
+	styleWidth := contentWidth + 2
+
+	key := func(k, desc string) string {
+		return "  " + styleCyanBold.Render(padRight(k, 14)) + desc
+	}
+	lines := []string{
+		styleCyanBold.Render("m2herd keys") + " " + styleDim.Render("(esc to close)"),
+		"",
+		styleBold.Render("DASHBOARD"),
+		key(",", "settings editor"),
+		key("r", "RESUME.md viewer"),
+		key("s", "steer — open .m2herd/inbox/STEER.md in $EDITOR"),
+		key("?", "this help"),
+		key("q / ctrl+c", "quit"),
+		"",
+		styleBold.Render("SETTINGS"),
+		key("j/k ↑/↓", "move"),
+		key("enter/space", "edit value (minibuffer) or cycle enum"),
+		key("a", "add routing rule (pattern minibuffer, then agent/runner/model per row)"),
+		key("d", "delete routing rule (y/n confirm)"),
+		key("r", "reset value to default"),
+		key("?", "this help"),
+		key("esc", "back to dashboard"),
+		"",
+		styleBold.Render("MODALS"),
+		key("RESUME", "↑/↓ pgup/pgdn scroll · ? help · esc/q close"),
+		key("minibuffer", "enter save · esc discard (invalid input stays open)"),
+		key("delete", "y confirm · n/esc cancel"),
+		key("help", "esc/q/? close"),
+	}
+	for i, l := range lines {
+		lines[i] = truncLine(l, contentWidth)
+	}
+	box := lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(colBorder).
+		Padding(0, 1).
+		Width(styleWidth)
+	return box.Render(strings.Join(lines, "\n"))
 }
 
 func notesBlock(s *Snapshot) []string {

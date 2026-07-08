@@ -32,6 +32,8 @@ type model struct {
 	showResume bool
 	resumeVP   viewport.Model
 
+	showHelp bool
+
 	settings *settingsView
 }
 
@@ -86,6 +88,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, nil
 
 	case tea.KeyMsg:
+		if m.showHelp {
+			switch msg.String() {
+			case "ctrl+c":
+				return m, tea.Quit
+			case "esc", "q", "?":
+				m.showHelp = false
+			}
+			return m, nil
+		}
 		if m.settings != nil {
 			return m.updateSettingsKey(msg)
 		}
@@ -95,6 +106,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				return m, tea.Quit
 			case "esc", "q":
 				m.showResume = false
+				return m, nil
+			case "?":
+				m.showHelp = true
 				return m, nil
 			}
 			var cmd tea.Cmd
@@ -111,6 +125,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, loadResumeCmd(m.dir)
 		case "s":
 			return m, suspendForSteerCmd(m.dir)
+		case "?":
+			m.showHelp = true
+			return m, nil
 		}
 		return m, nil
 
@@ -201,6 +218,9 @@ func suspendForSteerCmd(dir string) tea.Cmd {
 }
 
 func (m model) View() string {
+	if m.showHelp {
+		return RenderHelp(m.width)
+	}
 	if m.settings != nil {
 		return RenderSettings(m.settings, m.width)
 	}

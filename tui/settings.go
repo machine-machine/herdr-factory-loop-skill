@@ -37,6 +37,8 @@ type SettingsEndpoint struct {
 type RoutingRule struct {
 	Pattern string `json:"pattern"`
 	Agent   string `json:"agent"`
+	Runner  string `json:"runner,omitempty"`
+	Model   string `json:"model,omitempty"`
 }
 
 type Settings struct {
@@ -97,6 +99,15 @@ const (
 	settingsRowField settingsRowKind = iota
 	settingsRowRulePattern
 	settingsRowRuleAgent
+	settingsRowRuleRunner
+	settingsRowRuleModel
+)
+
+// settingsRows layout: settingsFieldRows fixed endpoint rows, then
+// settingsRowsPerRule rows (pattern/agent/runner/model) per routing rule.
+const (
+	settingsFieldRows   = 4
+	settingsRowsPerRule = 4
 )
 
 type settingsRow struct {
@@ -234,6 +245,9 @@ func validateSettings(s Settings) error {
 		if err := checkAgent(fmt.Sprintf("routing rule %d", i+1), r.Agent); err != nil {
 			return err
 		}
+		if err := checkRunner(fmt.Sprintf("routing rule %d", i+1), r.Runner); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -259,6 +273,8 @@ func settingsRows(s Settings) []settingsRow {
 		rows = append(rows,
 			settingsRow{Kind: settingsRowRulePattern, Section: "routing", Field: "pattern", Rule: i},
 			settingsRow{Kind: settingsRowRuleAgent, Section: "routing", Field: "agent", Rule: i},
+			settingsRow{Kind: settingsRowRuleRunner, Section: "routing", Field: "runner", Rule: i},
+			settingsRow{Kind: settingsRowRuleModel, Section: "routing", Field: "model", Rule: i},
 		)
 	}
 	return rows
@@ -307,7 +323,7 @@ func (m model) updateSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		switch row.Kind {
-		case settingsRowField, settingsRowRuleAgent:
+		case settingsRowField, settingsRowRuleAgent, settingsRowRuleRunner:
 			sv.cycleRow(row)
 			return m, saveSettingsCmd(m.dir, sv.settings)
 		case settingsRowRulePattern:
@@ -316,7 +332,16 @@ func (m model) updateSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			sv.inputValue = sv.settings.Routing[row.Rule].Pattern
 			sv.inputRow = row
 			return m, nil
+		case settingsRowRuleModel:
+			sv.inputMode = settingsInputString
+			sv.inputPrompt = "model (empty = default)"
+			sv.inputValue = sv.settings.Routing[row.Rule].Model
+			sv.inputRow = row
+			return m, nil
 		}
+	case "?":
+		m.showHelp = true
+		return m, nil
 	case "a":
 		sv.inputMode = settingsInputAddRule
 		sv.inputPrompt = "new pattern"
@@ -324,7 +349,7 @@ func (m model) updateSettingsKey(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	case "d":
 		row, ok := sv.currentRow()
-		if ok && (row.Kind == settingsRowRulePattern || row.Kind == settingsRowRuleAgent) {
+		if ok && row.Kind != settingsRowField {
 			sv.confirmDelete = true
 			sv.deleteRule = row.Rule
 		}
@@ -355,24 +380,33 @@ func (m model) updateSettingsInput(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		v := strings.TrimSpace(sv.inputValue)
 		switch sv.inputMode {
 		case settingsInputAddRule:
+			// Invalid input keeps the minibuffer open (typed text intact) with
+			// a red toast; only esc discards.
 			if v == "" {
-				sv.inputMode = settingsInputNone
 				sv.setToast("invalid: routing pattern is empty", true)
 				return m, settingsToastCmd()
 			}
 			sv.settings.Routing = append(sv.settings.Routing, RoutingRule{Pattern: v, Agent: settingsDefaults.Workers.Agent})
 			normalizeSettings(&sv.settings)
-			sv.cursor = 4 + (findRule(sv.settings.Routing, v) * 2) + 1
+			sv.cursor = settingsFieldRows + (findRule(sv.settings.Routing, v) * settingsRowsPerRule) + 1
 			sv.inputMode = settingsInputNone
 			sv.clampCursor()
 			return m, saveSettingsCmd(m.dir, sv.settings)
 		case settingsInputString:
 			row := sv.inputRow
-			if row.Kind == settingsRowRulePattern && row.Rule >= 0 && row.Rule < len(sv.settings.Routing) {
-				if v == "" {
-					sv.settings.Routing = append(sv.settings.Routing[:row.Rule], sv.settings.Routing[row.Rule+1:]...)
-				} else {
+			if row.Rule >= 0 && row.Rule < len(sv.settings.Routing) {
+				switch row.Kind {
+				case settingsRowRulePattern:
+					if v == "" {
+						sv.setToast("invalid: pattern is empty (d deletes the rule)", true)
+						return m, settingsToastCmd()
+					}
 					sv.settings.Routing[row.Rule].Pattern = v
+				case settingsRowRuleModel:
+					sv.settings.Routing[row.Rule].Model = v // empty clears → workers default
+				default:
+					sv.inputMode = settingsInputNone
+					return m, nil
 				}
 				normalizeSettings(&sv.settings)
 				sv.inputMode = settingsInputNone
@@ -435,6 +469,10 @@ func (sv *settingsView) cycleRow(row settingsRow) {
 		if row.Rule >= 0 && row.Rule < len(sv.settings.Routing) {
 			sv.settings.Routing[row.Rule].Agent = cycleValue(sv.settings.Routing[row.Rule].Agent, agentCycle)
 		}
+	case settingsRowRuleRunner:
+		if row.Rule >= 0 && row.Rule < len(sv.settings.Routing) {
+			sv.settings.Routing[row.Rule].Runner = cycleValue(sv.settings.Routing[row.Rule].Runner, runnerCycle)
+		}
 	}
 }
 
@@ -455,6 +493,16 @@ func (sv *settingsView) resetRow(row settingsRow) bool {
 	case settingsRowRuleAgent:
 		if row.Rule >= 0 && row.Rule < len(sv.settings.Routing) {
 			sv.settings.Routing[row.Rule].Agent = ""
+			return true
+		}
+	case settingsRowRuleRunner:
+		if row.Rule >= 0 && row.Rule < len(sv.settings.Routing) {
+			sv.settings.Routing[row.Rule].Runner = ""
+			return true
+		}
+	case settingsRowRuleModel:
+		if row.Rule >= 0 && row.Rule < len(sv.settings.Routing) {
+			sv.settings.Routing[row.Rule].Model = ""
 			return true
 		}
 	}
@@ -509,6 +557,8 @@ func RenderSettings(sv *settingsView, width int) string {
 		for i, r := range sv.settings.Routing {
 			lines = append(lines, renderRulePattern(sv, i, r.Pattern))
 			lines = append(lines, renderRuleAgent(sv, i, r.Agent))
+			lines = append(lines, renderRuleRunner(sv, i, r.Runner))
+			lines = append(lines, renderRuleModel(sv, i, r.Model))
 		}
 		workerDefaults := resolvedEndpoint(sv.settings.Workers, settingsDefaults.Workers)
 		lines = append(lines, styleDim.Render("  fallback  "+workerDefaults.Agent+" via "+workerDefaults.Runner+" — fallback — edit in WORKERS"))
@@ -544,6 +594,21 @@ func renderRuleAgent(sv *settingsView, idx int, raw string) string {
 	return renderSettingsRow(sv, row, fmt.Sprintf("rule %d agent", idx+1), settingsValue(raw, workerDefaults.Agent))
 }
 
+func renderRuleRunner(sv *settingsView, idx int, raw string) string {
+	workerDefaults := resolvedEndpoint(sv.settings.Workers, settingsDefaults.Workers)
+	row := settingsRow{Kind: settingsRowRuleRunner, Section: "routing", Field: "runner", Rule: idx}
+	return renderSettingsRow(sv, row, fmt.Sprintf("rule %d runner", idx+1), settingsValue(raw, workerDefaults.Runner))
+}
+
+func renderRuleModel(sv *settingsView, idx int, raw string) string {
+	row := settingsRow{Kind: settingsRowRuleModel, Section: "routing", Field: "model", Rule: idx}
+	value := styleDim.Render("default")
+	if raw != "" {
+		value = styleBold.Render(raw)
+	}
+	return renderSettingsRow(sv, row, fmt.Sprintf("rule %d model", idx+1), value)
+}
+
 func renderSettingsRow(sv *settingsView, row settingsRow, label, value string) string {
 	marker := "  "
 	if current, ok := sv.currentRow(); ok && sameSettingsRow(current, row) {
@@ -566,12 +631,18 @@ func sameSettingsRow(a, b settingsRow) bool {
 
 func settingsFooter(sv *settingsView) string {
 	if sv.inputMode != settingsInputNone {
-		return styleCyanBold.Render(sv.inputPrompt+": ") + sv.inputValue + styleDim.Render("  enter save · esc cancel")
+		line := styleCyanBold.Render(sv.inputPrompt+": ") + sv.inputValue + styleDim.Render("  enter save · esc discard")
+		// invalid input keeps the minibuffer open — surface the red toast on
+		// the same line so the feedback is visible while typing continues
+		if sv.toastLive && sv.toastRed {
+			line += " · " + styleRed.Render(sv.toast)
+		}
+		return line
 	}
 	if sv.confirmDelete {
 		return styleRed.Render("delete rule? ") + styleBold.Render("y") + "/" + styleBold.Render("n")
 	}
-	hint := styleDim.Render("j/k arrows move · enter/space edit/cycle · a add · d delete · r reset")
+	hint := styleDim.Render("j/k move · enter/space edit/cycle · a add · d delete · r reset · ? help · esc back")
 	if sv.toastLive {
 		if sv.toastRed {
 			return hint + " · " + styleRed.Render(sv.toast)
