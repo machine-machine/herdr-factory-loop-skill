@@ -31,6 +31,26 @@
 #                                                   #   runs/<run>/slices/S/verify.log; verified true|false + verify_cmd recorded in
 #                                                   #   status.json; on fail the slice is FAILED (+ failures.json entry).
 #                                                   #   --no-verify skips the gate (logged loudly).
+#   m2herd-up.sh watch    [--repo P] [--interval 60] [--max-resumes 3] [--once]
+#                                                   # SENTINEL: reconcile loop over workers[] in state spawned|working — encodes the
+#                                                   #   babysitting runs 1-3 needed by hand. Per TUI worker each tick: read the pane
+#                                                   #   (lines joined so wrap can't split a signature) + agent_status, then ladder:
+#                                                   #   crash signature (stream disconnected / Transport error / ECONNRESET / Unable to
+#                                                   #     connect to API) while not working → resume nudge (agent send, settle, Enter);
+#                                                   #   rate-limit menu ("What do you want to do?" + "limit to reset") → Enter (accept
+#                                                   #     stop-and-wait default), log the reset time when visible;
+#                                                   #   blocked on approval → escalate only ("WATCH: <slice> blocked on approval —
+#                                                   #     needs human/orchestrator"), NEVER auto-approve (deny/allow policy is
+#                                                   #     herd-loop's job);
+#                                                   #   idle + committed + report present → run the normal collect path;
+#                                                   #   idle + no commit (git log <base>..HEAD empty, porcelain clean) → stall nudge.
+#                                                   #   Resume count lives in the trace status.json ("resumes": N); past --max-resumes
+#                                                   #   the worker is marked failed (locked write) and left alone. Headless workers:
+#                                                   #   pid + log-tail check; a crash signature = failed at once (claude -p can't
+#                                                   #   resume). Never touches $SELF or panes not recorded in workers[]. --once =
+#                                                   #   single pass (orchestrator/scripted use); default loops until every watched
+#                                                   #   worker is done|failed. One status line per tick:
+#                                                   #   WATCH: <slice>=<state>[/<signature>] …   Exit 0 all done, 1 if any failed.
 #   m2herd-up.sh down     [--slice S | --all] [--repo P] [--force]
 #                                                   # tear worker(s) down: close pane (never $SELF; unknown self = fail safe),
 #                                                   #   remove worktree (dirty ones only with --force), delete branch when merged
@@ -70,7 +90,7 @@ DRY_RUN=0
 while [ "${1:-}" = "--dry-run" ]; do DRY_RUN=1; shift; done
 CMD="${1:-help}"; shift || true
 REPO=""; GOAL=""; SLICE=""; BASE=""; AGENT=""; HEADLESS=0; MODEL=""; RUNNER=""; ROOM_ONLY=0
-ALL=0; FORCE=0; NO_VERIFY=0
+ALL=0; FORCE=0; NO_VERIFY=0; INTERVAL=""; MAX_RESUMES=""; ONCE=0
 BASE_EXPLICIT=0; AGENT_EXPLICIT=0; MODEL_EXPLICIT=0; RUNNER_EXPLICIT=0
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -85,6 +105,9 @@ while [ $# -gt 0 ]; do
     --all) ALL=1; shift ;;
     --force) FORCE=1; shift ;;
     --no-verify) NO_VERIFY=1; shift ;;
+    --interval) INTERVAL="$2"; shift 2 ;;
+    --max-resumes) MAX_RESUMES="$2"; shift 2 ;;
+    --once) ONCE=1; shift ;;
     --model) MODEL="$2"; MODEL_EXPLICIT=1; shift 2 ;;
     --dry-run) DRY_RUN=1; shift ;;
     -h|--help) CMD="help"; shift ;;
@@ -111,6 +134,8 @@ BUILTIN_RUNNER="pane"
 BUILTIN_MAX_CONCURRENT=4
 BUILTIN_SETTLE_SECONDS=2
 BUILTIN_WAIT_TIMEOUT_MINUTES=30
+BUILTIN_WATCH_INTERVAL=60
+BUILTIN_MAX_RESUMES=3
 SUBMIT_SETTLE="$BUILTIN_SETTLE_SECONDS"             # settle between `agent send` and Enter
 WAIT_TIMEOUT=$((BUILTIN_WAIT_TIMEOUT_MINUTES * 60 * 1000)) # collect: ms to wait for worker idle
 
@@ -648,6 +673,63 @@ submit_pointer() { # submit_pointer <pane> <text>
   herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
 }
 
+# ---------- pane inspection helpers (dispatch verify + watch) ------------------
+# Pane text NORMALIZED for signature matching: lowercased with ALL whitespace
+# removed. The TUI hard-wraps lines mid-word ("cras\nhed"), so any newline- or
+# space-preserving match can lose a signature split across a wrap — joining
+# everything makes "stream disconnected" findable as "streamdisconnected" no
+# matter where the wrap fell.
+pane_norm_text() { # pane_norm_text <pane> [lines] -> normalized visible text
+  herdr pane read "$1" --source visible --lines "${2:-200}" --format text 2>/dev/null \
+    | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' || true
+}
+
+pane_raw_text() { # pane_raw_text <pane> [lines] -> visible text, lines intact
+  herdr pane read "$1" --source visible --lines "${2:-200}" --format text 2>/dev/null || true
+}
+
+agent_status_of() { # agent_status_of <pane> -> idle|working|blocked|done|unknown
+  local st
+  st="$(herdr agent get "$1" 2>/dev/null | jq -r '.result.agent.agent_status // empty' 2>/dev/null || true)"
+  printf '%s' "${st:-unknown}"
+}
+
+# Dispatch submission VERIFY (lesson prompt_lost_after_dispatch: worker sat idle
+# with the pointer stuck unsubmitted in its input; a manual re-send fixed it).
+# After the pointer send: status working = submitted; pointer text still on
+# screen while NOT working = unsubmitted input — re-send Enter, up to 2x.
+verify_submission() { # verify_submission <pane> <pointer-text>
+  local pane="$1" text="$2" frag norm status try
+  is_self "$pane" && return 0
+  if [ "$DRY_RUN" -eq 1 ]; then
+    plan "verify submission: wait settle, re-read pane '$pane'; pointer still unsubmitted → re-send Enter (up to 2x); input empty + status working → ok"
+    return 0
+  fi
+  frag="$(printf '%.60s' "$text" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  for try in 1 2 3; do
+    sleep "$SUBMIT_SETTLE"
+    status="$(agent_status_of "$pane")"
+    if [ "$status" = "working" ]; then
+      log "dispatch: pointer submitted (agent working)"
+      return 0
+    fi
+    norm="$(pane_norm_text "$pane" 60)"
+    case "$norm" in
+      *"$frag"*)
+        if [ "$try" -le 2 ]; then
+          log "dispatch: pointer still unsubmitted in pane $pane (status $status) — re-sending Enter ($try/2)"
+          herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
+        else
+          log "! dispatch: pointer may still be unsubmitted in pane $pane after 2 Enter re-sends — check the pane"
+          return 0
+        fi ;;
+      *)
+        log "dispatch: pane input clear (status $status) — pointer submitted"
+        return 0 ;;
+    esac
+  done
+}
+
 # ---------- up: workspace bootstrap -------------------------------------------
 # Machineroom pane viewer command. Prefer the engine's built-in flicker-free
 # watch mode (home-cursor repaint, self-update check every 10 min); the pane is
@@ -967,8 +1049,11 @@ dispatch() {
 
   # 3. file-protocol dispatch: one-line pointer, settle, Enter — same confinement
   #    as headless: the worker reads the task COPY inside its own worktree.
-  local wtask2; wtask2="$(copy_task_into_wt "$wt")"
-  submit_pointer "$pane" "$(confinement_line "$wt" "$branch") Read $wtask2 and follow its instructions exactly.$(lessons_pointer_suffix)"
+  local wtask2 pointer
+  wtask2="$(copy_task_into_wt "$wt")"
+  pointer="$(confinement_line "$wt" "$branch") Read $wtask2 and follow its instructions exactly.$(lessons_pointer_suffix)"
+  submit_pointer "$pane" "$pointer"
+  verify_submission "$pane" "$pointer"
 
   # 4. record in overview.json workers[]
   record_worker "$SLICE" "$pane" "$wt" "$branch" "spawned"
@@ -1236,6 +1321,278 @@ collect() {
   fi
 }
 
+# ---------- watch: sentinel — auto-resume crashed/stalled workers ---------------
+# Encodes the manual babysitting from runs 1-3 (LESSONS.md): codex workers
+# crashed 2x each on "stream disconnected: Transport error", claude workers died
+# on ECONNRESET, each needed a hand-typed resume nudge, and rate-limit menus
+# stalled workers for minutes. A reconcile loop over workers[] in state
+# spawned|working: detect the stall, climb the response ladder, and only
+# escalate what genuinely needs a human (approval prompts — auto-approval stays
+# OUT of scope here; deny/allow policy is herd-loop's job). Only pane_ids
+# recorded in workers[] are ever touched, and those were proven non-$SELF at
+# dispatch; is_self re-checks anyway before every send.
+
+RESUME_NUDGE="connection dropped — continue exactly where you left off: finish your task items, commit your work, and write your report."
+STALL_NUDGE="you appear stopped with no commit on your branch — continue exactly where you left off: finish your task items, commit your work, and write your report."
+REPORT_NUDGE="your commits landed but no report file exists — write your complete report to the path named in your task file, then stop."
+
+WATCH_TOKEN=""      # set by watch_one_*: "<slice>=<state>[/<signature>]"
+WATCHED=""          # slices seen active this watch — the exit-code set
+
+crash_signature_of() { # crash_signature_of <norm-text> -> echoes name; rc 1 when none
+  case "$1" in
+    *streamdisconnected*)   printf 'stream-disconnected' ;;
+    *transporterror*)       printf 'transport-error' ;;
+    *econnreset*)           printf 'econnreset' ;;
+    *unabletoconnecttoapi*) printf 'api-unreachable' ;;
+    *) return 1 ;;
+  esac
+}
+
+rate_limit_menu() { # rate_limit_menu <norm-text> — the interactive limit menu
+  case "$1" in
+    *whatdoyouwanttodo*) case "$1" in *limittoreset*) return 0 ;; esac ;;
+  esac
+  return 1
+}
+
+# Resume count lives in the slice's trace status.json ("resumes": N); when no
+# run bundle exists the count degrades to dispatch/<slice>.resumes so
+# --max-resumes still holds.
+resumes_status_json() { # resumes_status_json <slice> -> path, or empty
+  local rid p=""
+  rid="$(trace_find_run_for_slice "$1")"
+  [ -n "$rid" ] && p="$REPO/.m2herd/runs/$rid/slices/$1/status.json"
+  if [ -n "$p" ] && [ -f "$p" ]; then printf '%s' "$p"; fi
+  return 0
+}
+
+resumes_get() { # resumes_get <slice> -> N (0 when untracked)
+  local sj n=""
+  sj="$(resumes_status_json "$1")"
+  if [ -n "$sj" ]; then n="$(jq -r '.resumes // 0' "$sj" 2>/dev/null || true)"
+  else n="$(cat "$REPO/.m2herd/dispatch/$1.resumes" 2>/dev/null || true)"; fi
+  case "$n" in ''|*[!0-9]*) n=0 ;; esac
+  printf '%s' "$n"
+}
+
+resumes_bump() { # resumes_bump <slice> — increment the counter (no output)
+  local sj n tmp
+  n=$(( $(resumes_get "$1") + 1 ))
+  sj="$(resumes_status_json "$1")"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    plan "record resumes=$n for $1 (${sj:-$REPO/.m2herd/dispatch/$1.resumes})"
+  elif [ -n "$sj" ]; then
+    tmp="$(mktemp "$(dirname "$sj")/.status.json.tmp.XXXXXX")" || { trace_warn "mktemp for $sj failed"; return 0; }
+    jq --argjson n "$n" '.resumes = $n' "$sj" > "$tmp" 2>/dev/null && mv "$tmp" "$sj" \
+      || { rm -f "$tmp"; trace_warn "resumes update to $sj failed"; }
+  else
+    trace_warn "no run bundle for $1 — tracking resumes in dispatch/$1.resumes"
+    printf '%s' "$n" > "$REPO/.m2herd/dispatch/$1.resumes" 2>/dev/null || true
+  fi
+  return 0
+}
+
+# Base ref for the "did it commit anything" check: the run bundle recorded the
+# dispatch-time base; fall back to settings, then the repo's current branch.
+slice_base() { # slice_base <slice> -> ref
+  local rid b=""
+  rid="$(trace_find_run_for_slice "$1")"
+  [ -n "$rid" ] && b="$(jq -r '.base // empty' "$REPO/.m2herd/runs/$rid/run.json" 2>/dev/null || true)"
+  [ -n "$b" ] || b="$(settings_get '.workers.base' "")"
+  [ -n "$b" ] || b="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
+  printf '%s' "$b"
+}
+
+# Terminal failure via the SAME locked/trace writers the rest of the script
+# uses; after this the watch loop stops touching the worker.
+watch_fail() { # watch_fail <slice> <kind> <evidence>
+  printf 'WATCH: %s marked FAILED — %s\n' "$1" "$3"
+  set_worker_state "$1" "failed"
+  trace_collect_write "$1" "failed" "" "" || true
+  trace_append_failure "$1" "$2" "$3" || true
+}
+
+# Reuse the existing collect path (wait-idle short-circuits: we only call this
+# when the worker is already idle/exited). Runs in a subshell so collect's
+# `exit 1` on a failed verify/report can't kill the watch loop.
+watch_collect() { # watch_collect <slice> -> 0 done, 1 failed
+  if [ "$DRY_RUN" -eq 1 ]; then plan "run the collect path for $1 (collect --slice $1)"; return 0; fi
+  log "watch: collecting $1"
+  if ( SLICE="$1" && collect ) </dev/null; then return 0; else return 1; fi
+}
+
+# One resume-ladder step for a stalled TUI worker: enforce --max-resumes, bump
+# the counter, nudge (agent send, settle, Enter — submit_pointer).
+watch_nudge() { # watch_nudge <slice> <pane> <signature> <status> <nudge-text>
+  local s="$1" pane="$2" sig="$3" status="$4" text="$5" n
+  n="$(resumes_get "$s")"
+  if [ "$n" -ge "$WATCH_MAX_RESUMES" ]; then
+    watch_fail "$s" "resume_exhausted" "signature '$sig' after $n resumes (max $WATCH_MAX_RESUMES) — not touching it again"
+    WATCH_TOKEN="$s=failed/$sig:resumes-exhausted"
+    return 0
+  fi
+  resumes_bump "$s"
+  log "watch: $s signature '$sig' (status $status) — resume nudge $((n + 1))/$WATCH_MAX_RESUMES"
+  submit_pointer "$pane" "$text"
+  set_worker_state "$s" "working"
+  WATCH_TOKEN="$s=working/$sig:nudged$((n + 1))"
+}
+
+watch_one_tui() { # watch_one_tui <slice> <pane> <wt> <state>
+  local s="$1" pane="$2" wt="$3" state="$4"
+  local raw norm status sig known out commits="?" dirty="?" base reset
+  WATCH_TOKEN="$s=$state"
+  if [ -z "$pane" ] || [ "$pane" = "-" ]; then WATCH_TOKEN="$s=$state/no-pane"; return 0; fi
+  if is_self "$pane"; then WATCH_TOKEN="$s=$state/self-skip"; return 0; fi
+
+  # dead pane → straight to collect: its dead-pane branch keeps a landed report
+  # (verify gate included) or marks the slice failed with a written-out reason.
+  known="$(herdr pane list 2>/dev/null | jq -r '.result.panes[]?.pane_id' 2>/dev/null || true)"
+  if [ -n "$known" ] && ! printf '%s\n' "$known" | grep -qxF "$pane"; then
+    log "watch: $s pane $pane is gone — handing to collect"
+    if watch_collect "$s"; then WATCH_TOKEN="$s=done/pane-gone-collected"; else WATCH_TOKEN="$s=failed/pane-gone"; fi
+    return 0
+  fi
+
+  raw="$(pane_raw_text "$pane")"
+  norm="$(printf '%s' "$raw" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+  status="$(agent_status_of "$pane")"
+  if [ -z "$norm" ] && [ "$status" = "unknown" ]; then
+    # can't read it AND can't classify it (fleet hiccup?) — observe, never act
+    WATCH_TOKEN="$s=$state/unreadable"
+    return 0
+  fi
+
+  # 1. crash signature while not actively working → resume nudge. The "not
+  #    working" gate stops re-nudging a worker that already resumed but still
+  #    shows the old error text on screen.
+  if sig="$(crash_signature_of "$norm")" && [ "$status" != "working" ]; then
+    watch_nudge "$s" "$pane" "$sig" "$status" "$RESUME_NUDGE"
+    return 0
+  fi
+
+  # 2. rate-limit menu → accept the stop-and-wait default (Enter), log the
+  #    reset time when visible. Not a resume — nothing was lost.
+  if rate_limit_menu "$norm"; then
+    reset="$(printf '%s' "$raw" | grep -i 'reset' | head -1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
+    log "watch: $s rate-limit menu — pressing Enter (stop-and-wait)${reset:+; menu says: $reset}"
+    if [ "$DRY_RUN" -eq 1 ]; then plan "herdr pane send-keys '$pane' Enter"
+    else herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true; fi
+    WATCH_TOKEN="$s=$state/rate-limit:accepted"
+    return 0
+  fi
+
+  # 3. blocked on an approval prompt → escalate ONLY. Auto-approval is out of
+  #    scope by design (deny/allow policy belongs to herd-loop).
+  if [ "$status" = "blocked" ]; then
+    printf 'WATCH: %s blocked on approval — needs human/orchestrator\n' "$s"
+    WATCH_TOKEN="$s=blocked/approval"
+    return 0
+  fi
+
+  # 4. idle-ish (idle|done, plus unknown: a dead TUI drops agent detection and
+  #    that is exactly the crashed-back-to-shell case) → git decides.
+  case "$status" in
+    idle|done|unknown)
+      out="$REPO/.m2herd/dispatch/$s.out.md"
+      if [ -n "$wt" ] && [ -d "$wt" ]; then
+        base="$(slice_base "$s")"
+        if git -C "$wt" rev-parse --verify -q "$base" >/dev/null 2>&1; then
+          commits="$(git -C "$wt" log --oneline "$base..HEAD" 2>/dev/null | wc -l | tr -d ' ')"
+        fi
+        dirty="$(git -C "$wt" status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
+      fi
+      if [ -s "$out" ] && [ "$commits" != "?" ] && [ "$commits" -gt 0 ]; then
+        # idle + committed + report present → the worker is done; collect it
+        if watch_collect "$s"; then WATCH_TOKEN="$s=done/collected"; else WATCH_TOKEN="$s=failed/collect"; fi
+      elif [ "$commits" = "0" ]; then
+        # idle + empty input + no commit — worker forgot/stopped (dirty=$dirty)
+        log "watch: $s idle with 0 commits (dirty files: $dirty)"
+        watch_nudge "$s" "$pane" "idle-no-commit" "$status" "$STALL_NUDGE"
+      elif [ "$commits" != "?" ] && [ ! -s "$out" ]; then
+        watch_nudge "$s" "$pane" "idle-no-report" "$status" "$REPORT_NUDGE"
+      else
+        WATCH_TOKEN="$s=$state/idle-unverifiable"   # base ref or worktree gone — observe only
+      fi
+      ;;
+    *)
+      WATCH_TOKEN="$s=working"
+      ;;
+  esac
+  return 0
+}
+
+watch_one_headless() { # watch_one_headless <slice> <state>
+  local s="$1" state="$2" pid pstart curstart norm sig alive=0 out
+  WATCH_TOKEN="$s=$state"
+  pid="$(jq -r --arg s "$s" '[.workers[]? | select(.slice==$s)] | first | .pid // empty' "$OV" 2>/dev/null || true)"
+  pstart="$(jq -r --arg s "$s" '[.workers[]? | select(.slice==$s)] | first | .pid_start // empty' "$OV" 2>/dev/null || true)"
+  out="$REPO/.m2herd/dispatch/$s.out.md"
+  norm="$( { tail -c 4000 "$REPO/.m2herd/dispatch/$s.log" 2>/dev/null; tail -c 4000 "$REPO/.m2herd/dispatch/$s.stderr.log" 2>/dev/null; } \
+    | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]' || true)"
+  if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    curstart="$(ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' || true)"
+    if [ -z "$pstart" ] || [ "$curstart" = "$pstart" ]; then alive=1; fi   # start-time mismatch = recycled pid
+  fi
+  # crash signature in the log tail with no report = failed at once (a one-shot
+  # `claude -p` / `codex exec` cannot be resume-nudged); a landed report means
+  # the worker survived its errors — let collect (and the verify gate) judge it.
+  if [ ! -s "$out" ] && sig="$(crash_signature_of "$norm")"; then
+    watch_fail "$s" "worker_crash" "headless crash signature '$sig' in log tail — one-shot runner cannot be resumed"
+    WATCH_TOKEN="$s=failed/$sig"
+  elif [ "$alive" -eq 1 ]; then
+    WATCH_TOKEN="$s=working/pid$pid"
+  else
+    if watch_collect "$s"; then WATCH_TOKEN="$s=done/collected"; else WATCH_TOKEN="$s=failed/collect"; fi
+  fi
+  return 0
+}
+
+watch() {
+  resolve_repo; resolve_self
+  resolve_dispatch_settings
+  WATCH_INTERVAL="$(positive_int_or_default "${INTERVAL:-$BUILTIN_WATCH_INTERVAL}" "$BUILTIN_WATCH_INTERVAL")"
+  WATCH_MAX_RESUMES="$(positive_int_or_default "${MAX_RESUMES:-$BUILTIN_MAX_RESUMES}" "$BUILTIN_MAX_RESUMES")"
+  if [ ! -f "$OV" ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then plan "read $OV workers[] (absent — nothing to watch)"; return 0; fi
+    echo "no overview.json at $OV — nothing to watch" >&2; exit 1
+  fi
+  local once="$ONCE"
+  if [ "$DRY_RUN" -eq 1 ] && [ "$once" -eq 0 ]; then once=1; log "watch: dry-run — single pass, actions planned only"; fi
+  log "watch: repo=$REPO interval=${WATCH_INTERVAL}s max-resumes=$WATCH_MAX_RESUMES once=$once (self pane: ${SELF:-<unknown>})"
+  local active s w pane wt mode state line rc=0
+  while :; do
+    active="$(jq -r '[.workers[]? | select(.state=="spawned" or .state=="working")] | .[].slice' "$OV" 2>/dev/null || true)"
+    [ -n "$active" ] || break
+    line=""
+    for s in $active; do
+      case " $WATCHED " in *" $s "*) : ;; *) WATCHED="$WATCHED $s" ;; esac
+      w="$(jq -c --arg s "$s" '[.workers[]? | select(.slice==$s)] | first' "$OV" 2>/dev/null || true)"
+      pane="$(printf '%s' "$w" | jq -r '.pane_id // empty')"
+      wt="$(printf '%s' "$w" | jq -r '.worktree // empty')"
+      mode="$(printf '%s' "$w" | jq -r '.mode // "tui"')"
+      state="$(printf '%s' "$w" | jq -r '.state // "unknown"')"
+      if [ "$mode" = "headless" ]; then
+        watch_one_headless "$s" "$state"
+      else
+        watch_one_tui "$s" "$pane" "$wt" "$state"
+      fi
+      line="${line:+$line }$WATCH_TOKEN"
+    done
+    printf 'WATCH: %s\n' "$line"
+    [ "$once" -eq 1 ] && break
+    sleep "$WATCH_INTERVAL"
+  done
+  [ -n "$WATCHED" ] || log "watch: no workers in state spawned|working — nothing to do"
+  for s in $WATCHED; do
+    state="$(jq -r --arg s "$s" '[.workers[]? | select(.slice==$s)] | first | .state // "unknown"' "$OV" 2>/dev/null || echo unknown)"
+    [ "$state" = "failed" ] && rc=1
+  done
+  log "watch: done — watched:${WATCHED:- <none>} (exit $rc)"
+  exit "$rc"
+}
+
 # ---------- down: tear a worker down (pane → worktree → branch → state) --------
 # Idempotent: every step skips cleanly when its target is already gone. Retrying
 # a slice = clean `down --slice S`, then a normal dispatch recreates everything.
@@ -1359,6 +1716,7 @@ case "$CMD" in
   up)       up ;;
   dispatch) dispatch ;;
   collect)  collect ;;
+  watch)    watch ;;
   down)     down ;;
   help|*)   awk 'NR >= 2 { if ($0 ~ /^set -euo pipefail/) exit; print }' "$0" ;;
 esac
