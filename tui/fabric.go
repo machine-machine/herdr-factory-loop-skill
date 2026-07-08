@@ -230,25 +230,59 @@ func HumanNoteTime(t time.Time) string {
 	return local.Format("Jan 2 15:04")
 }
 
-// BudgetInfo is the newest /tmp/claude-ctx-*.json context-bridge reading.
+// BudgetInfo is the preferred /tmp/claude-ctx-*.json context-bridge reading.
 type BudgetInfo struct {
 	Present bool
 	Pct     int
 	Budget  int64
 	Age     string
+	Session string // session id from the bridge filename, "" when unknown
+}
+
+// bridgeSessionID extracts the session id ctx-bridge.sh embeds in its
+// filename (/tmp/claude-ctx-<session-id>.json).
+func bridgeSessionID(path string) string {
+	base := filepath.Base(path)
+	base = strings.TrimPrefix(base, "claude-ctx-")
+	return strings.TrimSuffix(base, ".json")
+}
+
+// liveClaudeSessions returns session ids of Claude Code sessions whose
+// transcript (~/.claude/projects/<slug>/<session-id>.jsonl) was written in
+// the last 5 minutes — best available "session is live" signal. Best-effort:
+// nil when the directory is absent or unreadable.
+func liveClaudeSessions() map[string]bool {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	matches, _ := filepath.Glob(filepath.Join(home, ".claude", "projects", "*", "*.jsonl"))
+	live := map[string]bool{}
+	for _, m := range matches {
+		fi, err := os.Stat(m)
+		if err != nil || time.Since(fi.ModTime()) > 5*time.Minute {
+			continue
+		}
+		live[strings.TrimSuffix(filepath.Base(m), ".jsonl")] = true
+	}
+	return live
 }
 
 // LoadBudget scans /tmp/claude-ctx-*.json for the first file with a numeric
 // .used_pct, mirroring budget_row() in scripts/m2herd.sh. Files older than
-// 30 min are ignored, files owned by the current uid are preferred (newest
-// first within each group), and a non-positive budget rejects the file.
+// 30 min are ignored, files owned by the current uid are preferred, then
+// files whose session id matches a live claude session, then newest first —
+// so with several fresh bridge files the one backed by a session that is
+// actually running wins.
 func LoadBudget() BudgetInfo {
 	matches, _ := filepath.Glob("/tmp/claude-ctx-*.json")
 	uid := os.Getuid()
+	live := liveClaudeSessions()
 	type candidate struct {
 		path string
 		mod  time.Time
 		mine bool
+		live bool
 	}
 	var cands []candidate
 	for _, m := range matches {
@@ -260,11 +294,14 @@ func LoadBudget() BudgetInfo {
 		if st, ok := fi.Sys().(*syscall.Stat_t); ok {
 			mine = int(st.Uid) == uid
 		}
-		cands = append(cands, candidate{path: m, mod: fi.ModTime(), mine: mine})
+		cands = append(cands, candidate{path: m, mod: fi.ModTime(), mine: mine, live: live[bridgeSessionID(m)]})
 	}
 	sort.Slice(cands, func(i, j int) bool {
 		if cands[i].mine != cands[j].mine {
 			return cands[i].mine
+		}
+		if cands[i].live != cands[j].live {
+			return cands[i].live
 		}
 		return cands[i].mod.After(cands[j].mod)
 	})
@@ -296,9 +333,48 @@ func LoadBudget() BudgetInfo {
 		if budget <= 0 {
 			continue
 		}
-		return BudgetInfo{Present: true, Pct: int(pctF), Budget: budget, Age: ageString(time.Since(c.mod))}
+		return BudgetInfo{Present: true, Pct: int(pctF), Budget: budget, Age: ageString(time.Since(c.mod)), Session: bridgeSessionID(m)}
 	}
 	return BudgetInfo{}
+}
+
+// SliceResumes reads resume counts from the current run's slice traces
+// (.m2herd/runs/<CURRENT>/slices/*/status.json). Best-effort and read-only:
+// any missing file, empty CURRENT, or unparseable trace is skipped silently.
+// Only slices with resumes>0 appear in the map; nil when none.
+func SliceResumes(dir string) map[string]int {
+	cur, err := os.ReadFile(filepath.Join(dir, ".m2herd", "runs", "CURRENT"))
+	if err != nil {
+		return nil
+	}
+	run := strings.TrimSpace(string(cur))
+	if run == "" {
+		return nil
+	}
+	matches, _ := filepath.Glob(filepath.Join(dir, ".m2herd", "runs", run, "slices", "*", "status.json"))
+	out := map[string]int{}
+	for _, m := range matches {
+		b, err := os.ReadFile(m)
+		if err != nil {
+			continue
+		}
+		var st struct {
+			Slice   string `json:"slice"`
+			Resumes int    `json:"resumes"`
+		}
+		if json.Unmarshal(b, &st) != nil || st.Resumes <= 0 {
+			continue
+		}
+		slice := st.Slice
+		if slice == "" {
+			slice = filepath.Base(filepath.Dir(m))
+		}
+		out[slice] = st.Resumes
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
 }
 
 // UpdateBanner is the cached ~/.cache/m2herd/update-status reading.
