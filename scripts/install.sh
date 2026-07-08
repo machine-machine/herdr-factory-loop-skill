@@ -109,7 +109,6 @@ else
   HOOKS_SRC_DIR="$CACHE_DIR/hooks"
   SCRIPTS_SRC_DIR="$CACHE_DIR/scripts"
 fi
-HOOK_SRC="$HOOKS_SRC_DIR/$HOOK_NAME"
 
 install_one() {
   local target_dir="$1"

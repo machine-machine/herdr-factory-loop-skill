@@ -1025,16 +1025,18 @@ evolve_dirs() {
 # --run <id|latest|current> (default: current, falling back to latest); prints
 # the resolved run-id, or nothing if none can be found.
 resolve_run_id() {
-  local want="${RUN:-current}" id
+  local want="${RUN:-current}" id d
   case "$want" in
     latest)
-      ls -1 "$RUNS_DIR" 2>/dev/null | grep '^r-' | sort | tail -1 || true ;;
+      id=""; for d in "$RUNS_DIR"/r-*; do [ -e "$d" ] && id="${d##*/}"; done
+      [ -z "$id" ] || printf '%s\n' "$id" ;;
     current|"")
       if [ -f "$RUNS_DIR/CURRENT" ] && [ -s "$RUNS_DIR/CURRENT" ]; then
         id="$(cat "$RUNS_DIR/CURRENT")"
         if [ -n "$id" ] && [ -d "$RUNS_DIR/$id" ]; then printf '%s' "$id"; return 0; fi
       fi
-      ls -1 "$RUNS_DIR" 2>/dev/null | grep '^r-' | sort | tail -1 || true ;;
+      id=""; for d in "$RUNS_DIR"/r-*; do [ -e "$d" ] && id="${d##*/}"; done
+      [ -z "$id" ] || printf '%s\n' "$id" ;;
     *)
       validate_token "run id" "$want"
       [ -d "$RUNS_DIR/$want" ] && printf '%s' "$want" ;;

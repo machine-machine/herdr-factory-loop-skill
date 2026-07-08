@@ -32,11 +32,8 @@ jobs:
         run: bash hooks/smoke.sh
 
   shellcheck:
-    name: shellcheck (advisory)
+    name: shellcheck
     runs-on: ubuntu-latest
-    # Advisory for now: the repo is not yet shellcheck-clean.
-    # Drop continue-on-error and gate at -S error once it is.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 
