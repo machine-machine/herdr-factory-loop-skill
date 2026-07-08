@@ -26,6 +26,12 @@ if [ -n "${_line:-}" ]; then _stdin="${_stdin}${_line}"; fi
 # jq is required for safe JSON encoding; without it, stay silent.
 command -v jq >/dev/null 2>&1 || exit 0
 
+# Session id from the stdin payload — used to find this session's own bridge
+# file. Sanitised like the js hooks: no path separators / traversal (it is
+# interpolated into a /tmp path).
+SID="$(printf '%s' "$_stdin" | jq -r '.session_id // empty' 2>/dev/null || true)"
+case "$SID" in */*|*\\*|*..*) SID="" ;; esac
+
 # Resolve the repo root: prefer $M2HERD_DIR, else cwd — whichever holds .m2herd/.
 ROOT=""
 if [ -n "${M2HERD_DIR:-}" ] && [ -d "${M2HERD_DIR}/.m2herd" ]; then
@@ -39,6 +45,51 @@ fi
 
 M2="${ROOT}/.m2herd"
 
+# --- context-budget awareness (reads the ctx-bridge statusline bridge file) --
+# Prefer THIS session's bridge file (from $SID) in /tmp then $TMPDIR; else the
+# newest fresh one. Both must be ≤30 min old — an older bridge describes a
+# window that no longer exists. Warn/debounce sidecars (…-m2herd-budget.json /
+# …-herdr-budget.json) share the glob and are skipped by name; anything whose
+# pct/used_pct doesn't parse numeric is skipped too. Never fails the hook.
+_mtime() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo 0; }
+CTX_PCT=""
+_now="$(date -u +%s 2>/dev/null || echo 0)"
+_bridge=""
+if [ -n "$SID" ]; then
+  for _d in /tmp "${TMPDIR:-}"; do
+    [ -n "$_d" ] || continue
+    _c="$_d/claude-ctx-$SID.json"
+    [ -f "$_c" ] || continue
+    _mt="$(_mtime "$_c")"
+    case "$_mt" in ''|*[!0-9]*) _mt=0 ;; esac
+    if [ $((_now - _mt)) -le 1800 ]; then _bridge="$_c"; break; fi
+  done
+fi
+if [ -z "$_bridge" ]; then
+  _best=0
+  for _d in /tmp "${TMPDIR:-}"; do
+    [ -n "$_d" ] && [ -d "$_d" ] || continue
+    for _c in "$_d"/claude-ctx-*.json; do
+      [ -f "$_c" ] || continue
+      [ -O "$_c" ] || continue
+      case "$_c" in *-m2herd-budget.json|*-herdr-budget.json) continue ;; esac
+      _mt="$(_mtime "$_c")"
+      case "$_mt" in ''|*[!0-9]*) _mt=0 ;; esac
+      [ $((_now - _mt)) -le 1800 ] || continue
+      if [ "$_mt" -gt "$_best" ]; then _best="$_mt"; _bridge="$_c"; fi
+    done
+  done
+fi
+if [ -n "$_bridge" ]; then
+  CTX_PCT="$(jq -r '(.pct // .used_pct) // empty' "$_bridge" 2>/dev/null || true)"
+  CTX_PCT="${CTX_PCT%.*}"
+  case "$CTX_PCT" in ''|*[!0-9]*) CTX_PCT="" ;; esac
+fi
+
+# Budget-aware digest sizing: at ≥60% context, halve the RESUME excerpt.
+RESUME_LINES=30
+if [ -n "$CTX_PCT" ] && [ "$CTX_PCT" -ge 60 ]; then RESUME_LINES=15; fi
+
 GOAL=""
 STATUS=""
 AREAS="0"
@@ -51,7 +102,7 @@ fi
 
 RESUME=""
 if [ -f "$M2/RESUME.md" ]; then
-  RESUME="$(head -30 "$M2/RESUME.md" 2>/dev/null || true)"
+  RESUME="$(head -"$RESUME_LINES" "$M2/RESUME.md" 2>/dev/null || true)"
 fi
 
 # Next-move probe (contract amendment v1.2, supersedes the v1.1 drift nudge —
@@ -93,7 +144,7 @@ MSG="m2herd context fabric detected at ${M2}."
 MSG="${MSG} goal: ${GOAL:-(unset)} | status: ${STATUS:-(unset)} | areas: ${AREAS}."
 if [ -n "$RESUME" ]; then
   MSG="${MSG}
---- RESUME.md (first 30 lines) ---
+--- RESUME.md (first ${RESUME_LINES} lines) ---
 ${RESUME}"
 else
   MSG="${MSG} No RESUME.md yet — run 'm2herd.sh status' to orient."
@@ -101,6 +152,12 @@ fi
 if [ -n "$NEXT" ]; then
   MSG="${MSG}
 ${NEXT}"
+fi
+# Budget-aware nudge: above 60% the digest itself must stay lean and the
+# orchestrator should lean on the fabric, not the transcript.
+if [ -n "$CTX_PCT" ] && [ "$CTX_PCT" -ge 60 ]; then
+  MSG="${MSG}
+context at ${CTX_PCT}% — prefer pointers over content; offload with m2herd refile/archive"
 fi
 
 # The orchestrator mandate — this is what makes a Claude Code session "kick off"

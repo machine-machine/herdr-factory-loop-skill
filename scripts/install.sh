@@ -10,6 +10,7 @@
 #   ./scripts/install.sh --local         # install from the local repo (no clone)
 #   ./scripts/install.sh --no-nudge-hook # skip the UserPromptSubmit/pre_llm_call nudge hook
 #   ./scripts/install.sh --no-m2herd-hooks # skip the m2herd SessionStart/PreCompact/PostToolUse hooks
+#   ./scripts/install.sh --no-statusline # skip the ctx-bridge statusline registration (claude)
 #   ./scripts/install.sh --uninstall
 #
 # Idempotent. Safe to re-run.
@@ -32,7 +33,7 @@ HOOK_NAME="herdr-dispatch-nudge.sh"
 CACHE_DIR="${HERMES_SKILL_CACHE_DIR:-$HOME/.cache/herdr-factory-loop-skill}"
 
 usage() {
-  sed -n '2,18p' "$0"
+  sed -n '2,19p' "$0"
   exit "${1:-0}"
 }
 
@@ -43,6 +44,7 @@ local_mode=0
 uninstall=0
 nudge_hook=1
 m2herd_hooks=1
+statusline=1
 for arg in "$@"; do
   case "$arg" in
     --hermes) install_hermes=1 ;;
@@ -51,6 +53,7 @@ for arg in "$@"; do
     --local)  local_mode=1 ;;
     --no-nudge-hook) nudge_hook=0 ;;
     --no-m2herd-hooks) m2herd_hooks=0 ;;
+    --no-statusline) statusline=0 ;;
     --uninstall) uninstall=1 ;;
     -h|--help) usage 0 ;;
     *) echo "Unknown arg: $arg" >&2; usage 1 ;;
@@ -324,6 +327,67 @@ register_m2herd_hooks() {
   echo "[claude] registered m2herd hooks in $settings (SessionStart, PreCompact$([ "$budget_ok" -eq 1 ] && echo ", PostToolUse"))"
 }
 
+# --- Claude Code statusline: ctx-bridge.sh (the context-budget bridge WRITER).
+# The whole budget layer reads /tmp/claude-ctx-<session>.json; ctx-bridge is the
+# only writer, wired as settings.json .statusLine. Registered ONLY when no
+# statusLine is configured yet — an existing one is NEVER clobbered (a note
+# explains how to chain manually). Skipped with --no-statusline. Uninstall
+# removes the statusLine only when it is ours (matched on the script name).
+CTX_BRIDGE_NAME="ctx-bridge.sh"
+
+register_claude_statusline() {
+  local settings="$HOME/.claude/settings.json"
+  local src="$SCRIPTS_SRC_DIR/$CTX_BRIDGE_NAME"
+  local cmd="bash \"$src\""
+
+  if [ "$uninstall" -eq 1 ]; then
+    [ -f "$settings" ] || return 0
+    if ! command -v jq >/dev/null 2>&1; then
+      echo "[claude] jq not found — cannot remove ctx-bridge statusLine from $settings automatically" >&2
+      return 0
+    fi
+    settings_json_ok "$settings" claude || return 0
+    if jq -e --arg name "$CTX_BRIDGE_NAME" '(.statusLine.command // "") | contains($name)' "$settings" >/dev/null 2>&1; then
+      backup_file "$settings"
+      local tmp="$settings.tmp.$$"
+      track_tmp "$tmp"
+      jq 'del(.statusLine)' "$settings" > "$tmp" && mv "$tmp" "$settings"
+      echo "[claude] removed ctx-bridge statusLine from $settings"
+    fi
+    return 0
+  fi
+
+  [ "$statusline" -eq 1 ] || return 0
+  if [ ! -f "$src" ]; then
+    echo "[claude] warn: $src not found — skipping statusline registration" >&2
+    return 0
+  fi
+  chmod +x "$src" 2>/dev/null || true
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "[claude] warn: jq not found — skipping statusLine registration. Wire it manually in $settings:" >&2
+    echo "  \"statusLine\": {\"type\": \"command\", \"command\": \"$cmd\"}" >&2
+    return 0
+  fi
+  settings_json_ok "$settings" claude || return 0
+  [ -f "$settings" ] || echo '{}' > "$settings"
+  if jq -e '.statusLine' "$settings" >/dev/null 2>&1; then
+    if jq -e --arg name "$CTX_BRIDGE_NAME" '(.statusLine.command // "") | contains($name)' "$settings" >/dev/null 2>&1; then
+      echo "[claude] ctx-bridge statusLine already registered in $settings"
+    else
+      echo "[claude] note: a statusLine is already configured in $settings — NOT clobbering it."
+      echo "[claude]       Without ctx-bridge the context-budget hooks stay blind (no /tmp/claude-ctx-<session>.json writer)."
+      echo "[claude]       To chain manually, tee the payload through ctx-bridge before your own command, e.g.:"
+      echo "[claude]         \"command\": \"tee >(bash \\\"$src\\\" >/dev/null) | <your existing statusline command>\""
+    fi
+    return 0
+  fi
+  backup_file "$settings"
+  local tmp="$settings.tmp.$$"
+  track_tmp "$tmp"
+  jq --arg cmd "$cmd" '.statusLine = {"type": "command", "command": $cmd}' "$settings" > "$tmp" && mv "$tmp" "$settings"
+  echo "[claude] registered ctx-bridge statusLine in $settings (context-budget bridge writer)"
+}
+
 # PATH wiring: any repo can run the m2herd engine, and the hooks find it via
 # `command -v m2herd` (degrading silently when absent).
 install_m2herd_bins() {
@@ -442,6 +506,7 @@ if [ "$install_claude" -eq 1 ]; then
   install_one "$HOME/.claude/skills" "claude"
   register_claude_hook
   register_m2herd_hooks
+  register_claude_statusline
   install_m2herd_bins
 fi
 if [ "$install_cursor" -eq 1 ]; then

@@ -79,15 +79,23 @@ process.stdin.on('end', () => {
 
     const metrics = JSON.parse(fs.readFileSync(metricsPath, 'utf8'));
     const now = Math.floor(Date.now() / 1000);
-    // A bridge without a (numeric) timestamp is unverifiable → treat as stale.
-    const ts = Number(metrics.timestamp);
+    // Timestamp tolerance (ctx-bridge.sh writes both shapes): numeric epoch
+    // `timestamp`, else numeric `timestamp_epoch`, else ISO-8601 `timestamp`.
+    // A bridge with none of those is unverifiable → treat as stale.
+    let ts = Number(metrics.timestamp);
+    if (!Number.isFinite(ts)) ts = Number(metrics.timestamp_epoch);
+    if (!Number.isFinite(ts)) {
+      const parsed = Date.parse(metrics.timestamp);
+      if (Number.isFinite(parsed)) ts = Math.floor(parsed / 1000);
+    }
     if (!Number.isFinite(ts) || (now - ts) > STALE_SECONDS) process.exit(0);
 
     // Budget fallbacks: bridge file's own budget, then the factory default.
     if (!budget) budget = Number(metrics.budget) || null;
     if (!budget) budget = DEFAULT_BUDGET;
 
-    const usedPct = Number(metrics.used_pct);
+    // used_pct is the canonical key; `pct` is the ctx-bridge contract alias.
+    const usedPct = Number(metrics.used_pct !== undefined ? metrics.used_pct : metrics.pct);
     if (!Number.isFinite(usedPct)) process.exit(0);
     const remaining = metrics.remaining_percentage;
 

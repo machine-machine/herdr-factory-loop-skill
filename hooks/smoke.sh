@@ -112,12 +112,110 @@ else
   FAIL=$((FAIL+1))
 fi
 
+# --- ctx-bridge.sh (statusline command + bridge WRITER) -----------------------
+# Not a JSON-envelope hook: stdout is a plain statusline line, so run_case's
+# jq assertion doesn't apply. Assert: always exit 0; a realistic payload
+# writes /tmp/claude-ctx-<sid>.json with correct pct; absent-fields and
+# garbage payloads print a line but write NOTHING.
+CTX_BRIDGE="$HERE/../scripts/ctx-bridge.sh"
+CTX_SID="smokectx$$"
+CTX_SID2="smokectx2n$$"
+CTX_SID3="smokectx3b$$"
+trap 'rm -rf "$FABRIC_DIR" "$WS_DIR" "$FABRIC70_DIR" /tmp/claude-ctx-smokectx*' EXIT
+FABRIC70_DIR=""
+
+ctx_case() { # ctx_case <label> <stdin-printf-arg>
+  label="$1"; stdin="$2"
+  out="$(printf '%b' "$stdin" | bash "$CTX_BRIDGE" 2>/dev/null)"; rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "FAIL $label: exit $rc (contract: always exit 0)"; FAIL=$((FAIL+1)); return 1
+  fi
+  if [ -z "$out" ]; then
+    echo "FAIL $label: no statusline output"; FAIL=$((FAIL+1)); return 1
+  fi
+  PASS=$((PASS+1)); return 0
+}
+
+rm -f "/tmp/claude-ctx-$CTX_SID.json" "/tmp/claude-ctx-$CTX_SID2.json"
+CTX_SAMPLE="{\"session_id\":\"$CTX_SID\",\"model\":{\"display_name\":\"Smoke\"},\"context_window\":{\"used_tokens\":230400,\"max_tokens\":384000}}"
+if ctx_case "ctx-bridge.sh(sample)" "$CTX_SAMPLE"; then
+  bridge="/tmp/claude-ctx-$CTX_SID.json"
+  if [ -f "$bridge" ] \
+    && [ "$(jq -r '.pct' "$bridge" 2>/dev/null)" = "60" ] \
+    && [ "$(jq -r '.used_pct' "$bridge" 2>/dev/null)" = "60" ] \
+    && [ "$(jq -r '.used' "$bridge" 2>/dev/null)" = "230400" ] \
+    && [ "$(jq -r '.budget' "$bridge" 2>/dev/null)" = "384000" ] \
+    && jq -e '.timestamp | test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T")' "$bridge" >/dev/null 2>&1; then
+    PASS=$((PASS+1))
+  else
+    echo "FAIL ctx-bridge.sh(bridge-file): $bridge missing or wrong fields: $(cat "$bridge" 2>/dev/null | head -c 200)"
+    FAIL=$((FAIL+1))
+  fi
+fi
+# statusline pass-through: model name + ctx N%.
+ctx_out="$(printf '%s' "$CTX_SAMPLE" | bash "$CTX_BRIDGE" 2>/dev/null)" || true
+case "$ctx_out" in
+  *Smoke*"ctx 60%"*) PASS=$((PASS+1)) ;;
+  *) echo "FAIL ctx-bridge.sh(statusline): '$ctx_out' (want model + ctx 60%)"; FAIL=$((FAIL+1)) ;;
+esac
+# absent usage fields: prints, writes nothing.
+ctx_case "ctx-bridge.sh(absent-fields)" "{\"session_id\":\"$CTX_SID2\",\"model\":{\"id\":\"m\"}}" || true
+if [ -f "/tmp/claude-ctx-$CTX_SID2.json" ]; then
+  echo "FAIL ctx-bridge.sh(absent-fields): wrote a bridge file without usage data"; FAIL=$((FAIL+1))
+else
+  PASS=$((PASS+1))
+fi
+# empty + garbage stdin: exit 0, no write for either.
+ctx_case "ctx-bridge.sh(empty)" "" || true
+ctx_case "ctx-bridge.sh(garbage)" '\x00\xff{{{not json\x01\n\xfe' || true
+
+# --- m2herd-session.sh budget-aware branch: fake bridge at 70% ----------------
+# Digest must halve the RESUME excerpt (30→15 lines) and append the context
+# advisory line.
+FABRIC70_DIR="$(mktemp -d)"
+mkdir -p "$FABRIC70_DIR/.m2herd"
+printf '{"goal":"smoke70","status":"testing","areas":[]}\n' > "$FABRIC70_DIR/.m2herd/overview.json"
+{ i=1; while [ "$i" -le 40 ]; do echo "RESUMELINE$i"; i=$((i+1)); done; } > "$FABRIC70_DIR/.m2herd/RESUME.md"
+printf '{"used":268800,"budget":384000,"pct":70,"used_pct":70,"remaining_percentage":30,"timestamp":"2099-01-01T00:00:00Z"}' \
+  > "/tmp/claude-ctx-$CTX_SID2.json"
+SESSION70="{\"hook_event_name\":\"SessionStart\",\"session_id\":\"$CTX_SID2\",\"cwd\":\"/tmp\"}"
+s70_out="$(printf '%s' "$SESSION70" | env M2HERD_DIR="$FABRIC70_DIR" bash "$HERE/m2herd-session.sh" 2>/dev/null)" || true
+s70_ctx="$(printf '%s' "$s70_out" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)"
+case "$s70_ctx" in
+  *"context at 70% — prefer pointers over content"*) PASS=$((PASS+1)) ;;
+  *) echo "FAIL m2herd-session.sh(70%-advisory): advisory line missing"; FAIL=$((FAIL+1)) ;;
+esac
+if printf '%s' "$s70_ctx" | grep -q 'RESUMELINE15' && ! printf '%s' "$s70_ctx" | grep -q 'RESUMELINE16'; then
+  PASS=$((PASS+1))
+else
+  echo "FAIL m2herd-session.sh(70%-halved): RESUME excerpt not halved to 15 lines"; FAIL=$((FAIL+1))
+fi
+rm -f "/tmp/claude-ctx-$CTX_SID2.json"
+
 # --- node hooks --------------------------------------------------------------
 
 if [ "$HAVE_NODE" -eq 1 ]; then
   BUDGET_SAMPLE='{"hook_event_name":"PostToolUse","session_id":"smoke-nonexistent","cwd":"/tmp"}'
   run_hook "m2herd-budget.js" "$BUDGET_SAMPLE" node "$HERE/m2herd-budget.js"
   run_hook "herdr-context-budget.js" "$BUDGET_SAMPLE" node "$HERE/herdr-context-budget.js"
+
+  # CRITICAL advisory (≥85%) must name the three concrete moves. Fresh
+  # epoch-timestamped bridge + a fabric cwd; warn sidecar cleaned first.
+  printf '{"used":334080,"budget":384000,"pct":87,"used_pct":87,"timestamp":%s}' "$(date -u +%s)" \
+    > "/tmp/claude-ctx-$CTX_SID3.json"
+  rm -f "/tmp/claude-ctx-$CTX_SID3-m2herd-budget.json"
+  CRIT_SAMPLE="{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"$CTX_SID3\",\"cwd\":\"/tmp\"}"
+  crit_out="$(printf '%s' "$CRIT_SAMPLE" | env M2HERD_DIR="$FABRIC70_DIR" node "$HERE/m2herd-budget.js" 2>/dev/null)" || true
+  crit_ctx="$(printf '%s' "$crit_out" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)"
+  if printf '%s' "$crit_ctx" | grep -q 'm2herd refile --area' \
+    && printf '%s' "$crit_ctx" | grep -q 'm2herd archive --area' \
+    && printf '%s' "$crit_ctx" | grep -q 'RESUME.md instead of retained transcript'; then
+    PASS=$((PASS+1))
+  else
+    echo "FAIL m2herd-budget.js(critical-moves): advisory missing the three moves: ${crit_ctx:0:200}"
+    FAIL=$((FAIL+1))
+  fi
+  rm -f "/tmp/claude-ctx-$CTX_SID3.json" "/tmp/claude-ctx-$CTX_SID3-m2herd-budget.json"
 else
   echo "SKIP m2herd-budget.js + herdr-context-budget.js: node not on PATH"
   SKIP=$((SKIP+1))

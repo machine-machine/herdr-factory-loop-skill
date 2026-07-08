@@ -80,15 +80,23 @@ process.stdin.on('end', () => {
 
     const metrics = JSON.parse(fs.readFileSync(metricsPath, 'utf8'));
     const now = Math.floor(Date.now() / 1000);
-    // A bridge without a (numeric) timestamp is unverifiable → treat as stale.
-    const ts = Number(metrics.timestamp);
+    // Timestamp tolerance (ctx-bridge.sh writes both shapes): numeric epoch
+    // `timestamp`, else numeric `timestamp_epoch`, else ISO-8601 `timestamp`.
+    // A bridge with none of those is unverifiable → treat as stale.
+    let ts = Number(metrics.timestamp);
+    if (!Number.isFinite(ts)) ts = Number(metrics.timestamp_epoch);
+    if (!Number.isFinite(ts)) {
+      const parsed = Date.parse(metrics.timestamp);
+      if (Number.isFinite(parsed)) ts = Math.floor(parsed / 1000);
+    }
     if (!Number.isFinite(ts) || (now - ts) > STALE_SECONDS) process.exit(0);
 
     // Budget fallbacks: bridge file's own budget, then the factory default.
     let budget = Number(metrics.budget) || null;
     if (!budget) budget = DEFAULT_BUDGET;
 
-    const usedPct = Number(metrics.used_pct);
+    // used_pct is the canonical key; `pct` is the ctx-bridge contract alias.
+    const usedPct = Number(metrics.used_pct !== undefined ? metrics.used_pct : metrics.pct);
     if (!Number.isFinite(usedPct)) process.exit(0);
     const remaining = metrics.remaining_percentage;
 
@@ -140,12 +148,14 @@ process.stdin.on('end', () => {
 
     let message;
     if (currentLevel === 'critical') {
+      const areas = pickAreas(m2Dir);
       message = `CONTEXT CRITICAL. ${usage} ` +
         `An m2herd context fabric exists at ${m2Dir}. The orchestrator should ` +
-        `offload everything non-essential NOW: distil working context into ` +
-        `${m2Dir}/context/<area>/context.md (deep material under context/<area>/deep/), ` +
-        `refresh ${m2Dir}/RESUME.md with where the work stands and the next 3 commands, ` +
-        `and keep only pointers in the live window — the folder holds the context.`;
+        `offload everything non-essential NOW — three concrete moves, in order: ` +
+        `(1) \`m2herd refile --area ${areas.biggest}\` to distil the biggest working set into the fabric; ` +
+        `(2) \`m2herd archive --area ${areas.stale}\` to archive the stalest finished area; ` +
+        `(3) re-read ${m2Dir}/RESUME.md instead of retained transcript. ` +
+        `Keep only pointers in the live window — the folder holds the context.`;
     } else if (currentLevel === 'high') {
       message = `CONTEXT HIGH. ${usage} ` +
         `An m2herd context fabric exists at ${m2Dir}. It may help to offload ` +
@@ -170,6 +180,42 @@ process.stdin.on('end', () => {
     process.exit(0);
   }
 });
+
+// Pick concrete area names for the CRITICAL advisory: `biggest` = the
+// context/<area>/ dir with the most bytes (top-level files only — a cheap,
+// good-enough proxy), `stale` = the one with the oldest newest-file mtime.
+// Falls back to <biggest>/<stale> placeholders so the advisory always names
+// the three moves even on an empty or unreadable fabric. Never throws.
+function pickAreas(m2Dir) {
+  const res = { biggest: '<biggest>', stale: '<stale>' };
+  try {
+    const ctxDir = path.join(m2Dir, 'context');
+    let biggest = null, biggestBytes = -1, stale = null, staleMtime = Infinity;
+    for (const name of fs.readdirSync(ctxDir)) {
+      const dir = path.join(ctxDir, name);
+      let st;
+      try { st = fs.statSync(dir); } catch (e) { continue; }
+      if (!st.isDirectory()) continue;
+      let bytes = 0, newest = 0;
+      try {
+        for (const f of fs.readdirSync(dir)) {
+          try {
+            const fst = fs.statSync(path.join(dir, f));
+            if (fst.isFile()) {
+              bytes += fst.size;
+              if (fst.mtimeMs > newest) newest = fst.mtimeMs;
+            }
+          } catch (e) { /* ignore */ }
+        }
+      } catch (e) { /* ignore */ }
+      if (bytes > biggestBytes) { biggestBytes = bytes; biggest = name; }
+      if (newest < staleMtime) { staleMtime = newest; stale = name; }
+    }
+    if (biggest) res.biggest = biggest;
+    if (stale) res.stale = stale;
+  } catch (e) { /* placeholders stand */ }
+  return res;
+}
 
 // Resolve the repo root holding the .m2herd/ context fabric: prefer
 // $M2HERD_DIR, else cwd. Returns null when neither holds .m2herd/.
