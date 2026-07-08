@@ -219,6 +219,19 @@ herdr-factory-loop-skill/
     └── lint.sh              ← sanity checks on SKILL.md frontmatter & cross-refs
 ```
 
+## CI
+
+<!-- badge placeholder — enable once the repo has a hosted remote:
+[![CI](https://<host>/<owner>/herdr-factory-loop-skill/actions/workflows/ci.yml/badge.svg)](https://<host>/<owner>/herdr-factory-loop-skill/actions/workflows/ci.yml)
+-->
+
+Every push and PR to `main` runs `.github/workflows/ci.yml` (mirrored at
+`.forgejo/workflows/ci.yml` for Forgejo Actions): shell syntax checks
+(`bash -n`), `scripts/lint.sh`, the herdr-free `m2herd.sh selftest`, the hook
+contract smokes, an advisory shellcheck pass, and a Go build/vet of `tui/`
+with a linux-amd64 `m2herd-tui` artifact. Run the same checks locally with
+`make ci` before committing.
+
 ## Versioning
 
 This skill follows [Semantic Versioning](https://semver.org/).
