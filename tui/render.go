@@ -28,6 +28,8 @@ type Snapshot struct {
 	AgentsOK   bool
 	Resumes    map[string]int
 	Warnings   []string
+	// SteerPending counts undrained steering lines below the STEER.md marker.
+	SteerPending int
 }
 
 // BuildSnapshot gathers every read-only data source in one pass.
@@ -61,8 +63,9 @@ func BuildSnapshot(dir string) (*Snapshot, error) {
 		AreaAges:   ages,
 		Agents:     agents,
 		AgentsOK:   agentsOK,
-		Resumes:    SliceResumes(dir),
-		Warnings:   warnings,
+		Resumes:      SliceResumes(dir),
+		Warnings:     warnings,
+		SteerPending: SteerPendingCount(dir),
 	}, nil
 }
 
@@ -126,8 +129,9 @@ func truncLine(s string, w int) string {
 	return ansi.Truncate(s, w, "…")
 }
 
-// Render draws one full frame at the given terminal width.
-func Render(s *Snapshot, width int) string {
+// Render draws one full frame at the given terminal width. steer carries the
+// minibuffer/toast state for the footer line (zero value = plain hints).
+func Render(s *Snapshot, width int, steer SteerFooter) string {
 	if width < minWidth {
 		width = minWidth
 	}
@@ -191,7 +195,7 @@ func Render(s *Snapshot, width int) string {
 	lines = append(lines, notesBlock(s)...)
 
 	lines = append(lines, "")
-	lines = append(lines, styleDim.Render("read-only · [,] settings [r]esume [s]teer [?] help [q]uit"))
+	lines = append(lines, footerLine(steer))
 
 	// Long values (goal, done_when, notes, branches, …) must not wrap inside
 	// the box — a wrapped line breaks the border and the two-column layout.
@@ -205,6 +209,22 @@ func Render(s *Snapshot, width int) string {
 		Padding(0, 1).
 		Width(styleWidth)
 	return box.Render(strings.Join(lines, "\n"))
+}
+
+// footerLine draws the dashboard footer: plain key hints, or the steer
+// minibuffer while it is open, with the steer toast appended when live.
+func footerLine(steer SteerFooter) string {
+	if steer.Active {
+		return styleCyanBold.Render("steer> ") + steer.Value + styleDim.Render("  enter send · esc cancel")
+	}
+	hint := styleDim.Render("read-only · [,] settings [r]esume [i] steer [s] $EDITOR [?] help [q]uit")
+	if steer.ToastLive {
+		if steer.ToastRed {
+			return hint + " · " + styleRed.Render(steer.Toast)
+		}
+		return hint + " · " + styleGreen.Render(steer.Toast)
+	}
+	return hint
 }
 
 func valueOr(v, fallback string) string {
@@ -236,6 +256,9 @@ func headerLine(s *Snapshot, width int) string {
 		driftMark = styleYellow.Render("◐")
 	}
 	right := dot + " " + statusText + " · drift " + driftMark
+	if s.SteerPending > 0 {
+		right = styleYellow.Render(fmt.Sprintf("✉ %d", s.SteerPending)) + " · " + right
+	}
 
 	fill := width - lipgloss.Width(left) - lipgloss.Width(right) - 2
 	if fill < 1 {
@@ -430,6 +453,7 @@ func RenderHelp(width int) string {
 		styleBold.Render("DASHBOARD"),
 		key(",", "settings editor"),
 		key("r", "RESUME.md viewer"),
+		key("i", "steer — minibuffer, appends below the STEER.md marker"),
 		key("s", "steer — open .m2herd/inbox/STEER.md in $EDITOR"),
 		key("?", "this help"),
 		key("q / ctrl+c", "quit"),
@@ -445,6 +469,7 @@ func RenderHelp(width int) string {
 		"",
 		styleBold.Render("MODALS"),
 		key("RESUME", "↑/↓ pgup/pgdn scroll · ? help · esc/q close"),
+		key("steer", "enter send · esc cancel · paste joins lines with '; '"),
 		key("minibuffer", "enter save · esc discard (invalid input stays open)"),
 		key("delete", "y confirm · n/esc cancel"),
 		key("help", "esc/q/? close"),

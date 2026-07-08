@@ -35,6 +35,12 @@ type model struct {
 	showHelp bool
 
 	settings *settingsView
+
+	steerActive    bool
+	steerValue     string
+	steerToast     string
+	steerToastRed  bool
+	steerToastLive bool
 }
 
 func newModel(dir string) model {
@@ -115,6 +121,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.resumeVP, cmd = m.resumeVP.Update(msg)
 			return m, cmd
 		}
+		if m.steerActive {
+			return m.updateSteerKey(msg)
+		}
 		switch msg.String() {
 		case "q", "ctrl+c":
 			return m, tea.Quit
@@ -123,6 +132,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, loadSettingsCmd(m.dir)
 		case "r":
 			return m, loadResumeCmd(m.dir)
+		case "i":
+			m.steerActive = true
+			m.steerValue = ""
+			return m, nil
 		case "s":
 			return m, suspendForSteerCmd(m.dir)
 		case "?":
@@ -201,6 +214,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.settings.toastLive = false
 		}
 		return m, nil
+
+	case steerDoneMsg:
+		if msg.err != nil {
+			m.steerToast, m.steerToastRed = "steer failed: "+msg.err.Error(), true
+		} else {
+			m.steerToast, m.steerToastRed = "steered ✓", false
+		}
+		m.steerToastLive = true
+		cmds := []tea.Cmd{steerToastCmd()}
+		// Refresh so the header's ✉ pending count reflects the append.
+		if !m.loading {
+			m.seq++
+			m.loading = true
+			cmds = append(cmds, loadSnapshotCmd(m.dir, m.seq))
+		}
+		return m, tea.Batch(cmds...)
+
+	case steerToastMsg:
+		m.steerToastLive = false
+		return m, nil
 	}
 	return m, nil
 }
@@ -240,7 +273,13 @@ func (m model) View() string {
 		}
 		return styleDim.Render("m2herd-tui: loading …")
 	}
-	out := Render(m.snap, m.width)
+	out := Render(m.snap, m.width, SteerFooter{
+		Active:    m.steerActive,
+		Value:     m.steerValue,
+		Toast:     m.steerToast,
+		ToastRed:  m.steerToastRed,
+		ToastLive: m.steerToastLive,
+	})
 	if m.err != nil {
 		out += "\n" + styleRed.Render(fmt.Sprintf("refresh error: %s (%s ago)", m.err.Error(), ageString(time.Since(m.errAt))))
 	}

@@ -75,7 +75,7 @@ func runOnce(dir string) {
 		os.Exit(1)
 	}
 	width := terminalWidth()
-	fmt.Println(Render(snap, width))
+	fmt.Println(Render(snap, width, SteerFooter{}))
 }
 
 func terminalWidth() int {
