@@ -1,0 +1,72 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  shell:
+    name: shell (syntax + lint + selftest + smokes)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # jq is preinstalled on ubuntu runners; node is present for the .js hook smokes.
+      - name: bash -n (syntax) on all scripts and hooks
+        run: |
+          set -e
+          for f in scripts/*.sh hooks/*.sh; do
+            bash -n "$f"
+            echo "syntax ok: $f"
+          done
+
+      - name: lint
+        run: bash scripts/lint.sh
+
+      - name: selftest (herdr-free tmpdir end-to-end)
+        run: bash scripts/m2herd.sh selftest
+
+      - name: hook contract smokes
+        run: bash hooks/smoke.sh
+
+  shellcheck:
+    name: shellcheck (advisory)
+    runs-on: ubuntu-latest
+    # Advisory for now: the repo is not yet shellcheck-clean.
+    # Drop continue-on-error and gate at -S error once it is.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shellcheck -S warning
+        run: shellcheck -S warning scripts/*.sh hooks/*.sh
+
+  go:
+    name: go (build + vet + tui artifact)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: tui/go.sum
+
+      - name: go build
+        working-directory: tui
+        run: go build ./...
+
+      - name: go vet
+        working-directory: tui
+        run: go vet ./...
+
+      - name: build m2herd-tui linux-amd64
+        working-directory: tui
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o m2herd-tui-linux-amd64 .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: m2herd-tui-linux-amd64
+          path: tui/m2herd-tui-linux-amd64
