@@ -245,3 +245,46 @@ pane_history = true                 # persist pane output across server restarts
 allow_nested = false                # block herdr-in-herdr (enable only for testing)
 ```
 Full default dump: `herdr --default-config`. Reload after edits: `herdr server reload-config`.
+
+---
+
+## m2herd CLI (this repo's engine — SKILL.md §16–§17)
+
+Installed on PATH by `scripts/install.sh` as `m2herd` (= `scripts/m2herd.sh`) and `m2herd-up`
+(= `scripts/m2herd-up.sh`). `--dir`/`--repo` default to `$PWD`. jq required.
+
+### m2herd — the context-fabric engine
+```
+m2herd boot    [--dir P] [--goal "…"]     # recommended entry: init (if needed) + sync + resume + next; non-fatal git-repo warning
+m2herd init    [--dir P] [--goal "…"]     # scaffold .m2herd/ from templates/m2herd/, gitignore it
+m2herd status  [--dir P]                  # render overview.json human-readably
+m2herd note    [--dir P] "text"           # append "- [<UTC ts>] text" to NOTES.md
+m2herd refile  [--dir P] --area A         # move live NOTES.md content into context/A/, update overview.json
+m2herd resume  [--dir P]                  # RESUME.md + one line per area (+ last 5 factory lessons when present)
+m2herd sync    [--dir P] [--check]        # regenerate areas[] from context/ tree; --check = report drift + exit 3
+m2herd archive [--dir P] --area A         # distill a done area to header + ≤10 lines; deep/ untouched
+m2herd gist    [--dir P] [--push]         # one-paragraph gist; --push pipes to $M2HERD_GIST_CMD
+m2herd next    [--dir P]                  # mechanical priority walk; exactly one "NEXT: " line
+m2herd config  list|get|set [--dir P] …   # .m2herd/settings.json with defaults + validation (bad enum → exit 2)
+m2herd evolve  analyze [--dir P] [--run <id|latest|current>]   # signatures + skeleton proposals from a run
+m2herd evolve  proposals [--dir P]        # list: id, kind, risk, status
+m2herd evolve  show <id> [--dir P]        # print a proposal
+m2herd evolve  apply <id> [--dir P] [--ack-repo]   # apply ladder (repo kind never auto-edits)
+m2herd evolve  reject <id> [--dir P]      # proposal status → rejected
+m2herd dashboard [--dir P] [--watch [--interval N]]   # read-only render; --watch prefers m2herd-tui (M2HERD_NO_TUI=1 forces bash)
+m2herd self-update [--check]              # ff-only engine pull; --check caches behind-count
+m2herd selftest                           # tmpdir end-to-end with jq asserts
+```
+
+### m2herd-up — workspace + worker dispatch
+```
+m2herd-up up       [--repo P] [--goal "…"] [--room-only]
+m2herd-up dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor|opencode]
+                   [--runner pane|headless] [--headless [--model M]]
+m2herd-up collect  --slice S [--repo P]
+m2herd-up down     [--slice S | --all] [--repo P] [--force]
+m2herd-up --dry-run <same args>           # print every herdr/git command instead of running it
+```
+Headless runners: claude / codex / opencode (cursor has no headless mode; default model
+sonnet). Dispatch knob resolution: CLI flag → settings.json routing rule → workers default →
+builtin. Retry a slice = `down --slice S`, then dispatch it again.

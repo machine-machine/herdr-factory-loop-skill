@@ -1,3 +1,8 @@
+> **STATUS: historical build contract.** This is the v2.0-era contract the m2herd herd was
+> built against, plus its amendments. It is kept as the record of what was promised to whom;
+> it is no longer the leading spec. **Where it disagrees with `skill/SKILL.md` ≥ 2.6.0, the
+> SKILL wins** — the shipped code and §16/§17 of the skill are the source of truth.
+
 # m2herd contract (v2.0.0) — pre-committed; ALL slices build against this
 
 Doctrine: **Claude Code (Fable) is the MAIN orchestrator.** The folder holds the
@@ -382,6 +387,48 @@ m2herd evolve reject <id> [--dir P]                            # frontmatter sta
 Template seeds for both trees (`evolver/README.md`, `evolver/LESSONS.md`, `runs/README.md`)
 live under `templates/m2herd/`. `skill/SKILL.md` documentation for the `evolve` commands
 lands separately once those commands are released.
+
+## Amendment v2.2 — settings layer, teardown, state honesty (recorded post-hoc, 2026-07-07)
+
+Recorded by the docs slice to close the gap between this contract and the shipped surface
+(the audit found "shipped surface exceeds the binding contract without amendments").
+
+**Settings config layer.** `.m2herd/settings.json` (seed: `templates/m2herd/settings.json`,
+`schema_version: 1`) configures WHO does the work; it is config, never state. Settled schema:
+`orchestrator.{agent,runner}`, `workers.{agent,runner,max,base,model,settle_seconds,
+wait_timeout_minutes}`, and `routing: [{pattern, agent, runner?, model?}]` (first match wins).
+Surface: `m2herd config list|get|set` with defaults + validation (invalid enum → exit 2),
+whole-file jq rewrites. Dispatch resolution precedence: CLI flag → routing rule → workers
+default → builtin, with the winning source logged.
+*Shipped drift (known, tracked as the `schema_drift_from_spec` factory lesson):* the engine's
+`config` currently validates `workers.{agent,runner,max}` + `routing[].pattern`, while
+`m2herd-up.sh` reads `workers.{default_agent,default_model,runner,base,settle_seconds,
+wait_timeout_minutes,max_concurrent}` + `routing[].match`. The settled schema above is the
+convergence target; until then SKILL.md §16.6 documents both live key sets.
+
+**TUI settings editor — read-only exception.** The `,` key in `m2herd-tui` opens a settings
+editor. This is the single sanctioned exception to the read-only watcher doctrine (v1.3): it
+may edit the CONFIG FILE only (`.m2herd/settings.json`, validated, atomic tmp+rename) — never
+`overview.json` or any state file. Steering still goes through `inbox/STEER.md`.
+
+**Teardown + retry.** `m2herd-up down [--slice S | --all] [--force]`: close the worker pane
+(never `$SELF`; an unresolvable self is treated as could-be-me and skipped), remove the
+worktree (dirty needs `--force`), `git branch -d` only when merged, set workers[]
+`state: "down"` only when nothing was refused. Idempotent. Retry = `down --slice S`, then
+dispatch again — no `retry` subcommand.
+
+**Collect state honesty.** `collect` marks a slice `failed` — never silently `done` — on a
+dead pane without a report, a recycled/missing headless pid, or an EMPTY report file. A full
+verify gate (running the slice's tests at collect) is NOT shipped; state honesty is the
+shipped guarantee.
+
+**Context-budget bridge.** The bridge file `/tmp/claude-ctx-<session>.json` is READ by
+`m2herd-budget.js`, the dashboard budget row, and `context-budget.sh status`; its WRITER is
+external (host statusline/session script) and is NOT shipped by this repo. Default budget on
+all readers: 384000.
+
+**Hook smokes.** The per-slice smoke obligation (§ hooks) is discharged by `hooks/smoke.sh`
+(sample/empty/garbage stdin → exit 0 + valid JSON for every hook).
 
 ## conventions (all slices)
 - bash: `set -euo pipefail`, mechanical + idempotent, the style of `scripts/herd-loop.sh`.

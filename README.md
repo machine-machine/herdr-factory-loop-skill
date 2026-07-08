@@ -42,7 +42,9 @@ m2herd boot                      # one-command start: init .m2herd/ (warns + rec
 m2herd note "…"                  # jot a thought into NOTES.md
 m2herd refile --area A           # move live notes into context/A/
 m2herd resume | status | next    # where are we / what now
-m2herd dashboard --watch         # live TUI over the fabric
+m2herd config list|get|set       # .m2herd/settings.json — who does the work (agents/runners/routing)
+m2herd dashboard --watch         # live TUI over the fabric (`,` opens the settings editor)
+m2herd evolve analyze|proposals|show|apply|reject   # turn failed runs into accepted factory lessons
 ```
 
 `m2herd boot` is the recommended entry point (init + sync + resume in one
@@ -55,6 +57,7 @@ m2herd-up up                     # orchestrator pane + machineroom pane in herdr
 m2herd-up dispatch --slice S     # worktree + worker + file-protocol task handoff
 m2herd-up dispatch --slice S --headless   # cheap non-TUI worker (claude -p / codex exec)
 m2herd-up collect --slice S      # wait, harvest report, update overview.json
+m2herd-up down --slice S|--all   # tear down pane + worktree (+merged branch); retry = down, then dispatch again
 ```
 
 ## What is herdr?
@@ -85,9 +88,28 @@ This skill teaches an agent how to:
 | 14 | Dispatch nudge (hooks) | Claude Code `UserPromptSubmit` + Hermes `pre_llm_call` hooks that re-check "should this herd?" every turn, by default — proposes a plan, never auto-spawns |
 | 15 | Context budgeting & decomposer (Hermes) | keep the orchestrator within a token budget (default GLM-5.2/384k); decompose into budget-sized slice manifests; hooks offload context on demand |
 | 16 | m2herd — the Fable main-orchestrator context fabric | Claude Code (Fable) as the MAIN orchestrator: a per-repo, gitignored `.m2herd/` holds the context while the orchestrator holds pointers — note/refile/resume/sync/archive/gist via `m2herd`, a 1-orchestrator + 1-machineroom-pane workspace via `m2herd-up`, three Claude Code hooks as the heartbeat |
+| 17 | evolve — the factory learns | Run trace bundles (`.m2herd/runs/`) + `m2herd evolve` (analyze/proposals/show/apply/reject): failed runs become reviewable proposals, accepted lessons land in `LESSONS.md` and auto-annotate every later dispatch |
 
 See [`skill/SKILL.md`](./skill/SKILL.md) for the full reference and
 [`skill/reference.md`](./skill/reference.md) for verbatim CLI/socket docs.
+
+## Which stack? (stack map)
+
+Four generations of orchestration live in this repo side by side. Pick by orchestrator:
+
+- **Start here — §16 m2herd** (+ §17 evolve): Claude Code (Fable) is the main orchestrator;
+  `.m2herd/` context fabric, `m2herd`/`m2herd-up`, the three Claude Code hooks. This is the
+  actively developed path.
+- **§12 / §15 herd-control**: the Hermes-era path — ICM reconciler (`herd-loop.sh`) plus the
+  Hermes context-budget layer. Kept working; superseded by §16 for Claude Code.
+- **§9 (with §1–§8, §10)**: manual herd recipes — raw herdr orchestration patterns any agent
+  can follow by hand, no standing loop.
+- **§13 fleet-control**: multi-mission meta-orchestration — one orchestrator per mission,
+  each self-driving its own herd.
+
+[`CONTRACT-m2herd.md`](./CONTRACT-m2herd.md) is the historical build contract the m2herd herd
+was built against (v2.0 era + amendments) — where it disagrees with `skill/SKILL.md` ≥ 2.6.0,
+SKILL.md wins.
 
 ## Onboarding (recommended): the factory loop
 
@@ -162,22 +184,29 @@ the symlinks stay valid and the skill is reloaded on the next session.
 herdr-factory-loop-skill/
 ├── README.md                ← you are here
 ├── CHANGELOG.md             ← version history (semver)
+├── CONTRACT-m2herd.md       ← historical m2herd build contract (v2.0 era + amendments; SKILL.md wins on conflict)
 ├── LICENSE                  ← MIT
 ├── CONTRIBUTING.md          ← how to propose changes
+├── Makefile                 ← TUI build targets: tui (host), tui-release (cross), lint, test
 ├── skill/
 │   ├── SKILL.md             ← the skill itself (loaded by the agent)
-│   └── reference.md         ← verbatim CLI & socket reference
+│   └── reference.md         ← verbatim CLI & socket reference (+ m2herd/m2herd-up CLI surfaces)
 ├── hooks/
 │   ├── herdr-dispatch-nudge.sh  ← per-turn dispatch-nudge hook (SKILL.md §14)
 │   ├── herdr-context-budget.js  ← Hermes PostToolUse context-budget hook (§15)
 │   ├── herdr-context-session.sh ← Hermes SessionStart budget/pointer hook (§15)
 │   ├── m2herd-session.sh        ← Claude Code SessionStart: inject .m2herd/ digest (§16)
 │   ├── m2herd-precompact.sh     ← Claude Code PreCompact: refile notes before compaction (§16)
-│   └── m2herd-budget.js         ← Claude Code PostToolUse: budget advisory → offload to .m2herd/ (§16)
+│   ├── m2herd-budget.js         ← Claude Code PostToolUse: budget advisory → offload to .m2herd/ (§16)
+│   └── smoke.sh                 ← hook contract smokes: sample/empty/garbage stdin → exit 0 + valid JSON
+├── tui/                         ← m2herd-tui source (Go, bubbletea): dashboard + `,` settings editor
+├── prebuilt/                    ← committed m2herd-tui binaries (darwin-arm64, linux-amd64, linux-arm64)
 ├── templates/
 │   ├── herd-control/            ← ICM orchestrator workspace scaffold (§12)
 │   ├── fleet-control/           ← meta-orchestrator workspace scaffold (§13)
-│   └── m2herd/                  ← .m2herd/ seeds: overview.json, RESUME.md, NOTES.md (§16)
+│   └── m2herd/                  ← .m2herd/ seeds: overview.json, RESUME.md, NOTES.md, settings.json,
+│       ├── evolver/             ←   evolver seeds: LESSONS.md (marker convention) + README (§17)
+│       └── runs/                ←   trace-bundle store README (§17)
 └── scripts/
     ├── onboard.sh           ← onboarding TUI: orchestrator choice + spec-kit + SDD loop
     ├── install.sh           ← one-line installer (see Install section)
@@ -185,8 +214,8 @@ herdr-factory-loop-skill/
     ├── fleet-loop.sh        ← meta-orchestrator loop over a fleet-control/ workspace (§13)
     ├── context-budget.sh    ← budget detect/status + slice-manifest decomposer (§15)
     ├── install-hermes-context.sh ← wires the Hermes context hooks into ~/.hermes/ (§15)
-    ├── m2herd.sh            ← .m2herd/ engine: init/status/note/refile/resume/sync/archive/gist (§16)
-    ├── m2herd-up.sh         ← m2herd workspace bootstrap + worker dispatch/collect (§16)
+    ├── m2herd.sh            ← .m2herd/ engine: boot/init/status/note/refile/resume/sync/archive/gist/next/config/evolve/dashboard/self-update/selftest (§16–§17)
+    ├── m2herd-up.sh         ← m2herd workspace bootstrap + worker dispatch/collect/down (§16)
     └── lint.sh              ← sanity checks on SKILL.md frontmatter & cross-refs
 ```
 

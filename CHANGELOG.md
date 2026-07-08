@@ -4,6 +4,57 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.6.0] - 2026-07-07
+
+Documentation convergence release: the skill now documents the factory as shipped (waves 1–3
+of the m2herd herd), from the code on main rather than from the original contract.
+
+### Added
+- **§17 "evolve — the factory learns"** — the continual-harness loop is finally documented:
+  trace bundles (`.m2herd/runs/<run-id>/` with run.json, per-slice prompt/report/status),
+  `m2herd evolve analyze|proposals|show|apply|reject`, the conservative apply ladder
+  (memory/policy/template append lessons; kind `repo` never auto-edits, `--ack-repo` to mark
+  applied), and lesson injection — `m2herd-up dispatch` appends a LESSONS.md pointer sentence
+  to every worker prompt when accepted lessons exist. Cross-referenced against the unrelated
+  `~/.herdr/runs/` run-report store (§10).
+- **§16.6 settings layer** — `.m2herd/settings.json` (schema_version 1) + `m2herd config
+  list|get|set` (defaults, validation, whole-file jq rewrites), dispatch-side resolution
+  precedence (CLI flag → routing rule → workers default → builtin), and the `m2herd-tui` `,`
+  settings editor as the single sanctioned read-only exception (config file only, never
+  state). The live engine-vs-workspace key drift is documented explicitly.
+- **`m2herd-up down` + failure/recovery path** — teardown (pane/worktree/merged-branch,
+  `--force`, idempotent), the retry flow (down → dispatch again), collect **state honesty**
+  (dead pane / recycled pid / empty report → `failed`, never silently done), and the two new
+  `next` ladder rungs (machineroom auto-kick, failed-worker) — a failed worker is no longer
+  invisible.
+- **`hooks/smoke.sh`** documented (contract hook smokes: sample/empty/garbage stdin →
+  exit 0 + valid JSON).
+- **README stack map** — explicit selection guidance across the four stacks (§16 m2herd is
+  the start-here path; §12/§15 = Hermes era; §9 = manual recipes; §13 = multi-mission meta),
+  a completed repository-layout tree (CONTRACT-m2herd.md, Makefile, tui/, prebuilt/,
+  templates/m2herd/{evolver,runs}, hooks/smoke.sh), and a link to CONTRACT-m2herd.md as the
+  historical build contract.
+- **CONTRACT-m2herd.md** — STATUS banner (historical; SKILL.md ≥ 2.6.0 wins on conflict) and
+  amendment v2.2 recording the shipped settings layer, TUI editor exception, down/retry,
+  collect state honesty, the external ctx-bridge writer, and the smoke.sh obligation.
+- **skill/reference.md** — verbatim `m2herd` / `m2herd-up` CLI surfaces.
+
+### Fixed
+- **Removed the fake "This install (verified)" table** from SKILL.md (hardcoded macOS path,
+  herdr 0.6.9) — replaced with three live check commands (`herdr status`,
+  `herdr integration status`, `m2herd selftest`).
+- **Documented the missing bridge-file writer honestly** — `/tmp/claude-ctx-<session>.json`
+  has readers everywhere (budget hooks, dashboard, `context-budget.sh status`) but NO shipped
+  writer; §15.1 now carries a known-gap box instead of implying it works out of the box.
+  All documented reader defaults aligned at 384000.
+- **Stale claims aligned with code** — machineroom pane command is `m2herd dashboard --watch`
+  (cheat sheet still showed the `watch -n 2` fallback); the `next` ladder now lists all nine
+  cases in code order; the dashboard "queries herdr ONCE" claim scoped to the WORKERS table;
+  §15.4 dedupe is keyed on hook FILENAME (not command string) and the
+  `install.sh --hermes` curl|bash silent-skip is called out; §15.1 budget resolution order
+  includes the explicit override and cache steps; §15.5 notes `herd-loop.sh rotate` hardcodes
+  the `hermes` replacement agent.
+
 ## [2.5.1] - 2026-07-04
 
 ### Changed

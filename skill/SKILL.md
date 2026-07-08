@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 2.5.1
+version: 2.6.0
 description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator). ALSO trigger for meta-orchestration — when the user wants to be the "meta-orchestrator" / "orchestrator of orchestrators", oversee or launch multiple orchestrators (each driving its own herd of workers) across several missions/repos, or drive a portfolio of parallel missions with /goal-based autonomy (fleet-loop.sh / fleet-control). ALSO trigger for m2herd — the Claude Code (Fable) main-orchestrator context fabric — when the user mentions m2herd, .m2herd, "context fabric", wants to offload context into the repo folder (the folder holds the context, the orchestrator holds pointers), refile or archive notes/areas, push a project gist to fleet memory, or come back to a project via the resume file (RESUME.md).
 ---
 
@@ -10,18 +10,16 @@ Drive herdr — a terminal workspace manager purpose-built to run **more than on
 
 > **You are inside herdr right now.** This Claude session is itself a herdr-managed agent in a pane. Read [Know thyself](#know-thyself-critical) before sending keys or closing anything.
 
-## This install (verified)
+## Check this install
 
-| Property | Value |
-|----------|-------|
-| Binary | `/Users/USERNAME/.local/bin/herdr` (on PATH as `herdr`) |
-| Version | `0.6.9` (protocol 13) |
-| Server | running — `herdr status` to confirm |
-| Socket | `~/.config/herdr/herdr.sock` (default session) |
-| Config | `~/.config/herdr/config.toml` |
-| Logs | `~/.config/herdr/{herdr,herdr-client,herdr-server}.log` |
-| Integrations installed | `claude`, `codex`, `opencode`, `kilo`, `hermes`, `cursor` |
-| Integrations available, not installed | `pi`, `omp`, `copilot`, `droid`, `kimi`, `qodercli` |
+Never assume the install state — verify it live:
+
+- `herdr status` — server up? version/protocol? (`herdr --version` for the binary alone)
+- `herdr integration status` — which agent integrations are installed/outdated
+- `m2herd selftest` — end-to-end sanity of the m2herd engine (§16), if `m2herd` is on PATH
+
+Defaults: socket `~/.config/herdr/herdr.sock`, config `~/.config/herdr/config.toml`,
+logs `~/.config/herdr/{herdr,herdr-client,herdr-server}.log`.
 
 CLI socket-query subcommands (`agent list`, `pane list`, `pane get`, …) print the **raw JSON socket response** to stdout — pipe through `jq`. Always run non-interactive subcommands; **never** run bare `herdr` (it launches/attaches the TUI and will hang a non-interactive shell).
 
@@ -636,11 +634,20 @@ with `--model NAME` / `--budget N`). The decomposer and both hooks resolve the b
 order, so live detection can refine the default without editing every file:
 
 ```
-herd.conf MODEL/BUDGET  →  ~/.hermes/config.yaml model.context_length  →  default GLM-5.2 / 384000
+explicit --model/--budget override  →  herd.conf MODEL/BUDGET
+  →  ~/.hermes/config.yaml model.context_length (then ~/.hermes/context_length_cache.yaml)
+  →  default GLM-5.2 / 384000
 ```
 
 `scripts/context-budget.sh detect --ws WS` prints the resolved `MODEL`, `BUDGET`, and `SOURCE=`
 (so the resolution is debuggable), machine-readable as `KEY=VALUE` lines.
+
+> **Known gap — the bridge file has no shipped writer.** Everything below that reads live
+> usage does so from `/tmp/claude-ctx-<session>.json` (the "bridge file"), but **nothing in
+> this repo writes it** — it must come from an external statusline/session script on the
+> host. Without one, `context-budget.sh status`, the §15.3 budget hook, `m2herd-budget.js`,
+> and the m2herd dashboard budget row all silently show nothing. The expected shape is
+> `{"session":"<id>","used":N,"budget":N,"ts":"<ISO-8601>"}` at literal `/tmp`.
 
 #### 15.2 The decomposer — `scripts/context-budget.sh`
 
@@ -697,13 +704,16 @@ constraint is also a global bullet in `AGENT.md` so it loads every tick.
 
 `scripts/install-hermes-context.sh` wires the hooks into `~/.hermes/`: it copies
 `hooks/*.{js,sh}` into `~/.hermes/hooks/` (chmod +x), `jq`-merges a PostToolUse entry (for the
-budget hook) and a SessionStart entry (for the session hook) into `~/.hermes/settings.json` keyed
-by command string (re-running adds nothing), sets the GLM-5.2 / 384k default in
-`~/.hermes/config.yaml`, and verifies with `hermes hooks doctor`. It **backs up** `settings.json`
-and `config.yaml` before touching them, only edits `context_length` (never rewrites the file), and
-supports `--dry-run` and `--uninstall`. Onboarding (§11.0) runs it automatically when the chosen
-orchestrator is `hermes` or `all`, and `scripts/install.sh --hermes` runs it too — so a Hermes
-factory gets the budget layer wired without a separate step.
+budget hook) and a SessionStart entry (for the session hook) into `~/.hermes/settings.json` —
+dedupe keyed on the hook **FILENAME** (not the full command string, which embeds an absolute
+path that changes across installs; same convention as §16.5) — sets the GLM-5.2 / 384k default
+in `~/.hermes/config.yaml`, and verifies with `hermes hooks doctor`. It **backs up**
+`settings.json` and `config.yaml` before touching them, only edits `context_length` (never
+rewrites the file), and supports `--dry-run` and `--uninstall`. Onboarding (§11.0) runs it
+automatically when the chosen orchestrator is `hermes` or `all`. `scripts/install.sh --hermes`
+also tries to run it, but resolves it relative to the install script — under the `curl | bash`
+one-liner that resolution fails and the step is **silently skipped**: when installing that way,
+run `bash ~/.cache/herdr-factory-loop-skill/scripts/install-hermes-context.sh` yourself.
 
 #### 15.5 Dynamic compression — lossy live window, lossless folder
 
@@ -732,7 +742,9 @@ bytes twice, and no summary is ever the only copy:
 - **Session-rotation on CRITICAL reboots the orchestrator from the pointer/digest.** When usage
   crosses **CRITICAL 85%**, the §15.3 hook also drops a `_fleet/.needs_rotation` sentinel; the
   `herd-loop.sh run` loop detects it and yields `STATUS: NEEDS_ROTATION` rather than looping on a
-  full window. `herd-loop.sh rotate --ws WS` then starts a fresh orchestrator agent, sends it
+  full window. `herd-loop.sh rotate --ws WS` then starts a fresh orchestrator agent (the replacement is
+  currently hardcoded to the `hermes` agent — rotating any other orchestrator, or rotating
+  twice while a `hermes` agent exists, aborts), sends it
   "resume from `_fleet/context_pointer.md` + `digest.md`" (the SessionStart hook orients it),
   retires the old pane, and clears the sentinel — enforced reorg by restart. It **refuses to close
   `$SELF`, the new pane, or an empty/unknown pane id**, and `--dry-run` prints the plan while
@@ -840,8 +852,11 @@ m2herd.sh sync   [--dir P] --check        # drift detector: exit 3 + human-reada
 m2herd.sh archive [--dir P] --area A      # decay: distill a done area's context.md to header + ≤10 summary lines (status: archived); deep/ stays lossless; overview.json entry gets "status":"archived"
 m2herd.sh gist   [--dir P] [--push]       # one-paragraph project gist (goal, status, one line per active area); --push pipes it to $M2HERD_GIST_CMD if set (the --llm pattern), else prints it with a note
 m2herd.sh next   [--dir P]                # self-prompting primitive: mechanical priority walk (NO LLM calls), prints exactly one line starting "NEXT: "
-m2herd.sh dashboard [--dir P]             # read-only tier-1 TUI: a pure renderer over existing state — no new state, no writes, ever
-m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync → status → resume (+ next cases, dashboard smoke); asserts schema fields with jq
+m2herd.sh config list|get|set [--dir P] … # read/write .m2herd/settings.json with defaults + validation (§16.6)
+m2herd.sh evolve <analyze|proposals|show|apply|reject> …   # the factory learns from its own runs (§17)
+m2herd.sh dashboard [--dir P] [--watch [--interval N]]     # read-only tier-1 TUI: a pure renderer over existing state — no new state, no fabric writes; --watch = flicker-free repaint loop (prefers the Go m2herd-tui when installed; M2HERD_NO_TUI=1 forces the bash renderer)
+m2herd.sh self-update [--check]           # ff-only pull of the engine repo; --check caches the behind-count for the dashboard header
+m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync → status → resume (+ next cases, config, dashboard smoke); asserts schema fields with jq
 ```
 
 `next` is the pulse of the agentic loop — it walks a fixed priority ladder and prints exactly
@@ -849,11 +864,18 @@ one `NEXT: ` line, so the machine always knows its next move without an LLM in t
 
 1. drift (`sync --check` logic fails) → `NEXT: context drift — run: m2herd sync`
 2. non-empty content below the `inbox/STEER.md` marker → `NEXT: drain steering — read .m2herd/inbox/STEER.md, act, then clear below the marker`
-3. `done_when` empty → `NEXT: coach the intent — set done_when + record open_questions`
-4. loose content in NOTES.md below the marker → `NEXT: refile notes — run: m2herd refile --area <pick>`
-5. a `workers[]` entry `spawned|working` whose pane is gone/idle → `NEXT: collect worker <slice> — run: m2herd-up collect --slice <slice>`
-6. `open_questions` non-empty → `NEXT: resolve open question: <first>`
-7. otherwise → `NEXT: compare RESUME.md against goal/done_when and dispatch or finish`
+3. herdr reachable + no machineroom tab watching this repo → `NEXT: bring up the machineroom — run: m2herd-up up --room-only --repo <dir>` (suppressed when herdr is absent/down or `M2HERD_SKIP_ROOM_CHECK=1`)
+4. `done_when` empty → `NEXT: coach the intent — set done_when + record open_questions`
+5. loose content in NOTES.md below the marker → `NEXT: refile notes — run: m2herd refile --area <pick>`
+6. a `workers[]` entry `spawned|working` whose pane is gone/idle → `NEXT: collect worker <slice> — run: m2herd-up collect --slice <slice>`
+7. a `workers[]` entry `failed` → `NEXT: worker <slice> failed — read dispatch/<slice>.out.md, then retry or clean up` (retry = `m2herd-up down --slice <slice>`, then dispatch again — §16.3)
+8. `open_questions` non-empty → `NEXT: resolve open question: <first>`
+9. otherwise → `NEXT: compare RESUME.md against goal/done_when and dispatch or finish`
+
+Failed workers are therefore never invisible: collect marks a dead/empty-report worker
+`failed` (state honesty, §16.3), case 7 surfaces it on every wake-up, and
+`m2herd-up down --slice <slice>` clears the pane/worktree/branch so a re-dispatch does not
+collide with the existing `wip/m2herd-<slice>` branch.
 
 `dashboard` renders the reference layout, top to bottom: a boxed header line —
 `m2herd · <repo-basename> ── ● <status> · drift ✓|◐` (the drift dot from the `sync --check`
@@ -867,10 +889,11 @@ static footer: `read-only · steering: .m2herd/inbox/STEER.md`. AREAS shows name
 active/archived status, per-area age from each context.md `updated:` header, and related
 links — archived areas rendered dim on one line; **staleness ages make rot visible**: decay
 discipline, rendered. WORKERS (when `workers[]` is non-empty) shows slice, branch, and
-**desired vs observed** state: when `herdr` is on PATH the dashboard queries
-`herdr agent list` ONCE per render and sets the desired `workers[].state` beside the observed
+**desired vs observed** state: when `herdr` is on PATH the WORKERS table queries
+`herdr agent list` once and sets the desired `workers[].state` beside the observed
 pane `agent_status`, marking mismatches with `!`; without herdr it degrades silently to
-desired-only. herdr READS are allowed in a watcher pane; herdr writes/sends (`agent send`,
+desired-only. (The `NEXT:` line's machineroom/stale-worker checks issue their own herdr
+reads, so a full render is a small handful of herdr READS, not exactly one.) herdr READS are allowed in a watcher pane; herdr writes/sends (`agent send`,
 `pane send-keys`, spawns, closes) are FORBIDDEN there — the dashboard stays a renderer even
 when it looks at the live fleet. Plain ASCII with tput colors on a tty, degrading to plain
 when piped.
@@ -903,12 +926,20 @@ in the dashboard header. Fallbacks when `m2herd` is absent: `watch -n 2 -t cat
 The pane is a WATCHER, never a writer. On PATH as `m2herd-up`.
 
 ```
-m2herd-up.sh up       [--repo P] [--goal "…"]      # ensure herdr workspace for repo: the one-orchestrator + one-machineroom shape; runs m2herd.sh init if missing
-m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor]
-                      [--headless [--model M]]      # worktree wip/m2herd-<S> off BASE (default: current branch), spawn worker, file-protocol dispatch of .m2herd/dispatch/S.task.md, record in overview.json workers[]
-m2herd-up.sh collect  --slice S [--repo P]          # wait idle (pane) / exited (headless pid), keep/copy report to dispatch/S.out.md, update workers[] state (+tokens/cost)
+m2herd-up.sh up       [--repo P] [--goal "…"] [--room-only]   # ensure herdr workspace for repo: the one-orchestrator + one-machineroom shape; runs m2herd.sh init if missing; --room-only never spawns an orchestrator pane
+m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor|opencode]
+                      [--runner pane|headless] [--headless [--model M]]
+                                                    # worktree wip/m2herd-<S> off BASE (default: current branch), spawn worker, file-protocol dispatch of .m2herd/dispatch/S.task.md, record in overview.json workers[]; flags fall back to settings.json routing/defaults (§16.6)
+m2herd-up.sh collect  --slice S [--repo P]          # wait idle (pane) / exited (headless pid), keep/copy report to dispatch/S.out.md, update workers[] state (+tokens/cost); a dead pane / recycled pid / EMPTY REPORT is marked failed, never silently done (state honesty)
+m2herd-up.sh down     [--slice S | --all] [--repo P] [--force]
+                                                    # tear worker(s) down: close the pane (never $SELF; an unresolvable self is treated as could-be-me and skipped), remove the worktree (dirty tree needs --force), `git branch -d` only when merged (else kept + reported), set workers[] state=down; idempotent
 m2herd-up.sh --dry-run <same args>                  # print every herdr/git command instead of running it
 ```
+
+**Retry a failed slice.** There is no `retry` subcommand; the documented flow is a clean
+teardown then a fresh dispatch: `m2herd-up down --slice S` (clears pane, worktree, and — when
+merged — the `wip/m2herd-<S>` branch, so the re-dispatch doesn't collide), fix the task file
+if the report says the task was wrong, then `m2herd-up dispatch --slice S` again.
 
 It follows the binding herdr rules from this skill: identify `$SELF` first and never touch it
 (§2); after `agent start` RE-RESOLVE the pane by cwd from `herdr agent list` (the returned
@@ -968,7 +999,10 @@ when the engine isn't on PATH:
 |------|-------|--------------|
 | `hooks/m2herd-session.sh` | `SessionStart` | Injects a digest — overview.json goal/status/areas count + first 30 lines of RESUME.md — as `{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext}}`, then appends the output of `m2herd next` (when the binary exists; bounded ~3s; silent-fail): every wake-up = orientation + the next move. bash + jq, bounded stdin read, always exit 0. |
 | `hooks/m2herd-precompact.sh` | `PreCompact` | Injects `additionalContext` instructing the model to refresh RESUME.md + overview.json and refile loose NOTES.md content into `context/<area>/` BEFORE compaction proceeds — compaction never eats un-refiled notes. Keeps its own drift nudge (run `m2herd sync` when overview.json and context/ disagree). Never blocks (exit 0 always). |
-| `hooks/m2herd-budget.js` | `PostToolUse` | The §15 budget watcher, natively for Claude Code: same bridge file (`/tmp/claude-ctx-<session>.json`), same 60/75/85% thresholds, debounce, and traversal guard as `herdr-context-budget.js` — but keyed on `.m2herd/` presence, and the advisory tells the orchestrator to offload into `.m2herd/context/<area>/` + refresh RESUME.md. `hookEventName` is ALWAYS `"PostToolUse"`. Silent-fail. |
+| `hooks/m2herd-budget.js` | `PostToolUse` | The §15 budget watcher, natively for Claude Code: same bridge file (`/tmp/claude-ctx-<session>.json`), same 60/75/85% thresholds, debounce, and traversal guard as `herdr-context-budget.js` — but keyed on `.m2herd/` presence, and the advisory tells the orchestrator to offload into `.m2herd/context/<area>/` + refresh RESUME.md. Default budget **384000** (kept in lockstep with the dashboard's budget row). `hookEventName` is ALWAYS `"PostToolUse"`. Silent-fail. NOTE: the bridge file itself has no shipped writer — see the §15.1 known-gap box; without an external writer this hook silently never fires. |
+
+Contract smokes for all the repo's hooks live in `hooks/smoke.sh`: it pipes a sample payload,
+empty stdin, and garbage stdin into each hook and asserts exit 0 + valid JSON out.
 
 #### 16.5 Install
 
@@ -990,6 +1024,87 @@ which embeds a node path that changes across upgrades); a timestamped `.bak-<ts>
 `settings.json` is written before every edit; the `.js` hook is skipped with a warning when
 `node` is missing (the two bash hooks still register). `./scripts/onboard.sh` wires all of
 this in when the chosen orchestrator is claude (or `all`).
+
+#### 16.6 Settings — `.m2herd/settings.json`
+
+The fabric's config layer (`schema_version: 1`, seeded from `templates/m2herd/settings.json`).
+It configures WHO does the work; it is config, **never state** — runtime state stays in
+`overview.json`. Read/write it through the CLI, which fills defaults and validates:
+
+```bash
+m2herd config list [--dir P]          # every key, resolved: value + (default|set) marker
+m2herd config get  <key> [--dir P]    # e.g. m2herd config get workers.agent
+m2herd config set  <key> <value>      # validated (bad enum → exit 2); whole-file jq rewrite
+```
+
+Keys the **engine** (`m2herd.sh config`) owns: `orchestrator.agent`/`orchestrator.runner`,
+`workers.agent`/`workers.runner`/`workers.max` (defaults `claude`/`pane`/3), and `routing` —
+an array of `{pattern, agent}` rules (optional `runner`); agents `claude|codex|cursor|opencode`,
+runners `pane|headless`.
+
+**Dispatch-side resolution (`m2herd-up`).** `dispatch` resolves each knob with the precedence
+**CLI flag → matching routing rule → workers.\* default → builtin**, and logs which source won.
+Heads-up on live **schema drift**: `m2herd-up.sh` currently reads a partly different key set —
+`workers.default_agent`, `workers.default_model`, `workers.runner`, `workers.base`,
+`workers.settle_seconds` (builtin 2), `workers.wait_timeout_minutes` (builtin 30),
+`workers.max_concurrent` (builtin 4) — and matches routing rules on `.match` (bash-glob
+semantics, first match wins) with `.agent`/`.model`/`.runner`, while the engine's `config`
+validates `.pattern`. Until the key sets converge (tracked as a factory lesson), keys you set
+via `m2herd config set` steer the engine's validation surface, and the `m2herd-up` keys above
+must be set in the file directly.
+
+**The TUI settings editor** — press `,` in `m2herd-tui` — is the one deliberate exception to
+the read-only dashboard doctrine: it edits **the config file only** (`.m2herd/settings.json`,
+validated, atomic tmp+rename), never `overview.json` or any other state. Steering still goes
+through `inbox/STEER.md`; state stays orchestrator-only.
+
+### 17. evolve — the factory learns
+
+The continual-harness loop: every dispatch/collect leaves a **trace bundle**, and
+`m2herd evolve` turns failed runs into reviewable proposals and accepted **lessons** that are
+injected into the next dispatch. Telemetry flows back into the factory itself.
+
+**Trace bundles** (written by `m2herd-up`, best-effort — a trace failure warns, never aborts a
+dispatch). `.m2herd/runs/CURRENT` holds the active run-id (`r-<UTC %Y%m%dT%H%M%SZ>`); rotation
+= delete `CURRENT`, the next dispatch starts a fresh run:
+
+```
+.m2herd/runs/<run-id>/
+  run.json                  # {run_id, created_at, goal, base, slices[]}
+  slices/<slice>/
+    prompt.md               # verbatim task file at dispatch time
+    report.md               # verbatim report at collect time
+    status.json             # slice, state, agent, runner, model, branch, worktree, timestamps, tokens, cost_usd
+    failures.json           # optional, orchestrator/worker-authored failure entries
+```
+
+(These are unrelated to the §10 `~/.herdr/runs/` run REPORTS — that store is the fleet's
+human-written compounding index; `.m2herd/runs/` is per-repo machine telemetry.)
+
+**The evolve commands** (`m2herd evolve …`, all mechanical — no LLM, no network, idempotent):
+
+```bash
+m2herd evolve analyze  [--run <id|latest|current>]  # classify boring failure signatures (failed state, missing/empty report, missing status.json, failures.json passthrough) → signatures/<run-id>.json + one skeleton proposal per signature
+m2herd evolve proposals                             # list: id, kind, risk, status
+m2herd evolve show <id>                             # print the proposal file
+m2herd evolve apply <id> [--ack-repo]               # conservative apply ladder, below
+m2herd evolve reject <id>                           # frontmatter status → rejected
+```
+
+Proposals live at `.m2herd/evolver/proposals/<id>.md` (id `<YYYY-MM-DD>-<run-id>-<slug>`,
+ordinal suffix on collision) with frontmatter `id/run/kind/target/risk/status/lesson` and
+sections Observed failure / Proposed change / Rollback / Acceptance check. The **apply
+ladder** is deliberately conservative: kind `memory`/`policy` append the lesson line to
+`LESSONS.md` (append-once by proposal-id); kind `template` additionally requires the target
+to be under `.m2herd/`; kind `repo` **never edits the target** — it prints a branch/patch
+recommendation and flips to applied only with `--ack-repo`.
+
+**Lessons close the loop.** Accepted lessons accumulate in `.m2herd/evolver/LESSONS.md` below
+the `<!-- === M2HERD:LIVE === -->` marker. `m2herd resume` prints the last 5 as
+`Recent factory lessons:`, and — the payoff — `m2herd-up dispatch` (pane and headless) appends
+one sentence to every worker's pointer message when live lessons exist: *"Also read <path to
+LESSONS.md> (accepted factory lessons) before starting."* The task file itself is never
+mutated. Workers start every run pre-warned by everything the factory has already learned.
 
 ---
 
@@ -1062,6 +1177,9 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 | Meta-orchestrate | `scripts/fleet-loop.sh init\|tick\|run\|status` over a `templates/fleet-control/` workspace — one orchestrator per mission in `missions.tsv`, each `/goal`-armed to self-drive its herd; meta launches/oversees/converges (§13) |
 | Which orchestrator? | `cat ~/.config/herdr-factory/config.toml` |
 | Dispatch nudge (hooks) | `./scripts/install.sh` wires `hooks/herdr-dispatch-nudge.sh` into Claude's `UserPromptSubmit` + Hermes's `pre_llm_call` — a per-turn reminder to consider herding, never an auto-spawn (§14) |
-| m2herd context fabric | `m2herd init\|note\|refile\|resume\|sync --check\|archive\|gist --push\|next\|dashboard` over the repo's `.m2herd/`; `m2herd-up up\|dispatch\|collect` for the 1-orchestrator + 1-watcher-pane workspace (`watch -n 2 -t "m2herd dashboard"`) — folder holds the context, orchestrator holds pointers, `next` is the machine's own next move, the dashboard is read-only (§16) |
+| m2herd context fabric | `m2herd boot\|note\|refile\|resume\|sync --check\|archive\|gist --push\|next\|dashboard` over the repo's `.m2herd/`; `m2herd-up up\|dispatch\|collect\|down` for the 1-orchestrator + 1-machineroom workspace (machineroom pane runs `m2herd dashboard --watch`) — folder holds the context, orchestrator holds pointers, `next` is the machine's own next move, the dashboard is read-only (§16) |
+| m2herd settings | `m2herd config list\|get\|set` over `.m2herd/settings.json` (defaults + validation); `,` in `m2herd-tui` opens the settings editor — config file only, never state (§16.6) |
+| Tear down / retry a worker | `m2herd-up down --slice S [--force]` (pane + worktree + merged branch, idempotent), then re-dispatch; `--all` sweeps every worker (§16.3) |
+| Factory learns | `m2herd evolve analyze` → `proposals` → `show <id>` → `apply <id> [--ack-repo]`\|`reject <id>`; accepted lessons land in `.m2herd/evolver/LESSONS.md` and auto-annotate every dispatch pointer (§17) |
 
 Full CLI + socket reference: [reference.md](reference.md).
