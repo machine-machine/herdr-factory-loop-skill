@@ -3,7 +3,7 @@ HOST_GOARCH:= $(shell go env GOARCH 2>/dev/null)
 LDFLAGS    := -s -w
 TARGETS    := darwin-amd64 darwin-arm64 linux-amd64 linux-arm64
 
-.PHONY: tui tui-release check-go lint test ci
+.PHONY: tui tui-release release-check check-go lint test ci
 
 check-go:
 	@command -v go >/dev/null 2>&1 || { echo "error: go not found on PATH — install Go (https://go.dev/dl/) to build the TUI"; exit 1; }
@@ -22,6 +22,17 @@ tui-release: check-go
 			go build -C tui -ldflags "$(LDFLAGS)" -o ../prebuilt/m2herd-tui-$$t . ; \
 	done
 	CGO_ENABLED=0 go build -C tui -ldflags "$(LDFLAGS)" -o ../prebuilt/m2herd-tui-$(HOST_GOOS)-$(HOST_GOARCH) .
+
+# release gate: rebuild every target, then prove the host binary actually
+# renders (--once against a throwaway .m2herd fixture)
+release-check: tui-release
+	@set -e; \
+	tmp=$$(mktemp -d); \
+	( cd "$$tmp" && git init -q && \
+	  bash "$(CURDIR)/scripts/m2herd.sh" init --goal "release-check fixture" >/dev/null ); \
+	"$(CURDIR)/prebuilt/m2herd-tui-$(HOST_GOOS)-$(HOST_GOARCH)" --once --dir "$$tmp"; \
+	rm -rf "$$tmp"; \
+	echo "release-check: OK"
 
 lint:
 	bash scripts/lint.sh

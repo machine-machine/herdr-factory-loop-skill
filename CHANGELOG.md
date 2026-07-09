@@ -4,6 +4,61 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.7.0] - 2026-07-09
+
+Reliability release: the factory now watches its own workers (wave 4), the shell layer is
+shellcheck-clean and CI-gated (wave 5), steering moved into the TUI, and releases rebuild
+the prebuilts automatically so they can never rot again.
+
+### Added
+- **`m2herd-up watch` — the worker sentinel.** A reconcile loop over `workers[]` in
+  spawned|working. Per TUI worker each tick: pane text (whitespace-joined so wraps can't
+  split a signature) + agent status, then the ladder — crash signature (stream disconnected /
+  Transport error / ECONNRESET / Unable to connect to API) while not working → resume nudge;
+  rate-limit menu → Enter (stop-and-wait, reset time logged); blocked → escalation only
+  (never auto-approve); idle + committed + report → the existing collect path (verify gate
+  included); idle + no commit → stall nudge. Resumes are tracked in the trace `status.json`;
+  past `--max-resumes` (default 3) the worker is failed via locked write + `failures.json`.
+  Headless workers get a pid-alive (start-time verified) + log-tail check; a crash signature
+  with no report fails at once (one-shot runners can't resume). `--once` single pass; the
+  default loops until all done|failed. Never touches `$SELF` or panes not in `workers[]`.
+- **TUI: `?` help overlay + routing/budget/resumes polish** — a help overlay listing every
+  key from dashboard/settings/RESUME modal; ROUTING rules gain runner (pane|headless cycle)
+  and model (minibuffer) rows matching the 2.6.0 engine schema; the budget row prefers the
+  bridge file whose session id matches a live claude session (dim source hint); WORKERS gains
+  a resumes column when any current-run slice trace has resumes>0; invalid minibuffer input
+  keeps the minibuffer open with the red toast inline instead of silently discarding.
+- **TUI: `i`-key steering + ✉ badge** — a one-line `steer>` minibuffer whose Enter appends
+  `- [<UTC ts>] <text>` below the STEER.md marker (file created from the template seed when
+  absent), under the engine's `<file>.lock` flock convention with same-dir tmp + rename;
+  multi-line paste collapses to `; `. The header shows a yellow `✉ N` badge while N steering
+  lines wait below the marker for the orchestrator's next drain. Tested down to 20-way
+  concurrent appends under `-race`.
+- **`m2herd room` / `m2herd-up room`** — `m2herd room` runs the best available watcher
+  (Go TUI, else the flicker-free bash watch) in the current terminal; `m2herd-up room`
+  ensures the machineroom pane and always (re)starts its viewer so the pane runs the latest
+  engine/TUI.
+- **CI** — `.github/workflows/ci.yml` + verbatim `.forgejo/workflows/ci.yml`: shell job
+  (bash -n, lint, selftest, hook smokes), shellcheck job, go job (build + vet + linux-amd64
+  TUI artifact); `make ci` runs the same steps locally. The shellcheck job started advisory
+  and is now **gating** (all 37 `-S warning` findings fixed across scripts/ and hooks/).
+- **Release automation** — new `release` workflow (GitHub + Forgejo copies) on tag push
+  `v*`: builds all four prebuilt targets and attaches them to the release (GitHub via
+  softprops/action-gh-release; Forgejo best-effort via its API when a `RELEASE_TOKEN`
+  secret exists, warn-and-skip otherwise). New `make release-check` builds every target and
+  sanity-runs the host binary (`--once` render against a throwaway fixture).
+- **darwin-amd64 prebuilt** joins the committed set — all four `prebuilt/m2herd-tui-*`
+  binaries rebuilt for this release (go 1.26.4, includes the `,` settings editor and the
+  `i` steer key).
+
+### Fixed
+- **Dispatch submit verify** — TUI dispatch now verifies submission after the pointer send:
+  status working = submitted; pointer still on screen while idle = re-send Enter (up to 2×).
+  The mechanical fix for the `prompt_lost_after_dispatch` factory lesson.
+
+### Changed
+- **README quick start** — explicit copy-paste install/upgrade blocks instead of prose.
+
 ## [2.6.0] - 2026-07-07
 
 Documentation convergence release: the skill now documents the factory as shipped (waves 1–3

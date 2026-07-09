@@ -1,0 +1,55 @@
+name: Release
+
+# Forgejo copy of .github/workflows/release.yml — best-effort equivalent.
+# Forgejo Actions has no gh CLI and softprops/action-gh-release targets the
+# GitHub API, so assets are attached via the Forgejo API instead. That needs a
+# repo secret RELEASE_TOKEN (a Forgejo access token with write:repository);
+# without it the job still builds everything and warns instead of failing —
+# the GitHub copy remains the canonical release-artifact source.
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    name: release (build all prebuilts + attach)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+
+      - name: build all release targets
+        run: make tui-release
+
+      - name: checksums
+        run: |
+          cd prebuilt
+          sha256sum m2herd-tui-* | tee SHA256SUMS
+
+      - name: attach binaries to the Forgejo release (best-effort)
+        env:
+          TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "warn: RELEASE_TOKEN secret not set — binaries built OK, skipping asset upload"
+            exit 0
+          fi
+          set -e
+          api="${GITHUB_SERVER_URL}/api/v1/repos/${GITHUB_REPOSITORY}"
+          tag="${GITHUB_REF_NAME}"
+          auth="Authorization: token $TOKEN"
+          # find the release for this tag, create it if missing
+          rid=$(curl -sf -H "$auth" "$api/releases/tags/$tag" | jq -r '.id' || true)
+          if [ -z "$rid" ] || [ "$rid" = "null" ]; then
+            rid=$(curl -sf -X POST -H "$auth" -H 'Content-Type: application/json' \
+              -d "{\"tag_name\":\"$tag\",\"name\":\"$tag\"}" "$api/releases" | jq -r '.id')
+          fi
+          for f in prebuilt/m2herd-tui-* prebuilt/SHA256SUMS; do
+            curl -sf -X POST -H "$auth" \
+              -F "attachment=@$f" \
+              "$api/releases/$rid/assets?name=$(basename "$f")" >/dev/null
+            echo "attached: $f"
+          done
