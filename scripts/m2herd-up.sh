@@ -23,6 +23,15 @@
 #                                                   #   in the worktree via nohup; log → dispatch/S.log, stderr → dispatch/S.stderr.log,
 #                                                   #   answer → dispatch/S.out.md;
 #                                                   #   usage (tokens/cost) parsed into workers[] at collect. Cheap hands, Fable judgment.
+#                                                   #   RESUME PLUMBING: claude gets a pre-generated uuid via `claude -p --session-id`,
+#                                                   #   codex resumes via `codex exec resume --last` (cwd-filtered to the worktree, so
+#                                                   #   the session id is the sentinel "last"); the id lands in the trace status.json
+#                                                   #   as "session" so `watch` can resume a crashed worker. opencode: no resume story.
+#                                                   # RATE-LIMIT VALVE: when another worker entered spawned|working within the last
+#                                                   #   workers.stagger_seconds (default 0 = off), dispatch sleeps that long first;
+#                                                   #   --agent claude also warns (advisory only) when the newest /tmp/claude-ctx-*.json
+#                                                   #   (own uid, mtime < 30 min) shows pct >= 90 — the orchestrator's own session is
+#                                                   #   near its context/rate ceiling.
 #   m2herd-up.sh collect  --slice S [--repo P] [--no-verify]
 #                                                   # wait idle (pane) / exited (headless pid), keep/copy report to dispatch/S.out.md,
 #                                                   # update workers[] state (+tokens/cost for headless). Then the VERIFY GATE runs an
@@ -40,7 +49,9 @@
 #                                                   #   crash signature (stream disconnected / Transport error / ECONNRESET / Unable to
 #                                                   #     connect to API) while not working → resume nudge (agent send, settle, Enter);
 #                                                   #   rate-limit menu ("What do you want to do?" + "limit to reset") → Enter (accept
-#                                                   #     stop-and-wait default), log the reset time when visible;
+#                                                   #     stop-and-wait default), log the reset time when visible, record
+#                                                   #     last_ratelimit in the trace status.json and SKIP all nudges for that
+#                                                   #     worker for the next 10 min (pool-pressure backoff);
 #                                                   #   blocked on approval → escalate only ("WATCH: <slice> blocked on approval —
 #                                                   #     needs human/orchestrator"), NEVER auto-approve (deny/allow policy is
 #                                                   #     herd-loop's job);
@@ -48,8 +59,11 @@
 #                                                   #   idle + no commit (git log <base>..HEAD empty, porcelain clean) → stall nudge.
 #                                                   #   Resume count lives in the trace status.json ("resumes": N); past --max-resumes
 #                                                   #   the worker is marked failed (locked write) and left alone. Headless workers:
-#                                                   #   pid + log-tail check; a crash signature = failed at once (claude -p can't
-#                                                   #   resume). Never touches $SELF or panes not recorded in workers[]. --once =
+#                                                   #   pid + log-tail check; a dead pid with a crash signature AND a recorded
+#                                                   #   session id → resume in place (`claude -p --resume <session>` /
+#                                                   #   `codex exec resume --last`, nohup, new pid recorded, resumes++, same
+#                                                   #   --max-resumes cap); no session id → failed as before.
+#                                                   #   Never touches $SELF or panes not recorded in workers[]. --once =
 #                                                   #   single pass (orchestrator/scripted use); default loops until every watched
 #                                                   #   worker is done|failed. One status line per tick:
 #                                                   #   WATCH: <slice>=<state>[/<signature>] …   Exit 0 all done, 1 if any failed.
@@ -64,7 +78,8 @@
 # values fall back to built-ins. Keys follow the settled engine schema
 # (m2herd.sh config): workers.agent, workers.max, workers.model, workers.base,
 # workers.runner, workers.settle_seconds, workers.wait_timeout_minutes,
-# workers.verify_cmd. routing[].pattern uses bash `case "$slice" in $pattern)`
+# workers.verify_cmd, workers.stagger_seconds (rate-limit valve, default 0).
+# routing[].pattern uses bash `case "$slice" in $pattern)`
 # glob semantics (optional agent/runner/model per rule), and the first matching
 # routing rule wins. Precedence: CLI flag > routing > workers defaults.
 #
@@ -145,6 +160,17 @@ log()        { printf '  %s\n' "$*"; }
 plan()       { log "[dry-run] $*"; }
 need()       { command -v "$1" >/dev/null 2>&1 || { echo "required tool not on PATH: $1" >&2; exit 1; }; }
 utc_now()    { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# UUID for `claude -p --session-id` (the resume story needs the id KNOWN at
+# dispatch time — `claude -p` also reports session_id in its JSON envelope, but
+# that only exists after exit, too late for a crash). Empty output = no uuid
+# source on this box; the caller degrades to no-resume, never aborts.
+gen_uuid() {
+  if command -v uuidgen >/dev/null 2>&1; then uuidgen | tr '[:upper:]' '[:lower:]'
+  elif [ -r /proc/sys/kernel/random/uuid ]; then cat /proc/sys/kernel/random/uuid
+  else python3 -c 'import uuid; print(uuid.uuid4())' 2>/dev/null || true
+  fi
+}
 
 # Central token validation (binding cross-slice convention). A slice name
 # becomes filenames under .m2herd/dispatch/, the branch wip/m2herd-<S>, and
@@ -471,24 +497,27 @@ ov_update() { # ov_update <jq args…> '<filter>'
   return 1
 }
 
-record_worker() { # record_worker <slice> <pane> <worktree> <branch> <state> [mode] [model] [pid] [pid_start] [pid_comm]
-  local slice="$1" pane="$2" wt="$3" branch="$4" state="$5" mode="${6:-tui}" model="${7:-}" pid="${8:-}" pid_start="${9:-}" pid_comm="${10:-}"
+record_worker() { # record_worker <slice> <pane> <worktree> <branch> <state> [mode] [model] [pid] [pid_start] [pid_comm] [session]
+  local slice="$1" pane="$2" wt="$3" branch="$4" state="$5" mode="${6:-tui}" model="${7:-}" pid="${8:-}" pid_start="${9:-}" pid_comm="${10:-}" session="${11:-}"
   if [ "$DRY_RUN" -eq 1 ]; then
-    plan "jq rewrite $OV (locked): workers[] += {slice:\"$slice\", pane_id:\"$pane\", mode:\"$mode\", agent:\"$AGENT\"${model:+, model:\"$model\"}${pid:+, pid:$pid}, worktree:\"$wt\", branch:\"$branch\", state:\"$state\", …}"
+    plan "jq rewrite $OV (locked): workers[] += {slice:\"$slice\", pane_id:\"$pane\", mode:\"$mode\", agent:\"$AGENT\"${model:+, model:\"$model\"}${pid:+, pid:$pid}${session:+, session:\"$session\"}, worktree:\"$wt\", branch:\"$branch\", state:\"$state\", dispatched_at:<now>, …}"
     return 0
   fi
   [ -f "$OV" ] || { echo "no overview.json at $OV (run: m2herd-up.sh up --repo $REPO)" >&2; exit 1; }
   ov_update --arg slice "$slice" --arg pane "$pane" --arg wt "$wt" --arg br "$branch" \
      --arg st "$state" --arg ts "$(utc_now)" --arg mode "$mode" --arg agent "$AGENT" \
-     --arg model "$model" --arg pid "$pid" --arg pstart "$pid_start" --arg pcomm "$pid_comm" '
+     --arg model "$model" --arg pid "$pid" --arg pstart "$pid_start" --arg pcomm "$pid_comm" \
+     --arg sess "$session" '
     .workers = ((.workers // []) | map(select(.slice != $slice))) + [({
       slice: $slice, pane_id: $pane, worktree: $wt, branch: $br, state: $st, mode: $mode, agent: $agent,
+      dispatched_at: $ts,
       task: (".m2herd/dispatch/" + $slice + ".task.md"),
       out:  (".m2herd/dispatch/" + $slice + ".out.md") }
       + (if $model != "" then {model: $model} else {} end)
       + (if $pid != "" then {pid: ($pid | tonumber)} else {} end)
       + (if $pstart != "" then {pid_start: $pstart} else {} end)
-      + (if $pcomm != "" then {pid_comm: $pcomm} else {} end))]
+      + (if $pcomm != "" then {pid_comm: $pcomm} else {} end)
+      + (if $sess != "" then {session: $sess} else {} end))]
     | .updated_at = $ts
   ' || { echo "overview.json update failed (lock timeout or jq error)" >&2; exit 1; }
 }
@@ -581,20 +610,21 @@ run_append_slice() { # run_append_slice <slice>
 
 # Write the dispatch half of the bundle: prompt.md (copy of the task file) +
 # status.json (state=spawned). Same for pane and headless — runner/model differ.
-trace_dispatch_write() { # trace_dispatch_write <slice> <runner:pane|headless> <model> <branch> <wt>
+trace_dispatch_write() { # trace_dispatch_write <slice> <runner:pane|headless> <model> <branch> <wt> [session]
   [ -n "$RUN_ID" ] || return 0
-  local slice="$1" runner="$2" model="$3" branch="$4" wt="$5"
+  local slice="$1" runner="$2" model="$3" branch="$4" wt="$5" session="${6:-}"
   local dir="$REPO/.m2herd/runs/$RUN_ID/slices/$slice" task="$REPO/.m2herd/dispatch/$slice.task.md"
   if [ "$DRY_RUN" -eq 1 ]; then
-    plan "mkdir -p $dir; cp $task -> $dir/prompt.md; write $dir/status.json (state=spawned runner=$runner${model:+ model=$model})"
+    plan "mkdir -p $dir; cp $task -> $dir/prompt.md; write $dir/status.json (state=spawned runner=$runner${model:+ model=$model}${session:+ session=$session})"
     return 0
   fi
   mkdir -p "$dir" || { trace_warn "mkdir $dir failed"; return 1; }
   cp "$task" "$dir/prompt.md" 2>/dev/null || trace_warn "copy $task -> $dir/prompt.md failed"
   jq -n --arg slice "$slice" --arg agent "$AGENT" --arg runner "$runner" --arg model "$model" \
-        --arg branch "$branch" --arg wt "$wt" --arg ts "$(utc_now)" \
+        --arg branch "$branch" --arg wt "$wt" --arg ts "$(utc_now)" --arg sess "$session" \
     '{slice:$slice, state:"spawned", agent:$agent, runner:$runner, model:$model, branch:$branch,
-      worktree:$wt, dispatched_at:$ts, collected_at:"", tokens:0, cost_usd:0}' \
+      worktree:$wt, dispatched_at:$ts, collected_at:"", tokens:0, cost_usd:0}
+     + (if $sess != "" then {session:$sess} else {} end)' \
     > "$dir/status.json" 2>/dev/null || trace_warn "write $dir/status.json failed"
 }
 
@@ -879,6 +909,52 @@ up() {
   log "up: done — workspace $ws, orchestrator ${orch:-?}, notes ${notes:-<pending>}"
 }
 
+# ---------- rate-limit-aware dispatch helpers ----------------------------------
+# Pool-pressure valve (lesson rate_limit_stall: parallel claude spawns share ONE
+# rate-limit pool and wave dispatches stalled workers on the limit menu). When
+# workers.stagger_seconds > 0 and another worker entered state spawned|working
+# within that window (workers[].dispatched_at, ISO UTC), sleep the full window
+# before spawning. Default 0 = off; malformed values = off.
+stagger_before_spawn() {
+  local stagger recent
+  stagger="$(settings_get '.workers.stagger_seconds' 0)"
+  case "$stagger" in ''|*[!0-9]*) stagger=0 ;; esac
+  [ "$stagger" -gt 0 ] || return 0
+  [ -f "$OV" ] || return 0
+  recent="$(jq -r --argjson now "$(date +%s)" --argjson win "$stagger" '
+    [.workers[]? | select((.state == "spawned" or .state == "working")
+      and (($now - ((.dispatched_at // "") | fromdateiso8601? // 0)) < $win))] | length
+  ' "$OV" 2>/dev/null || echo 0)"
+  [ "${recent:-0}" -gt 0 ] || return 0
+  if [ "$DRY_RUN" -eq 1 ]; then
+    plan "sleep $stagger   # stagger: $recent worker(s) entered spawned|working within ${stagger}s (workers.stagger_seconds)"
+  else
+    log "dispatch: stagger — $recent worker(s) entered spawned|working within ${stagger}s; sleeping ${stagger}s (workers.stagger_seconds)"
+    sleep "$stagger"
+  fi
+}
+
+# Advisory ceiling check for claude dispatches: the statusline drops the
+# orchestrator's own context snapshot at /tmp/claude-ctx-<...>.json. Newest
+# OWN-uid file with mtime < 30 min and pct >= 90 → WARN that the orchestrator
+# session is near its context/rate ceiling. NEVER blocks, never aborts.
+warn_ctx_ceiling() {
+  [ "$AGENT" = "claude" ] || return 0
+  local f="" c pct
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    if [ -z "$f" ] || [ "$c" -nt "$f" ]; then f="$c"; fi
+  done <<EOF
+$(find /tmp -maxdepth 1 -name 'claude-ctx-*.json' -uid "$(id -u)" -mmin -30 2>/dev/null || true)
+EOF
+  [ -n "$f" ] || return 0
+  pct="$(jq -r '.pct // empty' "$f" 2>/dev/null || true)"
+  pct="${pct%%.*}"
+  case "$pct" in ''|*[!0-9]*) return 0 ;; esac
+  [ "$pct" -ge 90 ] || return 0
+  log "! WARNING: orchestrator session context at ${pct}% ($f) — near its context/rate ceiling; consider finishing dispatches soon (advisory only, not blocking)"
+}
+
 # ---------- dispatch: worktree + worker + file-protocol task -------------------
 dispatch() {
   [ -n "$SLICE" ] || { echo "dispatch needs --slice S" >&2; exit 2; }
@@ -894,6 +970,8 @@ dispatch() {
   log "dispatch: slice=$SLICE repo=$REPO base=$BASE agent=$AGENT (self pane: ${SELF:-<unknown>})"
   log_resolution
   enforce_max_concurrent
+  warn_ctx_ceiling
+  stagger_before_spawn
 
   run_ensure || true
   run_append_slice "$SLICE" || true
@@ -958,20 +1036,39 @@ dispatch() {
     local errlg="$REPO/.m2herd/dispatch/$SLICE.stderr.log" hpid="" hstart="" hcomm="" wtask
     wtask="$(copy_task_into_wt "$wt")"
     local hprompt; hprompt="$(confinement_line "$wt" "$branch") Read $wtask and follow its instructions exactly. Write your complete report to $out when done (the report file is the ONLY thing you write outside the worktree).$(lessons_pointer_suffix)"
+    # HEADLESS RESUME plumbing (lesson worker_stream_disconnect: headless workers
+    # died permanently on the first transport crash). claude: pre-generate the
+    # session uuid so `watch` can `claude -p --resume <uuid>` after a crash.
+    # codex: `codex exec resume --last` filters sessions by cwd, and the worktree
+    # is unique per slice — the sentinel "last" is the whole session story.
+    # opencode: no resume flag in `opencode run` — session stays empty (no resume).
+    local hsession=""
+    case "$AGENT" in
+      claude)
+        hsession="$(gen_uuid)"
+        [ -n "$hsession" ] || log "! no uuid source (uuidgen//proc/python3) — dispatching WITHOUT --session-id; watch cannot resume this worker"
+        ;;
+      codex) hsession="last" ;;
+    esac
     if [ "$DRY_RUN" -eq 1 ]; then
       case "$AGENT" in
-        claude)   plan "cd '$wt' && nohup claude -p '<pointer>' --model '$MODEL' --dangerously-skip-permissions --output-format json > '$lg' 2> '$errlg' &" ;;
-        codex)    plan "cd '$wt' && nohup codex exec --dangerously-bypass-approvals-and-sandbox '<pointer>' > '$lg' 2> '$errlg' &" ;;
-        opencode) plan "cd '$wt' && nohup opencode run '<pointer>' > '$lg' 2> '$errlg' &" ;;
+        claude)   plan "cd '$wt' && nohup claude -p '<pointer>' ${hsession:+--session-id '$hsession' }--model '$MODEL' --dangerously-skip-permissions --output-format json > '$lg' 2> '$errlg' &" ;;
+        codex)    plan "cd '$wt' && nohup codex exec --dangerously-bypass-approvals-and-sandbox '<pointer>' > '$lg' 2> '$errlg' &   # resume story: codex exec resume --last (cwd-filtered)" ;;
+        opencode) plan "cd '$wt' && nohup opencode run '<pointer>' > '$lg' 2> '$errlg' &   # no resume story" ;;
       esac
       plan "record pid + its start-time/comm (ps -o lstart=/-o comm=) so collect can verify the pid was not recycled"
-      record_worker "$SLICE" "-" "$wt" "$branch" "spawned" "headless" "$MODEL" ""
-      trace_dispatch_write "$SLICE" "headless" "$MODEL" "$branch" "$wt" || true
-      log "dispatch: dry-run headless plan complete for $SLICE"
+      record_worker "$SLICE" "-" "$wt" "$branch" "spawned" "headless" "$MODEL" "" "" "" "$hsession"
+      trace_dispatch_write "$SLICE" "headless" "$MODEL" "$branch" "$wt" "$hsession" || true
+      log "dispatch: dry-run headless plan complete for $SLICE${hsession:+ (session $hsession)}"
       return 0
     fi
     case "$AGENT" in
-      claude)   ( cd "$wt" && nohup claude -p "$hprompt" --model "$MODEL" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
+      claude)
+        if [ -n "$hsession" ]; then
+          ( cd "$wt" && nohup claude -p "$hprompt" --session-id "$hsession" --model "$MODEL" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
+        else
+          ( cd "$wt" && nohup claude -p "$hprompt" --model "$MODEL" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
+        fi ;;
       codex)    ( cd "$wt" && nohup codex exec --dangerously-bypass-approvals-and-sandbox "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
       opencode) ( cd "$wt" && nohup opencode run "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
     esac
@@ -981,9 +1078,9 @@ dispatch() {
     # waits on is still OUR worker, not a recycled pid (fix: recycled-pid hang)
     hstart="$(ps -o lstart= -p "$hpid" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' || true)"
     hcomm="$(ps -o comm= -p "$hpid" 2>/dev/null | tr -d ' ' || true)"
-    record_worker "$SLICE" "-" "$wt" "$branch" "spawned" "headless" "$MODEL" "$hpid" "$hstart" "$hcomm"
-    trace_dispatch_write "$SLICE" "headless" "$MODEL" "$branch" "$wt" || true
-    log "dispatch: done — $SLICE headless ($AGENT/$MODEL, pid $hpid), log $lg, stderr $errlg"
+    record_worker "$SLICE" "-" "$wt" "$branch" "spawned" "headless" "$MODEL" "$hpid" "$hstart" "$hcomm" "$hsession"
+    trace_dispatch_write "$SLICE" "headless" "$MODEL" "$branch" "$wt" "$hsession" || true
+    log "dispatch: done — $SLICE headless ($AGENT/$MODEL, pid $hpid${hsession:+, session $hsession}), log $lg, stderr $errlg"
     return 0
   fi
 
@@ -1411,6 +1508,48 @@ resumes_bump() { # resumes_bump <slice> — increment the counter (no output)
   return 0
 }
 
+# Headless session id recorded at dispatch (claude: a real uuid for
+# `claude -p --resume`; codex: the sentinel "last" for `codex exec resume --last`).
+# Trace status.json first, overview.json workers[].session as fallback.
+session_get() { # session_get <slice> -> session id, or empty (no resume story)
+  local sj v=""
+  sj="$(resumes_status_json "$1")"
+  [ -n "$sj" ] && v="$(jq -r '.session // empty' "$sj" 2>/dev/null || true)"
+  [ -n "$v" ] || v="$(jq -r --arg s "$1" '[.workers[]? | select(.slice==$s)] | first | .session // empty' "$OV" 2>/dev/null || true)"
+  printf '%s' "$v"
+}
+
+# Rate-limit backoff (10 min): after accepting the limit menu, nudging that
+# worker again only burns the shared pool — it is WAITING for the reset, not
+# stuck. last_ratelimit is epoch seconds in the trace status.json, degrading to
+# dispatch/<slice>.ratelimit when no run bundle exists (same idiom as resumes).
+RATELIMIT_BACKOFF_SECONDS=600
+
+ratelimit_mark() { # ratelimit_mark <slice> — record "rate-limit menu accepted now"
+  local sj now tmp; now="$(date +%s)"
+  sj="$(resumes_status_json "$1")"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    plan "record last_ratelimit=$now for $1 (${sj:-$REPO/.m2herd/dispatch/$1.ratelimit})"
+  elif [ -n "$sj" ]; then
+    tmp="$(mktemp "$(dirname "$sj")/.status.json.tmp.XXXXXX")" || { trace_warn "mktemp for $sj failed"; return 0; }
+    jq --argjson t "$now" '.last_ratelimit = $t' "$sj" > "$tmp" 2>/dev/null && mv "$tmp" "$sj" \
+      || { rm -f "$tmp"; trace_warn "last_ratelimit update to $sj failed"; }
+  else
+    trace_warn "no run bundle for $1 — tracking last_ratelimit in dispatch/$1.ratelimit"
+    printf '%s' "$now" > "$REPO/.m2herd/dispatch/$1.ratelimit" 2>/dev/null || true
+  fi
+  return 0
+}
+
+in_ratelimit_backoff() { # in_ratelimit_backoff <slice> -> 0 when inside the 10-min window
+  local sj t=""
+  sj="$(resumes_status_json "$1")"
+  if [ -n "$sj" ]; then t="$(jq -r '.last_ratelimit // empty' "$sj" 2>/dev/null || true)"
+  else t="$(cat "$REPO/.m2herd/dispatch/$1.ratelimit" 2>/dev/null || true)"; fi
+  case "$t" in ''|*[!0-9]*) return 1 ;; esac
+  [ $(( $(date +%s) - t )) -lt "$RATELIMIT_BACKOFF_SECONDS" ]
+}
+
 # Base ref for the "did it commit anything" check: the run bundle recorded the
 # dispatch-time base; fall back to settings, then the repo's current branch.
 slice_base() { # slice_base <slice> -> ref
@@ -1444,6 +1583,11 @@ watch_collect() { # watch_collect <slice> -> 0 done, 1 failed
 # the counter, nudge (agent send, settle, Enter — submit_pointer).
 watch_nudge() { # watch_nudge <slice> <pane> <signature> <status> <nudge-text>
   local s="$1" pane="$2" sig="$3" status="$4" text="$5" n
+  if in_ratelimit_backoff "$s"; then
+    log "watch: $s signature '$sig' but inside the 10-min rate-limit backoff — not nudging (pool pressure)"
+    WATCH_TOKEN="$s=working/rate-limit-backoff:$sig"
+    return 0
+  fi
   n="$(resumes_get "$s")"
   if [ "$n" -ge "$WATCH_MAX_RESUMES" ]; then
     watch_fail "$s" "resume_exhausted" "signature '$sig' after $n resumes (max $WATCH_MAX_RESUMES) — not touching it again"
@@ -1491,12 +1635,19 @@ watch_one_tui() { # watch_one_tui <slice> <pane> <wt> <state>
   fi
 
   # 2. rate-limit menu → accept the stop-and-wait default (Enter), log the
-  #    reset time when visible. Not a resume — nothing was lost.
+  #    reset time when visible. Not a resume — nothing was lost. Then back off:
+  #    record last_ratelimit and leave the worker alone for 10 min (the menu can
+  #    stay on screen after the Enter; re-pressing only burns the shared pool).
   if rate_limit_menu "$norm"; then
+    if in_ratelimit_backoff "$s"; then
+      WATCH_TOKEN="$s=$state/rate-limit:backoff"
+      return 0
+    fi
     reset="$(printf '%s' "$raw" | grep -i 'reset' | head -1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || true)"
-    log "watch: $s rate-limit menu — pressing Enter (stop-and-wait)${reset:+; menu says: $reset}"
+    log "watch: $s rate-limit menu — pressing Enter (stop-and-wait), backing off ${RATELIMIT_BACKOFF_SECONDS}s${reset:+; menu says: $reset}"
     if [ "$DRY_RUN" -eq 1 ]; then plan "herdr pane send-keys '$pane' Enter"
     else herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true; fi
+    ratelimit_mark "$s"
     WATCH_TOKEN="$s=$state/rate-limit:accepted"
     return 0
   fi
@@ -1541,8 +1692,68 @@ watch_one_tui() { # watch_one_tui <slice> <pane> <wt> <state>
   return 0
 }
 
+# Respawn a crashed headless worker into the SAME session (nohup, same log
+# files — the fresh JSON envelope keeps collect's usage parse working). New pid
+# (+ start-time/comm) recorded via the same locked writer dispatch uses.
+HEADLESS_RESUME_PROMPT="continue: finish the task file items, write the report"
+
+headless_resume() { # headless_resume <slice> <signature> <session> — sets WATCH_TOKEN
+  local s="$1" sig="$2" sess="$3" w wagent wt wbranch wmodel lg errlg hpid hstart hcomm n
+  w="$(jq -c --arg s "$s" '[.workers[]? | select(.slice==$s)] | first' "$OV" 2>/dev/null || true)"
+  wagent="$(printf '%s' "$w" | jq -r '.agent // "claude"')"
+  wt="$(printf '%s' "$w" | jq -r '.worktree // empty')"
+  wbranch="$(printf '%s' "$w" | jq -r '.branch // empty')"
+  wmodel="$(printf '%s' "$w" | jq -r '.model // empty')"
+  lg="$REPO/.m2herd/dispatch/$s.log"; errlg="$REPO/.m2herd/dispatch/$s.stderr.log"
+  if [ -z "$wt" ] || [ ! -d "$wt" ]; then
+    watch_fail "$s" "worker_crash" "headless '$sig' and worktree ${wt:-<none>} is gone — cannot resume"
+    WATCH_TOKEN="$s=failed/$sig:no-worktree"
+    return 0
+  fi
+  n="$(resumes_get "$s")"
+  resumes_bump "$s"
+  log "watch: $s headless '$sig' — resuming session $sess ($((n + 1))/$WATCH_MAX_RESUMES)"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    case "$wagent" in
+      claude) plan "cd '$wt' && nohup claude -p --resume '$sess' '$HEADLESS_RESUME_PROMPT' ${wmodel:+--model '$wmodel' }--dangerously-skip-permissions --output-format json > '$lg' 2> '$errlg' &" ;;
+      codex)  plan "cd '$wt' && nohup codex exec --dangerously-bypass-approvals-and-sandbox resume --last '$HEADLESS_RESUME_PROMPT' > '$lg' 2> '$errlg' &   # cwd filter pins --last to this worktree" ;;
+    esac
+    plan "record new pid + start-time/comm in workers[] (state=working)"
+    WATCH_TOKEN="$s=working/$sig:resumed$((n + 1))"
+    return 0
+  fi
+  case "$wagent" in
+    claude)
+      if [ -n "$wmodel" ]; then
+        ( cd "$wt" && nohup claude -p --resume "$sess" "$HEADLESS_RESUME_PROMPT" --model "$wmodel" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
+      else
+        ( cd "$wt" && nohup claude -p --resume "$sess" "$HEADLESS_RESUME_PROMPT" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
+      fi ;;
+    codex)
+      # `codex exec resume` filters recorded sessions by cwd; the worktree is
+      # unique per slice, so --last IS this worker's session.
+      ( cd "$wt" && nohup codex exec --dangerously-bypass-approvals-and-sandbox resume --last "$HEADLESS_RESUME_PROMPT" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
+    *)
+      watch_fail "$s" "worker_crash" "headless '$sig' — agent $wagent has no resume story"
+      WATCH_TOKEN="$s=failed/$sig:no-resume-story"
+      return 0 ;;
+  esac
+  hpid="$(cat "$lg.pid" 2>/dev/null || true)"; rm -f "$lg.pid"
+  if [ -z "$hpid" ]; then
+    watch_fail "$s" "worker_crash" "headless '$sig' resume respawn produced no pid — see $lg / $errlg"
+    WATCH_TOKEN="$s=failed/$sig:resume-spawn"
+    return 0
+  fi
+  hstart="$(ps -o lstart= -p "$hpid" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' || true)"
+  hcomm="$(ps -o comm= -p "$hpid" 2>/dev/null | tr -d ' ' || true)"
+  AGENT="$wagent"   # record_worker stamps workers[].agent from $AGENT
+  record_worker "$s" "-" "$wt" "$wbranch" "working" "headless" "$wmodel" "$hpid" "$hstart" "$hcomm" "$sess"
+  WATCH_TOKEN="$s=working/$sig:resumed$((n + 1))"
+  return 0
+}
+
 watch_one_headless() { # watch_one_headless <slice> <state>
-  local s="$1" state="$2" pid pstart curstart norm sig alive=0 out
+  local s="$1" state="$2" pid pstart curstart norm sig alive=0 out sess n
   WATCH_TOKEN="$s=$state"
   pid="$(jq -r --arg s "$s" '[.workers[]? | select(.slice==$s)] | first | .pid // empty' "$OV" 2>/dev/null || true)"
   pstart="$(jq -r --arg s "$s" '[.workers[]? | select(.slice==$s)] | first | .pid_start // empty' "$OV" 2>/dev/null || true)"
@@ -1553,17 +1764,32 @@ watch_one_headless() { # watch_one_headless <slice> <state>
     curstart="$(ps -o lstart= -p "$pid" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' || true)"
     if [ -z "$pstart" ] || [ "$curstart" = "$pstart" ]; then alive=1; fi   # start-time mismatch = recycled pid
   fi
-  # crash signature in the log tail with no report = failed at once (a one-shot
-  # `claude -p` / `codex exec` cannot be resume-nudged); a landed report means
-  # the worker survived its errors — let collect (and the verify gate) judge it.
-  if [ ! -s "$out" ] && sig="$(crash_signature_of "$norm")"; then
-    watch_fail "$s" "worker_crash" "headless crash signature '$sig' in log tail — one-shot runner cannot be resumed"
-    WATCH_TOKEN="$s=failed/$sig"
-  elif [ "$alive" -eq 1 ]; then
+  if [ "$alive" -eq 1 ]; then
     WATCH_TOKEN="$s=working/pid$pid"
-  else
-    if watch_collect "$s"; then WATCH_TOKEN="$s=done/collected"; else WATCH_TOKEN="$s=failed/collect"; fi
+    return 0
   fi
+  # pid is DEAD. Crash signature in the log tail with no report → resume into
+  # the recorded session (claude --resume / codex resume --last) up to
+  # --max-resumes; no session recorded → failed, exactly as before. A landed
+  # report means the worker survived its errors — let collect (verify gate
+  # included) judge it.
+  if [ ! -s "$out" ] && sig="$(crash_signature_of "$norm")"; then
+    sess="$(session_get "$s")"
+    if [ -z "$sess" ]; then
+      watch_fail "$s" "worker_crash" "headless crash signature '$sig' in log tail and no session id recorded — cannot resume"
+      WATCH_TOKEN="$s=failed/$sig"
+      return 0
+    fi
+    n="$(resumes_get "$s")"
+    if [ "$n" -ge "$WATCH_MAX_RESUMES" ]; then
+      watch_fail "$s" "resume_exhausted" "headless signature '$sig' after $n resumes (max $WATCH_MAX_RESUMES) — not respawning again"
+      WATCH_TOKEN="$s=failed/$sig:resumes-exhausted"
+      return 0
+    fi
+    headless_resume "$s" "$sig" "$sess"
+    return 0
+  fi
+  if watch_collect "$s"; then WATCH_TOKEN="$s=done/collected"; else WATCH_TOKEN="$s=failed/collect"; fi
   return 0
 }
 
