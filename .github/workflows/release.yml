@@ -1,0 +1,38 @@
+name: Release
+
+# Prebuilt-rot guard: every v* tag rebuilds all four m2herd-tui targets and
+# attaches them to the GitHub release, so the committed prebuilt/ set can be
+# cross-checked (and users can always download current binaries).
+on:
+  push:
+    tags: ["v*"]
+
+jobs:
+  release:
+    name: release (build all prebuilts + attach)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: stable
+          cache-dependency-path: tui/go.sum
+
+      - name: build all release targets
+        run: make tui-release
+
+      - name: checksums
+        run: |
+          cd prebuilt
+          sha256sum m2herd-tui-* | tee SHA256SUMS
+
+      - name: attach binaries to the GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            prebuilt/m2herd-tui-*
+            prebuilt/SHA256SUMS
+          generate_release_notes: true
