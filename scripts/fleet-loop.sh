@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # fleet-loop.sh — the meta-orchestrator reconciler (tier 0).
 #
+# STATUS: legacy, maintained. This script drives the fleet-control (Hermes-era) stack
+# (§15), the meta tier above herd-control (§12). It keeps working and keeps getting
+# fixes, but for Claude Code orchestration it is superseded by m2herd (§16) — see
+# scripts/m2herd.sh + scripts/m2herd-up.sh (`m2herd-up`).
+#
 # Same ICM idea as herd-loop.sh, one level up. herd-loop.sh reconciles WORKERS for one
 # feature; fleet-loop.sh reconciles ORCHESTRATORS for a whole portfolio of missions:
 #

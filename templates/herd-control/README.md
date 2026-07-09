@@ -1,5 +1,10 @@
 # herd-control — an ICM-steered herdr workspace
 
+> **Status: legacy, maintained.** This template + `scripts/herd-loop.sh` are the
+> herd-control (Hermes-era, §12/§15) stack. They keep working and keep getting fixes,
+> but for Claude Code orchestration they are superseded by **m2herd** (§16) —
+> `scripts/m2herd.sh` + `scripts/m2herd-up.sh` (`m2herd-up`).
+
 A filesystem-native control room for driving a herdr fleet. It marries two ideas:
 
 - **ICM** ([Interpretable Context Methodology](https://arxiv.org/abs/2603.16021)) — the folder

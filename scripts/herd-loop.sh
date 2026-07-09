@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
 # herd-loop.sh — the ICM-steered herdr reconciler.
 #
+# STATUS: legacy, maintained. This script drives the herd-control (Hermes-era) stack
+# (§12/§15): file-native workspaces reconciled against the herdr socket. It keeps
+# working and keeps getting fixes, but for Claude Code orchestration it is superseded
+# by m2herd (§16) — see scripts/m2herd.sh + scripts/m2herd-up.sh (`m2herd-up`).
+#
+# Config resolution chain (per key, first non-empty wins):
+#   1. explicit CLI flag (--base, --worker, ...) / env
+#   2. herd.conf in the workspace           (existing behavior — legacy workspaces unchanged)
+#   3. the target repo's .m2herd/settings.json, read-only via jq, when present
+#      (BASE ← .workers.base, WORKER_DEFAULT ← .workers.agent)
+#   4. built-in defaults (main / codex)
+#
 # The folder (an ICM "herd-control" workspace) is DESIRED state. The herdr socket is
 # OBSERVED state. This script reconciles them: it observes the fleet, spawns the workers
 # a fanout stage declares, collects finished work, handles or escalates blocked workers,
@@ -28,6 +40,7 @@ set -euo pipefail
 # ---------- arg parsing ------------------------------------------------------
 CMD="${1:-help}"; shift || true
 WS=""; REPO=""; BASE="main"; FEATURE=""; WORKER_DEFAULT="codex"
+BASE_FLAG=0; WORKER_FLAG=0                # explicit flag wins over herd.conf/settings.json in tick
 MODEL="GLM-5.2"; BUDGET="384000"          # context-budget layer defaults (GLM-5.2 / 384k)
 INTERVAL=10; MAX_TICKS=0; DRY_RUN=0; ORCH=""; FORCE=0
 AUTO_ROTATE=0; MAX_ROTATIONS=5            # run --auto-rotate: rotate on CRITICAL, capped
@@ -35,9 +48,9 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --ws) WS="$2"; shift 2 ;;
     --repo) REPO="$2"; shift 2 ;;
-    --base) BASE="$2"; shift 2 ;;
+    --base) BASE="$2"; BASE_FLAG=1; shift 2 ;;
     --feature) FEATURE="$2"; shift 2 ;;
-    --worker) WORKER_DEFAULT="$2"; shift 2 ;;
+    --worker) WORKER_DEFAULT="$2"; WORKER_FLAG=1; shift 2 ;;
     --model) MODEL="$2"; shift 2 ;;
     --budget) BUDGET="$2"; shift 2 ;;
     --interval) INTERVAL="$2"; shift 2 ;;
@@ -73,6 +86,13 @@ resolve_ws() {
 }
 
 conf_get() { grep -E "^$1=" "$WS/herd.conf" 2>/dev/null | head -1 | cut -d= -f2- || true; }
+# read-only fallback into the target repo's m2herd settings (see header chain). Only
+# consulted when herd.conf lacks the key; absent file/key/jq → empty (chain falls through).
+m2_settings_get() { # m2_settings_get <repo> <jq-path> -> value or empty
+  local f="$1/.m2herd/settings.json"
+  [ -n "$1" ] && [ -f "$f" ] && command -v jq >/dev/null 2>&1 || return 0
+  jq -er "$2 // empty" "$f" 2>/dev/null || true
+}
 ctx_get()  { grep -iE "^$2:" "$1" 2>/dev/null | head -1 | sed -E 's/^[^:]+:[[:space:]]*//' || true; }
 active()   { cat "$WS/_fleet/active_stage" 2>/dev/null || echo "01_spec"; }
 ctx_file() { echo "$WS/stages/$(active)/CONTEXT.md"; }
@@ -486,8 +506,18 @@ collect_slice() {
 # ---------- tick: one reconciliation pass ------------------------------------
 tick() {
   resolve_ws
-  REPO="$(conf_get REPO)"; BASE="$(conf_get BASE)"; BASE="${BASE:-main}"
-  WORKER_DEFAULT="$(conf_get WORKER_DEFAULT)"; WORKER_DEFAULT="${WORKER_DEFAULT:-codex}"
+  REPO="$(conf_get REPO)"
+  # chain (see header): flag > herd.conf > repo .m2herd/settings.json > default
+  if [ "$BASE_FLAG" -ne 1 ]; then
+    BASE="$(conf_get BASE)"
+    [ -n "$BASE" ] || BASE="$(m2_settings_get "$REPO" '.workers.base')"
+    BASE="${BASE:-main}"
+  fi
+  if [ "$WORKER_FLAG" -ne 1 ]; then
+    WORKER_DEFAULT="$(conf_get WORKER_DEFAULT)"
+    [ -n "$WORKER_DEFAULT" ] || WORKER_DEFAULT="$(m2_settings_get "$REPO" '.workers.agent')"
+    WORKER_DEFAULT="${WORKER_DEFAULT:-codex}"
+  fi
   rm -f "$(FLEET_STATE)/.needs_review"
   observe || { echo "STATUS: ERROR (cannot observe fleet)"; return 1; }
   drain_inbox
@@ -501,6 +531,8 @@ tick() {
   [ -f "$ctx" ] || { echo "STATUS: ERROR (no contract for stage $stage)"; return 1; }
   mode="$(ctx_get "$ctx" mode)"; gate="$(ctx_get "$ctx" gate)"; deliverable="$(ctx_get "$ctx" deliverable)"
   log "stage $stage (mode=${mode:-solo}, gate=${gate:-review})"
+  # per-tick audit trail (AGENT.md Layer 4). Under --dry-run FLEET_STATE is the shadow dir.
+  printf '%s\ttick\tstage=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$stage" >> "$(FLEET_STATE)/events.log"
 
   local complete=0
   if [ "$mode" = "fanout" ]; then
@@ -581,6 +613,12 @@ tick() {
 }
 
 # ---------- advance: active stage → its handoff ------------------------------
+# Context manifests FOLLOW the handoff: context-budget.sh plan writes per-slice
+# manifests under the planning stage (03_tasks by default) but gen_prompt only looks
+# in the ACTIVE stage's context/ — so on advance, copy stages/<old>/context/*.md into
+# stages/<new>/context/ (no clobber: a manifest already rewritten there by
+# `context-budget.sh pointer --stage <new>` wins). Copy, not symlink: portable, and
+# the workspace stays reconstructible from plain files.
 advance() {
   resolve_ws
   local stage ctx handoff; stage="$(active)"; ctx="$WS/stages/$stage/CONTEXT.md"
@@ -588,6 +626,15 @@ advance() {
   if [ -z "$handoff" ] || [ "$handoff" = "DONE" ]; then
     state_write "set active_stage=DONE" write_line "$WS/_fleet/active_stage" "DONE"; echo "STATUS: DONE"; return 0
   fi
+  local m dest="$WS/stages/$handoff/context"
+  for m in "$WS/stages/$stage/context"/*.md; do
+    [ -f "$m" ] || continue
+    if [ "$DRY_RUN" -eq 1 ]; then log "[dry-run] would copy context manifest $m → $dest/"; continue; fi
+    mkdir -p "$dest"
+    if [ ! -e "$dest/$(basename "$m")" ]; then
+      cp "$m" "$dest/"; log "context manifest → $dest/$(basename "$m")"
+    fi
+  done
   state_write "set active_stage=$handoff" write_line "$WS/_fleet/active_stage" "$handoff"
   log "advanced $stage → $handoff"
 }

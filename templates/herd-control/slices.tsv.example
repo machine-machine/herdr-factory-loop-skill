@@ -1,0 +1,15 @@
+# slices.tsv.example — seed for a fanout stage's slices.tsv (04_implement by default).
+# Copy to stages/04_implement/slices.tsv, uncomment/edit the rows, and tick.
+#
+# herd-loop.sh parses each non-comment line as TAB-separated columns:
+#   slice<TAB>worker[<TAB>scope-notes…]
+#
+#   slice   — [A-Za-z0-9_-] id. Becomes branch wip/<stage>/<slice>, worktree label,
+#             and prompt file stages/<stage>/prompts/<slice>.md (auto-generated).
+#   worker  — codex | claude | cursor | <binary-on-PATH>. Empty → WORKER_DEFAULT
+#             (herd.conf, else the repo's .m2herd/settings.json workers.agent, else codex).
+#   extras  — every further column is ignored by the loop: free-form scope notes for humans.
+#
+# Columns are REAL TABS, not spaces.
+#auth-api	codex	scope: services/auth only
+#auth-ui	claude	scope: web/src/auth only
