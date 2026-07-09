@@ -10,10 +10,19 @@
 # It does the MECHANICAL work only (byte→token estimate `ceil(bytes/4)`, threshold math,
 # file writes). Judgment stays with the orchestrator.
 #
+# Config resolution chain for MODEL/BUDGET (first non-empty wins):
+#   1. explicit --model/--budget flags
+#   2. herd.conf MODEL/BUDGET                (existing behavior — legacy workspaces unchanged)
+#   3. the workspace repo's .m2herd/settings.json, read-only via jq, when present
+#      (BUDGET ← .orchestrator.budget; not in the m2herd default schema, so this only
+#       fires when a user has set it — absent key falls through)
+#   4. ~/.hermes/config.yaml model.context_length (+ cache)
+#   5. built-in defaults (GLM-5.2 / 384000)
+#
 # Usage:
 #   context-budget.sh detect    [--ws DIR] [--model NAME] [--budget N]
 #   context-budget.sh status    [--ws DIR] [--session ID]
-#   context-budget.sh plan      --ws DIR --intent FILE [--fraction 0.25]
+#   context-budget.sh plan      --ws DIR --intent FILE [--stage S] [--fraction 0.25]
 #   context-budget.sh pointer   --ws DIR --stage S --slice X [--fraction 0.25]
 #   context-budget.sh summarize --ws DIR --stage S --slice X [--llm "CMD"]
 #   context-budget.sh compact   --ws DIR
@@ -66,6 +75,14 @@ soft_ws() {
 }
 
 conf_get() { grep -E "^$1=" "$WS/herd.conf" 2>/dev/null | head -1 | cut -d= -f2- || true; }
+# read-only fallback into the workspace repo's m2herd settings (see header chain).
+# Absent repo/file/key/jq → empty, and the chain falls through to the next rung.
+m2_settings_get() { # m2_settings_get <jq-path> -> value or empty
+  local r f; r="$(conf_get REPO)"; [ -n "$r" ] || r="$WS"
+  f="$r/.m2herd/settings.json"
+  [ -n "$r" ] && [ -f "$f" ] && command -v jq >/dev/null 2>&1 || return 0
+  jq -er "$1 // empty" "$f" 2>/dev/null || true
+}
 
 # repo root the slice file-links are relative to (herd.conf REPO, else the workspace itself).
 repo_root() {
@@ -90,7 +107,8 @@ yaml_model_key() { # yaml_model_key <file> <key>
 }
 
 # ---------- detect: resolve MODEL / BUDGET / SOURCE --------------------------
-# order: herd.conf → ~/.hermes/config.yaml model.context_length (+cache) → GLM-5.2/384000.
+# order: herd.conf → repo .m2herd/settings.json (orchestrator.budget) →
+#        ~/.hermes/config.yaml model.context_length (+cache) → GLM-5.2/384000.
 resolve_budget() { # sets globals MODEL BUDGET SOURCE
   local cm cb
   # explicit CLI overrides win outright.
@@ -102,7 +120,12 @@ resolve_budget() { # sets globals MODEL BUDGET SOURCE
   if [ -n "$cb" ]; then
     MODEL="${cm:-$DEFAULT_MODEL}"; BUDGET="$cb"; SOURCE="herd.conf"; return
   fi
-  # 2. ~/.hermes/config.yaml (context_length), then the cache file
+  # 2. repo .m2herd/settings.json — herd.conf MODEL (if any) still names the model.
+  cb="$(m2_settings_get '.orchestrator.budget')"
+  if [ -n "$cb" ]; then
+    MODEL="${cm:-$DEFAULT_MODEL}"; BUDGET="$cb"; SOURCE="m2herd-settings"; return
+  fi
+  # 3. ~/.hermes/config.yaml (context_length), then the cache file
   cb="$(yaml_model_key "$HERMES_CONFIG" context_length)"
   cm="$(yaml_model_key "$HERMES_CONFIG" default)"
   if [ -z "$cb" ] && [ -f "$HERMES_CACHE" ]; then
@@ -111,7 +134,7 @@ resolve_budget() { # sets globals MODEL BUDGET SOURCE
   if [ -n "$cb" ]; then
     MODEL="${cm:-$DEFAULT_MODEL}"; BUDGET="$cb"; SOURCE="hermes-config"; return
   fi
-  # 3. default
+  # 4. default
   MODEL="$DEFAULT_MODEL"; BUDGET="$DEFAULT_BUDGET"; SOURCE="default"
 }
 
@@ -236,6 +259,10 @@ write_manifest() { # write_manifest <out-md> <slice> <files-space-sep>
 }
 
 # ---------- plan: decompose an intent into per-slice manifests ---------------
+# --stage S targets the manifests at stages/S/context/ (default 03_tasks, the planning
+# stage — unchanged). Pass the fanout stage (e.g. --stage 04_implement) to write them
+# where gen_prompt will look; `herd-loop.sh advance` also copies 03_tasks manifests
+# forward, so the default stays correct either way.
 plan() {
   resolve_ws
   [ -n "$INTENT" ] || { echo "plan needs --intent FILE" >&2; exit 2; }
@@ -243,7 +270,7 @@ plan() {
   local rows; rows="$(slices_from_intent "$INTENT")"
   [ -n "$rows" ] || rows="$(slices_from_tasks "$WS/stages/03_tasks/output/tasks.md")"
   [ -n "$rows" ] || { echo "no slices found in intent or tasks.md" >&2; exit 1; }
-  local ctxdir="$WS/stages/03_tasks/context" n=0 oversized=0
+  local ctxdir="$WS/stages/${STAGE:-03_tasks}/context" n=0 oversized=0
   mkdir -p "$ctxdir"
   local slice files out
   while IFS=$'\t' read -r slice files; do
@@ -386,6 +413,22 @@ EOF
   assert_nonempty "detect"  "$(detect)"
   detect | grep -q '^BUDGET=384000' || { echo "FAIL: detect BUDGET not from herd.conf" >&2; fail=1; }
 
+  # settings.json fallback: herd.conf without BUDGET → repo .m2herd/settings.json
+  # orchestrator.budget; then restore herd.conf and assert it still wins.
+  mkdir -p "$repo/.m2herd"
+  printf '{"orchestrator":{"budget":123456}}\n' > "$repo/.m2herd/settings.json"
+  printf 'REPO=%s\nBASE=main\n' "$repo" > "$ws/herd.conf"
+  detect | grep -q '^BUDGET=123456' || { echo "FAIL: detect BUDGET not from .m2herd/settings.json fallback" >&2; fail=1; }
+  detect | grep -q '^SOURCE=m2herd-settings' || { echo "FAIL: detect SOURCE not m2herd-settings" >&2; fail=1; }
+  cat > "$ws/herd.conf" <<EOF
+REPO=$repo
+BASE=main
+MODEL=GLM-5.2
+BUDGET=384000
+EOF
+  detect | grep -q '^BUDGET=384000' || { echo "FAIL: herd.conf BUDGET did not win over settings.json" >&2; fail=1; }
+  echo "ok: settings.json fallback chain"
+
   assert_nonempty "status"  "$(status)"
   status | grep -q '^BUDGET=' || { echo "FAIL: status missing BUDGET" >&2; fail=1; }
 
@@ -397,6 +440,11 @@ EOF
   if grep -q 'SECRET_BODY_MARKER' "$ws/stages/03_tasks/context/budget-engine.md"; then
     echo "FAIL: manifest inlined file body (must be links only)" >&2; fail=1
   fi
+
+  # plan --stage: manifests land under the requested stage, not 03_tasks.
+  INTENT="$ws/intent.tsv"; STAGE="09_custom"
+  assert_nonempty "plan(--stage)" "$(plan)"
+  [ -f "$ws/stages/09_custom/context/budget-engine.md" ] || { echo "FAIL: plan --stage wrote no manifest under 09_custom" >&2; fail=1; }
 
   INTENT=""; STAGE="04_implement"; SLICE="budget-engine"
   assert_nonempty "pointer" "$(pointer)"

@@ -22,7 +22,7 @@ one stage at a time, with the whole state reconstructible from this folder alone
 - `ROUTER.md` (Layer 1) tells you which stage handles the current situation.
 - Each `stages/NN_*/CONTEXT.md` (Layer 2) is the contract for that stage: Inputs / Process / Outputs.
 - `_config/` and `shared/` (Layer 3) are stable reference — internalize as constraints, do not rewrite.
-- `_fleet/` (Layer 4, observed) is written by the loop each tick: `agents.json`, `ledger.tsv`, `events.log`.
+- `_fleet/` (Layer 4, observed) is written by the loop each tick: `agents.json`, `ledger.tsv`, `events.log` (one `ts<TAB>tick<TAB>stage=` line per pass).
 - Stage artifacts (Layer 4, working) land **only** in that stage's `output/`.
 
 ## Global constraints

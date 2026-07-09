@@ -1,5 +1,10 @@
 # fleet-control — the meta-orchestrator workspace
 
+> **Status: legacy, maintained.** This template + `scripts/fleet-loop.sh` are the
+> fleet-control (Hermes-era, §15) stack. They keep working and keep getting fixes,
+> but for Claude Code orchestration they are superseded by **m2herd** (§16) —
+> `scripts/m2herd.sh` + `scripts/m2herd-up.sh` (`m2herd-up`).
+
 ICM workspace for the **meta-orchestrator** (tier 0): the orchestrator of orchestrators.
 Driven by `scripts/fleet-loop.sh`. Same folder=desired / socket=observed reconciliation as
 `herd-control/`, one level up — its "workers" are **orchestrators**, its "slices" are **missions**.

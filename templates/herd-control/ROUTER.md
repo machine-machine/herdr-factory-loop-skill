@@ -15,7 +15,7 @@
 | Tasks ready, build it | `04_implement` | `_config/dispatch_policy.md` | research docs |
 | Built, check consistency | `05_analyze` | `_config/review_checklist.md` | — |
 | Reviewed, merge + report | `06_converge` | `_config/gate_policy.md` | — |
-| Channel intent, skip the spec ceremony | `04_implement` (hand-write `slices.tsv`) | `_config/dispatch_policy.md` | spec/plan |
+| Channel intent, skip the spec ceremony | `04_implement` (hand-write `slices.tsv` — seed: `slices.tsv.example` at the workspace root) | `_config/dispatch_policy.md` | spec/plan |
 
 ## By fleet state (warm — what to do while a stage is active)
 
