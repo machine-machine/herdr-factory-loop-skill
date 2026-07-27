@@ -41,7 +41,7 @@ jobs:
         run: shellcheck -S warning scripts/*.sh hooks/*.sh
 
   go:
-    name: go (build + vet + tui artifact)
+    name: go (build + vet + test + tui artifact)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -58,6 +58,10 @@ jobs:
       - name: go vet
         working-directory: tui
         run: go vet ./...
+
+      - name: go test
+        working-directory: tui
+        run: go test ./...
 
       - name: build m2herd-tui linux-amd64
         working-directory: tui
