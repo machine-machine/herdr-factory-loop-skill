@@ -2,6 +2,9 @@
 > built against, plus its amendments. It is kept as the record of what was promised to whom;
 > it is no longer the leading spec. **Where it disagrees with `skill/SKILL.md` ≥ 2.6.0, the
 > SKILL wins** — the shipped code and §16/§17 of the skill are the source of truth.
+> **Exception:** amendments dated after the shipped skill version (currently v2.3, wave 7)
+> are forward-looking specs, issued before the code exists. Those bind the slices that
+> build them, and SKILL.md is updated to match at collect time.
 
 # m2herd contract (v2.0.0) — pre-committed; ALL slices build against this
 
@@ -429,6 +432,162 @@ all readers: 384000.
 
 **Hook smokes.** The per-slice smoke obligation (§ hooks) is discharged by `hooks/smoke.sh`
 (sample/empty/garbage stdin → exit 0 + valid JSON for every hook).
+
+## Amendment v2.3 — declared topology (`graph.json`), wave 7 — orchestrator-issued, binding
+
+**Doctrine.** The folder holds the context; from v2.3 it also holds the *topology*. Until
+now m2herd's graph was real but undeclared: nodes (dispatch → worker → verify gate →
+collect, with `watch` as the reconciler and `evolve` as the slow outer loop), conditional
+edges (`routing[]`, the `watch` ladder), and a bounded retry cycle (`--max-resumes`) all
+exist in code, but *which slices exist and what they wait on* lived only in the
+orchestrator's context window and in warplan prose. A fresh session could recover goal,
+notes, areas, runs and lessons from the fabric — never the graph. v2.3 closes that: the
+topology becomes a file, and dispatch reads it.
+
+This is a promotion, not a rewrite. Nothing in v1.x/v2.x changes semantics. Single-slice
+`dispatch --slice S` stays exactly as it is and stays the default.
+
+### §1. `.m2herd/graph.json` (seed: `templates/m2herd/graph.json`)
+
+```json
+{
+  "schema_version": 1,
+  "updated_at": "ISO-8601 UTC",
+  "nodes": [
+    {"id": "<slice>", "kind": "slice|gate|human", "owns": ["<repo-relative path>", "..."],
+     "area": "<area name, optional>", "summary": "string, optional"}
+  ],
+  "edges": [
+    {"from": "<node id>", "to": "<node id>", "type": "depends_on|caused",
+     "max_traversals": 1, "note": "string, optional"}
+  ]
+}
+```
+
+- `nodes[].id` MUST match the slice token rule already in force
+  (`^[A-Za-z0-9][A-Za-z0-9._-]*$`, no `..`) and MUST be unique.
+- `nodes[].kind`: only `slice` is dispatchable in v2.3. `gate` (a deterministic verify
+  command) and `human` (a checkpoint) are reserved — writers MAY declare them, `dispatch`
+  MUST skip them and say so. Do not pretend they execute.
+- `nodes[].owns` is the single-owner declaration this contract has always enforced by
+  prose ("touch ONLY your files"); in v2.3 it is machine-readable. Overlapping `owns`
+  between two nodes with no `depends_on` between them is a **lint error** — that is the
+  parallel-write bug the doctrine exists to prevent.
+- `edges` MAY be empty. A missing `graph.json` is NOT an error for any existing command;
+  it is an error only for `dispatch --all` and `graph show|next`.
+
+### §2. Edge types
+
+Exactly two ship. `supersedes` and `decided_by` are deliberately NOT adopted — no
+mechanical consumer exists in m2herd, and an unconsumed edge type is decoration.
+
+- **`depends_on`** — `{"from": "A", "to": "B", "type": "depends_on"}` reads *"A depends on
+  B"*: B MUST be in state `done` before A may dispatch. Direction is normative; a writer
+  that reverses it produces a wrong wave order, so `graph lint` MUST print the sentence
+  form ("A depends on B") for every such edge so the author can proofread it.
+- **`caused`** — provenance, informational, never gates dispatch. Written by
+  `evolve` to record failure → lesson → follow-up-slice lineage.
+
+### §3. Cycles are declared, not forbidden
+
+Agent graphs are not DAGs — `watch`'s resume ladder is already a bounded cycle. Therefore:
+
+- A cycle among `depends_on` edges is legal **only if every edge in that cycle carries
+  `max_traversals >= 1`**. The walker MUST refuse to traverse an edge more than
+  `max_traversals` times within one run, and MUST log the refusal.
+- A cycle where any edge omits `max_traversals` is a **lint error**, and `dispatch --all`
+  MUST exit 2 rather than walk it.
+- `max_traversals` defaults to `1` when absent on a non-cycle edge.
+
+### §4. Ownership — orchestrator proposes, human applies
+
+`graph.json` is a **reference with an owner** (slow loop owns the fast loop's target):
+
+- `dispatch`, `collect`, `watch`, and the TUI are **read-only** on `graph.json`. No
+  exceptions — not even to record state. Slice state stays in `overview.json.workers[]`
+  and the run traces.
+- The orchestrator MAY propose topology edits, but ONLY as an evolver proposal file
+  (`kind: graph_edit`, §2 of amendment v2.1 format), landing in `.m2herd/evolver/proposals/`.
+  It becomes live text only on explicit `m2herd evolve apply <id>` — the same
+  human-in-the-loop gate that already guards `LESSONS.md`.
+- Direct programmatic writes to `graph.json` outside that path are a contract violation.
+
+### §5. CLI surfaces (build THESE)
+
+**`scripts/m2herd.sh` (owner of all graph *reasoning*)**
+
+```
+m2herd.sh graph lint  [--dir D]              # validate; exit 0 ok, 2 invalid
+m2herd.sh graph show  [--dir D]              # human render: topological levels + live state
+m2herd.sh graph next  [--dir D]              # MACHINE surface: ready slices, one per line, no decoration
+```
+
+`graph next` is the single source of truth for readiness and the seam between the two
+scripts — `m2herd-up.sh` MUST shell out to it rather than reimplement the walk.
+Definition of ready, exactly: `kind == "slice"`, AND its own state is not
+`working|spawned|done`, AND every `depends_on` target is `done` (state read from
+`overview.json.workers[]`; a node with no worker entry is `pending`), AND no edge budget
+in `max_traversals` is exhausted. Output order: topological, then `nodes[]` order for ties.
+Empty output + exit 0 means "nothing ready" (distinct from exit 2 = invalid graph).
+
+**`scripts/m2herd-up.sh`**
+
+```
+m2herd-up.sh dispatch --all [--repo P] [--base BRANCH] [--dry-run]
+```
+
+- Calls `m2herd.sh graph next`, then dispatches each returned slice through the **existing**
+  single-slice path — same `resolve_dispatch_settings` precedence (CLI flag → `routing[]`
+  → `workers.*` → builtin), same `stagger_before_spawn`, same `enforce_max_concurrent`,
+  same trace writes. `--all` adds selection, never a second dispatch implementation.
+- Stops adding workers at `workers.max`; leftover ready slices are reported, not queued in
+  memory. `--all` is idempotent and re-runnable: run it again after a `collect` and the
+  next tier starts. This is the intended operating loop.
+- A ready slice with no `.m2herd/dispatch/<slice>.task.md` is skipped with a loud warning,
+  never dispatched with an empty prompt.
+- `--slice` and `--all` are mutually exclusive (exit 2).
+- Invalid graph → propagate exit 2 from `graph next`, dispatch nothing.
+
+**Metrics (the AUDIT obligation — a graph that cannot be measured cannot be justified)**
+
+`m2herd.sh evolve analyze` additionally writes `.m2herd/runs/<run-id>/metrics.json`:
+
+```json
+{
+  "run_id": "r-…", "computed_at": "ISO-8601 UTC",
+  "wall_clock_seconds": 0,        // max(collected_at) - min(dispatched_at) over the run
+  "worker_seconds_sum": 0,        // Σ per-slice (collected_at - dispatched_at)
+  "parallel_efficiency": 0.0,     // worker_seconds_sum / wall_clock_seconds; 1.0 == fully serial
+  "critical_path": ["<slice>"],   // longest depends_on chain by summed duration
+  "critical_path_seconds": 0,
+  "slices": [{"slice":"…","seconds":0,"idle_gap_seconds":0,"tokens":0,"cost_usd":0}]
+}
+```
+
+`idle_gap_seconds` = this slice's `dispatched_at` minus the latest `collected_at` among its
+`depends_on` targets — i.e. **time lost to hand-ordering**. That number is the entire
+empirical case for or against widening the graph. Timestamps come from the existing
+`status.json` fields; no new writer is needed. Absent `graph.json` → emit the file with
+`critical_path: []` and per-slice numbers only. Never fabricate a duration: a slice missing
+`collected_at` gets `null`, not `0`.
+
+**TUI (`tui/*.go`)** — read-only on `graph.json`, per the v1.3 watcher doctrine: a graph
+view (topological levels, one row per node, live state glyph from `workers[]`, dependency
+arrows) reachable by a documented key, plus the tier-3 drill-down already on the backlog.
+The `,` settings-editor exception (v2.2) is NOT extended to `graph.json`.
+
+### §6. Wave 7 slice ownership (single-owner, machine-readable in the seed graph)
+
+| slice | owns | may not touch |
+|---|---|---|
+| `graph-engine` | `scripts/m2herd.sh`, `templates/m2herd/graph.json` | `m2herd-up.sh`, `tui/` |
+| `graph-dispatch` | `scripts/m2herd-up.sh` | `m2herd.sh`, `tui/` |
+| `graph-tui` | `tui/*.go` | both scripts |
+
+`graph-dispatch` builds against the `graph next` **output format specified above**, not
+against `graph-engine`'s implementation — the contract is the interface, so the two run in
+parallel and integrate at collect. Docs, CHANGELOG and the version bump are the
+orchestrator's, at collect time.
 
 ## conventions (all slices)
 - bash: `set -euo pipefail`, mechanical + idempotent, the style of `scripts/herd-loop.sh`.
