@@ -56,8 +56,8 @@ ci:
 	bash scripts/m2herd.sh selftest
 	bash hooks/smoke.sh
 	@if command -v go >/dev/null 2>&1; then \
-		echo "+ go build ./... && go vet ./... (tui/)"; \
-		go build -C tui ./... && go vet -C tui ./...; \
+		echo "+ go build ./... && go vet ./... && go test ./... (tui/)"; \
+		go build -C tui ./... && go vet -C tui ./... && go test -C tui ./...; \
 	else \
-		echo "skip: go not on PATH — go build/vet skipped (CI runs them)"; \
+		echo "skip: go not on PATH — go build/vet/test skipped (CI runs them)"; \
 	fi
