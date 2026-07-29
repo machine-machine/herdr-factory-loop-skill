@@ -1270,6 +1270,27 @@ dispatch_all() {
     exit 2
   fi
 
+  # ---- pass 0: is this engine even a `graph next` engine? ----------------------
+  # An engine that predates v2.3 falls through to its `help|*)` case, which prints
+  # the usage header and exits 0 — so "exit 0" alone does NOT mean the subcommand
+  # exists. Any line that cannot be a slice id proves we are reading help text (or
+  # some other unexpected output), and the honest response is to dispatch nothing.
+  local bad=""
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    case "$s" in
+      [A-Za-z0-9]*) case "$s" in *[!A-Za-z0-9._-]*|*..*) bad="$s"; break ;; esac ;;
+      *) bad="$s"; break ;;
+    esac
+  done <<EOF
+$ready
+EOF
+  if [ -n "$bad" ]; then
+    echo "'$engine graph next' did not return a slice list — first offending line: '$bad'" >&2
+    echo "that engine most likely predates contract v2.3 (an unknown subcommand prints usage and exits 0). Update the engine, then re-run. Dispatching NOTHING." >&2
+    exit 2
+  fi
+
   # ---- pass 1: classify EVERY returned id before anything is spawned ----------
   local eligible="" skip_kind="" skip_task="" skip_unknown="" n_ready s kind
   n_ready="$(list_count "$ready")"
