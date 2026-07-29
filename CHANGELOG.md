@@ -4,6 +4,23 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.7.1] - 2026-07-30
+
+CI-only patch: the TUI's tests now actually run, and both workflows are off the
+deprecated Node 20 action runtime.
+
+### Fixed
+- **`go test` runs in CI.** `tui/steer_test.go` (5 cases) had never been executed by
+  either `make ci` or `.github/workflows/ci.yml` — both stopped at `go build` + `go vet`.
+  Both now run `go test ./...` as well. Verified against Go 1.26.5.
+- **Workflows off Node 20.** Every run was annotating "Node.js 20 is deprecated ... being
+  forced to run on Node.js 24". Bumped `actions/checkout` v4→v7, `actions/setup-go` v5→v7,
+  `actions/upload-artifact` v4→v7, `softprops/action-gh-release` v2→v3 — all Node 24
+  native, all requiring runner ≥ 2.327.1 (satisfied by `ubuntu-latest`).
+- **Stray TUI binaries ignored.** `make tui` writes into `prebuilt/`, so a hand-run
+  `go build .` inside `tui/` left an untracked 5.4 MB unstripped binary behind, as did the
+  CI artifact step. `tui/m2herd-tui` and `tui/m2herd-tui-*` are now gitignored.
+
 ## [2.7.0] - 2026-07-09
 
 Reliability release: the factory now watches its own workers (wave 4), the shell layer is
