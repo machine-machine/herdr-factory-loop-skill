@@ -1135,7 +1135,13 @@ dispatch() {
     last_worker="$(worker_panes_in_tab "$orch_tab" "$orch_pane" | tail -1)"
     if [ -n "$last_worker" ]; then split_pane="$last_worker"; split_dir="down"
     else                           split_pane="$orch_pane";  split_dir="right"; fi
-    is_self "$split_pane" && { echo "split target resolved to \$SELF ($split_pane) — refusing" >&2; exit 1; }
+    # Splitting $SELF is the DESIGNED first-worker path (no workers yet -> split RIGHT,
+    # 50/50): a split CREATES a pane and never sends keys to or closes the target, so it
+    # is safe, and the send/close paths keep their own is_self guards. Refuse only when the
+    # LAST-WORKER lookup landed on $SELF — that means pane resolution went wrong.
+    if [ -n "$last_worker" ] && is_self "$split_pane"; then
+      echo "last-worker split target resolved to \$SELF ($split_pane) — refusing" >&2; exit 1
+    fi
     local split_note="${last_worker:+last worker $last_worker}"; split_note="${split_note:-no workers yet}"
     if [ "$DRY_RUN" -eq 1 ]; then
       plan "herdr pane split '$split_pane' --direction $split_dir --ratio 0.5 --cwd '$wt' --no-focus   # orch=$orch_pane tab=$orch_tab, $split_note"
