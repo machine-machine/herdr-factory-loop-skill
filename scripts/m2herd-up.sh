@@ -32,6 +32,21 @@
 #                                                   #   --agent claude also warns (advisory only) when the newest /tmp/claude-ctx-*.json
 #                                                   #   (own uid, mtime < 30 min) shows pct >= 90 — the orchestrator's own session is
 #                                                   #   near its context/rate ceiling.
+#   m2herd-up.sh dispatch --all [--repo P] [--base BRANCH] [--dry-run]
+#                                                   # GRAPH-DRIVEN wave (contract v2.3 §5): selection comes from `m2herd.sh graph next`
+#                                                   #   (the machine seam — ready slice ids, one per line; empty = nothing ready;
+#                                                   #   exit 2 = invalid graph → we dispatch NOTHING), then EVERY selected slice goes
+#                                                   #   through the same single-slice path above: same routing/settings precedence,
+#                                                   #   same stagger, same workers.max gate, same overview/trace writes. --all adds
+#                                                   #   SELECTION, never a second dispatch implementation. Mutually exclusive with
+#                                                   #   --slice (exit 2); .m2herd/graph.json absent → exit 2 (never "dispatch
+#                                                   #   everything you can find"). read-only on graph.json (§4).
+#                                                   #   BOUNDS + HONESTY: stops adding workers at workers.max; leftover ready slices
+#                                                   #   are REPORTED with the exact command to continue (re-run after a collect —
+#                                                   #   --all is idempotent and re-runnable, that IS the operating loop), never
+#                                                   #   queued in memory; a ready slice with no .m2herd/dispatch/<S>.task.md is
+#                                                   #   skipped LOUDLY, never dispatched with an empty prompt; a non-`slice` node
+#                                                   #   (kind gate|human, reserved in v2.3) is skipped and said so.
 #   m2herd-up.sh collect  --slice S [--repo P] [--no-verify]
 #                                                   # wait idle (pane) / exited (headless pid), keep/copy report to dispatch/S.out.md,
 #                                                   # update workers[] state (+tokens/cost for headless). Then the VERIFY GATE runs an
@@ -960,8 +975,12 @@ EOF
 }
 
 # ---------- dispatch: worktree + worker + file-protocol task -------------------
-dispatch() {
-  [ -n "$SLICE" ] || { echo "dispatch needs --slice S" >&2; exit 2; }
+# THE dispatch implementation — one slice, one worker. `dispatch --slice S` calls
+# it directly; `dispatch --all` calls it once per graph-selected slice, so the
+# two modes cannot drift (contract v2.3 §5: --all adds selection, nothing else).
+# Sets $SLICE because the settings/routing/prompt/trace helpers all key off it.
+dispatch_one() { # dispatch_one <slice>
+  SLICE="$1"
   validate_token slice "$SLICE"
   resolve_repo; resolve_self
   resolve_dispatch_settings
@@ -1202,6 +1221,191 @@ dispatch() {
   record_worker "$SLICE" "$pane" "$wt" "$branch" "spawned"
   trace_dispatch_write "$SLICE" "pane" "" "$branch" "$wt" || true
   log "dispatch: done — $SLICE recorded in overview.json (state=spawned)"
+}
+
+# ---------- dispatch --all: graph-driven SELECTION (contract v2.3 §5) ----------
+# The walk is NOT ours. `m2herd.sh graph next` is the single source of truth for
+# readiness (kind, dependency state, edge budgets) and the seam between the two
+# scripts; we consume its FORMAT — ready slice ids one per line, empty + exit 0 =
+# nothing ready, exit 2 = invalid graph — and never reimplement it. graph.json is
+# opened READ-ONLY here, and only to answer "what kind of node is this id?" (§4:
+# dispatch never writes it, not even to record state).
+
+# Tiny newline-list helpers — the file's list idiom is a newline-separated string
+# fed to `while read` via heredoc (see down()), not arrays. Appends are inline
+# (`list="$list$item"$'\n'`): $( ) strips trailing newlines, so an add-helper
+# would silently glue the whole list into one token.
+list_count() { printf '%s' "$1" | awk 'NF { n++ } END { print n + 0 }'; }
+list_join()  { printf '%s' "$1" | awk 'NF { printf "%s%s", sep, $0; sep = ", " }'; }
+
+# The engine that owns graph reasoning, resolved from our own neighbourhood the
+# same way up() resolves it for `init` — sibling first, PATH second, never a
+# hardcoded absolute path.
+graph_engine() { # -> path to the m2herd engine, or empty
+  local e="$SCRIPT_DIR/m2herd.sh"
+  [ -x "$e" ] || e="$(command -v m2herd || true)"
+  printf '%s' "$e"
+}
+
+dispatch_all() {
+  resolve_repo
+  local graph="$REPO/.m2herd/graph.json"
+  [ -f "$graph" ] || {
+    echo "no graph.json at $graph — 'dispatch --all' dispatches the DECLARED topology (CONTRACT-m2herd.md v2.3 §1) and never guesses; write it (seed: templates/m2herd/graph.json), or dispatch one slice with --slice S" >&2
+    exit 2; }
+  jq -e . "$graph" >/dev/null 2>&1 || {
+    echo "invalid JSON in $graph — dispatching nothing" >&2; exit 2; }
+
+  local engine; engine="$(graph_engine)"
+  [ -n "$engine" ] && [ -x "$engine" ] || {
+    echo "no m2herd engine found ($SCRIPT_DIR/m2herd.sh or 'm2herd' on PATH) — 'dispatch --all' reads readiness from 'm2herd.sh graph next'" >&2
+    exit 2; }
+
+  log "dispatch --all: repo=$REPO graph=$graph engine=$engine"
+
+  local ready="" rc=0
+  ready="$("$engine" graph next --dir "$REPO")" || rc=$?
+  if [ "$rc" -ne 0 ]; then
+    echo "'$engine graph next --dir $REPO' exited $rc — invalid graph; dispatching NOTHING" >&2
+    exit 2
+  fi
+
+  # ---- pass 1: classify EVERY returned id before anything is spawned ----------
+  local eligible="" skip_kind="" skip_task="" skip_unknown="" n_ready s kind
+  n_ready="$(list_count "$ready")"
+  if [ "$n_ready" -eq 0 ]; then
+    log "ready (graph next): none — nothing is ready right now (that is exit 0, not an error)"
+  else
+    log "ready (graph next): $n_ready — $(list_join "$ready")"
+  fi
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    validate_token slice "$s"     # ids become filenames + branch names: same gate as --slice
+    kind="$(jq -r --arg id "$s" '[.nodes[]? | select(.id == $id) | (.kind // "slice")] | first // empty' "$graph" 2>/dev/null || true)"
+    if [ -z "$kind" ]; then
+      log "! WARNING: 'graph next' returned '$s', which is not a node in $graph — SKIPPED"
+      skip_unknown="$skip_unknown$s"$'\n'; continue
+    fi
+    if [ "$kind" != "slice" ]; then
+      # v2.3 ships gate/human as DECLARABLE but not executable — say so, never pretend
+      log "skip $s: kind=$kind is not dispatchable in v2.3 (reserved)"
+      skip_kind="$skip_kind$s (kind=$kind)"$'\n'; continue
+    fi
+    if [ ! -f "$REPO/.m2herd/dispatch/$s.task.md" ]; then
+      # wave-1 lesson prompt_lost_after_dispatch: a worker with empty input is worse
+      # than no worker — it looks alive and produces nothing.
+      log "! WARNING: ready slice '$s' has NO task file (.m2herd/dispatch/$s.task.md) — SKIPPED, never dispatched with an empty prompt; write the task file, then re-run"
+      skip_task="$skip_task$s"$'\n'; continue
+    fi
+    eligible="$eligible$s"$'\n'
+  done <<EOF
+$ready
+EOF
+
+  # ---- bounds: workers.max is the ceiling; leftovers are reported, not queued --
+  # resolve_dispatch_settings with no slice in hand gives us MAX_CONCURRENT (the
+  # converged .workers.max key); per-slice routing is resolved inside dispatch_one.
+  SLICE=""
+  resolve_dispatch_settings
+  local active=0 capacity
+  [ -f "$OV" ] && active="$(jq -r '[.workers[]? | select(.state == "spawned" or .state == "working")] | length' "$OV" 2>/dev/null || echo 0)"
+  capacity=$((MAX_CONCURRENT - ${active:-0}))
+  [ "$capacity" -lt 0 ] && capacity=0
+
+  local selected="" deferred="" n=0
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    if [ "$n" -lt "$capacity" ]; then
+      selected="$selected$s"$'\n'; n=$((n + 1))
+    else
+      deferred="$deferred$s"$'\n'
+    fi
+  done <<EOF
+$eligible
+EOF
+
+  local n_eligible n_selected
+  n_eligible="$(list_count "$eligible")"; n_selected="$(list_count "$selected")"
+  log "capacity: workers.max=$MAX_CONCURRENT, active=${active:-0} → $capacity slot(s); eligible=$n_eligible, selected=$n_selected"
+  [ -n "$selected" ] && log "selected: $(list_join "$selected")"
+
+  # the exact command to continue — the operating loop is: --all, collect, --all
+  local cont="m2herd-up.sh dispatch --all --repo $REPO"
+  [ "$BASE_EXPLICIT" -eq 1 ] && cont="$cont --base $BASE"
+  [ "$AGENT_EXPLICIT" -eq 1 ] && cont="$cont --agent $AGENT"
+  [ "$RUNNER_EXPLICIT" -eq 1 ] && cont="$cont --runner $RUNNER"
+  [ "$MODEL_EXPLICIT" -eq 1 ] && cont="$cont --model $MODEL"
+
+  # ---- pass 2: dispatch each selected slice through the SINGLE-SLICE path ------
+  # Subshell: dispatch_one's failure paths `exit`, and a wave must still be able
+  # to report what it did and did not do. A failure STOPS the walk (the next
+  # slice would hit the same broken herdr/git state) — the rest become deferred.
+  local dispatched="" done_ids="|" failed="" i=0
+  while IFS= read -r s; do
+    [ -n "$s" ] || continue
+    i=$((i + 1))
+    log ""
+    log "--- dispatch --all [$i/$n_selected]: $s ---"
+    if ( dispatch_one "$s" ); then
+      dispatched="$dispatched$s"$'\n'; done_ids="$done_ids$s|"
+    else
+      failed="$s"
+      log "! dispatch FAILED for $s (see the error above) — stopping the walk; nothing further is dispatched this run"
+      break
+    fi
+  done <<EOF
+$selected
+EOF
+
+  # selected-but-never-attempted (walk stopped) join the deferred list, honestly labelled
+  local n_defer_cap defer_why
+  n_defer_cap="$(list_count "$deferred")"
+  defer_why="workers.max=$MAX_CONCURRENT reached"
+  if [ -n "$failed" ]; then
+    if [ "$n_defer_cap" -gt 0 ]; then defer_why="$defer_why / walk stopped at $failed"
+    else                             defer_why="walk stopped at $failed, never attempted"; fi
+  fi
+  if [ -n "$failed" ]; then
+    while IFS= read -r s; do
+      [ -n "$s" ] || continue
+      [ "$s" = "$failed" ] && continue
+      case "$done_ids" in *"|$s|"*) continue ;; esac
+      deferred="$deferred$s"$'\n'
+    done <<EOF
+$selected
+EOF
+  fi
+
+  # ---- report ------------------------------------------------------------------
+  local n_dispatched n_deferred
+  n_dispatched="$(list_count "$dispatched")"; n_deferred="$(list_count "$deferred")"
+  log ""
+  log "dispatch --all: done — ready $n_ready, dispatched $n_dispatched, deferred $n_deferred"
+  [ -n "$dispatched" ]   && log "  dispatched:     $(list_join "$dispatched")"
+  [ -n "$deferred" ]     && log "  deferred:       $(list_join "$deferred")   ($defer_why) — NOT queued in memory"
+  [ -n "$skip_task" ]    && log "  skipped:        $(list_join "$skip_task")   (no .m2herd/dispatch/<slice>.task.md — write it)"
+  [ -n "$skip_kind" ]    && log "  not dispatchable: $(list_join "$skip_kind")   (reserved in v2.3)"
+  [ -n "$skip_unknown" ] && log "  unknown ids:    $(list_join "$skip_unknown")   (returned by 'graph next' but absent from graph.json)"
+  if [ -n "$deferred" ]; then
+    log "  continue after a collect:  $cont"
+  elif [ "$n_dispatched" -eq 0 ]; then
+    log "  nothing ready to dispatch — collect the running workers, or write the missing task files, then: $cont"
+  fi
+  [ -n "$failed" ] && exit 1
+  return 0
+}
+
+# Selection mode gate: exactly one of --slice / --all (contract v2.3 §5).
+dispatch() {
+  if [ "$ALL" -eq 1 ] && [ -n "$SLICE" ]; then
+    echo "dispatch: --slice and --all are mutually exclusive (--all takes its slices from 'm2herd.sh graph next')" >&2
+    exit 2
+  fi
+  if [ "$ALL" -eq 0 ] && [ -z "$SLICE" ]; then
+    echo "dispatch needs --slice S (one slice) or --all (every ready slice in .m2herd/graph.json)" >&2
+    exit 2
+  fi
+  if [ "$ALL" -eq 1 ]; then dispatch_all; else dispatch_one "$SLICE"; fi
 }
 
 # ---------- verify gate (collect) ----------------------------------------------
