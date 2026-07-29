@@ -7,6 +7,7 @@
 #   ./scripts/install.sh --hermes        # ~/.hermes/skills/herdr
 #   ./scripts/install.sh --claude        # ~/.claude/skills/herdr
 #   ./scripts/install.sh --cursor        # ~/.cursor/skills/herdr
+#   ./scripts/install.sh --pi            # ~/.pi/agent/skills/herdr (+ herdr integration)
 #   ./scripts/install.sh --local         # install from the local repo (no clone)
 #   ./scripts/install.sh --no-nudge-hook # skip the UserPromptSubmit/pre_llm_call nudge hook
 #   ./scripts/install.sh --no-m2herd-hooks # skip the m2herd SessionStart/PreCompact/PostToolUse hooks
@@ -40,6 +41,7 @@ usage() {
 install_hermes=0
 install_claude=0
 install_cursor=0
+install_pi=0
 local_mode=0
 uninstall=0
 nudge_hook=1
@@ -50,6 +52,7 @@ for arg in "$@"; do
     --hermes) install_hermes=1 ;;
     --claude) install_claude=1 ;;
     --cursor) install_cursor=1 ;;
+    --pi)     install_pi=1 ;;
     --local)  local_mode=1 ;;
     --no-nudge-hook) nudge_hook=0 ;;
     --no-m2herd-hooks) m2herd_hooks=0 ;;
@@ -60,11 +63,14 @@ for arg in "$@"; do
   esac
 done
 
-# Default: install for all supported agents if no agent flag was given
-if [ "$install_hermes" -eq 0 ] && [ "$install_claude" -eq 0 ] && [ "$install_cursor" -eq 0 ]; then
+# Default: install for all supported agents if no agent flag was given.
+# pi is opt-in-by-detection: only when the binary is actually present, so a
+# no-flag run never creates ~/.pi for someone who does not use pi.
+if [ "$install_hermes" -eq 0 ] && [ "$install_claude" -eq 0 ] && [ "$install_cursor" -eq 0 ] && [ "$install_pi" -eq 0 ]; then
   install_hermes=1
   install_claude=1
   install_cursor=1
+  if command -v pi >/dev/null 2>&1 || [ -d "$HOME/.pi/agent" ]; then install_pi=1; fi
 fi
 
 # Resolve the skill source path.
@@ -482,6 +488,36 @@ register_hermes_hook() {
   echo "[hermes] note: non-interactive runs (gateway/cron) need one of --accept-hooks, HERMES_ACCEPT_HOOKS=1, or hooks_auto_accept: true — otherwise the first-use consent prompt blocks silently. See skill/SKILL.md §14." >&2
 }
 
+# --- pi: herdr's own agent-state integration (~/.pi/agent/extensions/).
+# m2herd's `watch` sentinel reads herdr's agent_status (idle|working|blocked) to
+# decide resume/escalate/collect. For pi that field is only trustworthy once
+# herdr's pi integration is installed, so wire it here rather than leaving the
+# sentinel reading a default.
+register_pi_integration() {
+  if ! command -v herdr >/dev/null 2>&1; then
+    echo "[pi] WARNING: herdr not on PATH — skipped 'herdr integration install pi'. m2herd's watch sentinel cannot read pi worker state until you run it." >&2
+    return 0
+  fi
+  if [ "$uninstall" -eq 1 ]; then
+    herdr integration uninstall pi >/dev/null 2>&1 || echo "[pi] integration uninstall failed (non-fatal)" >&2
+    echo "[pi] herdr integration uninstalled"
+    return 0
+  fi
+  if herdr integration status 2>/dev/null | grep -q '^pi: current'; then
+    echo "[pi] herdr integration already current"
+  else
+    # herdr refuses with "pi extension directory not found ... create the
+    # extensions directory first" — pi only creates it on demand, so make it here.
+    mkdir -p "$HOME/.pi/agent/extensions"
+    if herdr integration install pi >/dev/null 2>&1; then
+      echo "[pi] herdr integration installed (~/.pi/agent/extensions/herdr-agent-state.ts)"
+    else
+      echo "[pi] WARNING: 'herdr integration install pi' failed — worker state will read as unknown to watch" >&2
+    fi
+  fi
+  echo "[pi] note: pi works as an m2herd WORKER now. As an ORCHESTRATOR it reads CLAUDE.md/AGENTS.md natively, but the live fabric snapshot that Claude Code gets from hooks/m2herd-session.sh needs pi's session_start extension — not installed by this script yet." >&2
+}
+
 if [ "$install_hermes" -eq 1 ]; then
   install_one "$HOME/.hermes/skills" "hermes"
   register_hermes_hook
@@ -511,6 +547,13 @@ fi
 if [ "$install_cursor" -eq 1 ]; then
   install_one "$HOME/.cursor/skills" "cursor"
   echo "[cursor] note: cursor has no shell-hook mechanism (see shared/goal_support.md) — nudge hook not installed"
+fi
+if [ "$install_pi" -eq 1 ]; then
+  # pi implements the Agent Skills standard and discovers directories containing
+  # SKILL.md under ~/.pi/agent/skills/ (docs/skills.md § Locations).
+  install_one "$HOME/.pi/agent/skills" "pi"
+  register_pi_integration
+  install_m2herd_bins
 fi
 
 if [ "$uninstall" -eq 1 ]; then
