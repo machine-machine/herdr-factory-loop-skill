@@ -4,6 +4,40 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.7.2] - 2026-07-30
+
+Adds `pi` as a first-class m2herd worker agent, and unblocks the first dispatch of any wave.
+
+### Added
+- **`pi` worker support** (`@earendil-works/pi-coding-agent`). Accepted by `valid_agent`,
+  `settings_validate_agent` and `routing[].agent`. Pane mode runs `pi -a` — `--approve` is
+  mandatory, since an interactive pi stops on the project-trust prompt in a fresh worktree
+  and the worker would never start. Headless runs
+  `pi -p -a --session-id <uuid> --mode json`; because `--session-id` takes an exact id
+  (creating it if missing), pi gets the same pre-generated-uuid resume story as claude, so
+  `watch` can resume a crashed pi worker. Verified end to end against a real pi 0.83.0:
+  dispatch, session continuity across two calls, report salvage and usage parse.
+- **`collect` understands pi's JSONL.** Report salvaged from the last `agent_end` event's
+  final assistant text; `tokens`/`cost_usd` summed from `turn_end` usage. Local providers
+  report `cost: 0` — recorded, not dropped.
+- **`scripts/install.sh --pi`** links the skill into `~/.pi/agent/skills/` (pi implements the
+  Agent Skills standard) and installs herdr's pi integration, which `watch` needs in order to
+  read `agent_status` at all. It also creates `~/.pi/agent/extensions/` first, because
+  `herdr integration install pi` refuses when that directory is absent. A no-flag install
+  enables pi only when the binary or `~/.pi/agent` is actually present.
+
+### Fixed
+- **First worker of a wave could not spawn.** `dispatch` aborted with "split target resolved
+  to $SELF — refusing" whenever the orchestrator pane resolved to `$SELF`, which is the
+  normal case. The no-workers-yet branch deliberately splits the orchestrator RIGHT 50/50 —
+  its own comment says so — and the next line refused exactly that. A split creates a pane
+  and never sends keys to or closes the target, and the send/close paths keep their own
+  `is_self` guards, so the guard only ever blocked the intended path. Now it refuses only
+  when the LAST-WORKER lookup lands on `$SELF`, which does mean resolution went wrong.
+- **Headless `--model sonnet` default is claude-only.** It was applied to every agent, so a
+  headless pi (default provider `spark-glm` on this host) would have been handed an
+  Anthropic model name. codex/opencode/pi now resolve their own defaults.
+
 ## [2.7.1] - 2026-07-30
 
 CI-only patch: the TUI's tests now actually run, and both workflows are off the

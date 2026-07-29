@@ -171,8 +171,8 @@ settings_effective_json() {
 }
 
 settings_validate_agent() {
-  case "$2" in claude|codex|cursor|opencode) return 0 ;; esac
-  echo "config set: $1 must be one of: claude, codex, cursor, opencode" >&2; exit 2
+  case "$2" in claude|codex|cursor|opencode|pi) return 0 ;; esac
+  echo "config set: $1 must be one of: claude, codex, cursor, opencode, pi" >&2; exit 2
 }
 settings_validate_runner() {
   case "$2" in pane|headless) return 0 ;; esac
@@ -191,7 +191,7 @@ settings_validate_routing() {
   jq -e '
     type=="array" and all(.[]; type=="object"
       and ((.pattern // "") | type=="string" and length > 0)
-      and (.agent | IN("claude","codex","cursor","opencode"))
+      and (.agent | IN("claude","codex","cursor","opencode","pi"))
       and ((.runner // "pane") | IN("pane","headless"))
       and ((.model // "") | type=="string"))
   ' >/dev/null 2>&1 || { echo "config set: routing must be a JSON array of {pattern, agent[, runner, model]} rules" >&2; exit 2; }

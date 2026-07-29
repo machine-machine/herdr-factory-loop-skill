@@ -232,7 +232,7 @@ settings_get() { # settings_get <jq-path> <default>
 }
 
 valid_agent() {
-  case "$1" in claude|codex|cursor|opencode) return 0 ;; *) return 1 ;; esac
+  case "$1" in claude|codex|cursor|opencode|pi) return 0 ;; *) return 1 ;; esac
 }
 
 valid_runner() {
@@ -474,6 +474,10 @@ worker_argv() {
     codex)  printf '%s\t%s\n' "codex" "--dangerously-bypass-approvals-and-sandbox" ;;
     claude) printf '%s\t%s\n' "claude" "--dangerously-skip-permissions" ;;
     cursor) printf '%s\t%s\n' "cursor-agent" "--force" ;;
+    # pi has no per-tool approval gate; `-a/--approve` trusts the worktree's
+    # project-local files for the run. Without it an interactive pi stops on the
+    # project-trust prompt in a fresh worktree and the worker never starts.
+    pi)     printf '%s\t%s\n' "pi" "-a" ;;
     *) printf '%s\t%s\n' "$1" "" ;;
   esac
 }
@@ -963,7 +967,10 @@ dispatch() {
   resolve_dispatch_settings
   [ -n "$BASE" ] || BASE="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
   local branch="wip/m2herd-$SLICE" task="$REPO/.m2herd/dispatch/$SLICE.task.md"
-  if [ "$HEADLESS" -eq 1 ] && [ -z "$MODEL" ]; then
+  # "sonnet" is a claude-only default: codex/opencode/pi resolve their own default
+  # model, and passing an Anthropic name to pi (default provider google) would
+  # either fuzzy-match something unintended or fail outright.
+  if [ "$HEADLESS" -eq 1 ] && [ -z "$MODEL" ] && [ "$AGENT" = "claude" ]; then
     MODEL="sonnet"
     MODEL_SOURCE="headless default"
   fi
@@ -986,8 +993,8 @@ dispatch() {
     # verified 2026-07-02: `claude -p` works on the Max plan (usage JSON incl. costUSD);
     # codex exec / opencode run are the non-Anthropic fallbacks. cursor has no headless mode.
     case "$AGENT" in
-      claude|codex|opencode) : ;;
-      *) echo "--headless supports --agent claude|codex|opencode (cursor has no headless mode)" >&2; exit 2 ;;
+      claude|codex|opencode|pi) : ;;
+      *) echo "--headless supports --agent claude|codex|opencode|pi (cursor has no headless mode)" >&2; exit 2 ;;
     esac
   fi
 
@@ -1049,12 +1056,19 @@ dispatch() {
         [ -n "$hsession" ] || log "! no uuid source (uuidgen//proc/python3) — dispatching WITHOUT --session-id; watch cannot resume this worker"
         ;;
       codex) hsession="last" ;;
+      pi)
+        # pi's `--session-id <id>` uses the exact id, CREATING it if missing, so the
+        # same pre-generated-uuid story as claude works for both dispatch and resume.
+        hsession="$(gen_uuid)"
+        [ -n "$hsession" ] || log "! no uuid source (uuidgen//proc/python3) — dispatching WITHOUT --session-id; watch cannot resume this worker"
+        ;;
     esac
     if [ "$DRY_RUN" -eq 1 ]; then
       case "$AGENT" in
         claude)   plan "cd '$wt' && nohup claude -p '<pointer>' ${hsession:+--session-id '$hsession' }--model '$MODEL' --dangerously-skip-permissions --output-format json > '$lg' 2> '$errlg' &" ;;
         codex)    plan "cd '$wt' && nohup codex exec --dangerously-bypass-approvals-and-sandbox '<pointer>' > '$lg' 2> '$errlg' &   # resume story: codex exec resume --last (cwd-filtered)" ;;
         opencode) plan "cd '$wt' && nohup opencode run '<pointer>' > '$lg' 2> '$errlg' &   # no resume story" ;;
+        pi)       plan "cd '$wt' && nohup pi -p -a ${hsession:+--session-id '$hsession' }${MODEL:+--model '$MODEL' }--mode json '<pointer>' > '$lg' 2> '$errlg' &   # resume story: pi -p --session-id '$hsession'" ;;
       esac
       plan "record pid + its start-time/comm (ps -o lstart=/-o comm=) so collect can verify the pid was not recycled"
       record_worker "$SLICE" "-" "$wt" "$branch" "spawned" "headless" "$MODEL" "" "" "" "$hsession"
@@ -1071,6 +1085,14 @@ dispatch() {
         fi ;;
       codex)    ( cd "$wt" && nohup codex exec --dangerously-bypass-approvals-and-sandbox "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
       opencode) ( cd "$wt" && nohup opencode run "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
+      pi)
+        # -a: `-p` never prompts for project trust, but without --approve it IGNORES
+        # the worktree's project-local resources (defaultProjectTrust=ask is the default).
+        if [ -n "$hsession" ]; then
+          ( cd "$wt" && nohup pi -p -a --session-id "$hsession" ${MODEL:+--model "$MODEL"} --mode json "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
+        else
+          ( cd "$wt" && nohup pi -p -a ${MODEL:+--model "$MODEL"} --mode json "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
+        fi ;;
     esac
     hpid="$(cat "$lg.pid" 2>/dev/null || true)"; rm -f "$lg.pid"
     [ -n "$hpid" ] || { echo "headless spawn failed (no pid) — see $lg / $errlg" >&2; exit 1; }
@@ -1369,6 +1391,9 @@ collect() {
       # JSON envelope (.result), codex/opencode/anything else log plain text
       case "$wagent" in
         claude) jq -r '.result // empty' "$lg" > "$out" 2>/dev/null || true ;;
+        # pi --mode json is JSONL, one event per line: the final assistant text
+        # is the last text block of the agent_end event.
+        pi)     jq -rs 'map(select(.type=="agent_end")) | last | .messages // [] | map(select(.role=="assistant")) | last | .content // [] | map(select(.type=="text") | .text) | join("\n")' "$lg" > "$out" 2>/dev/null || true ;;
         *)      tail -n 60 "$lg" > "$out" 2>/dev/null || true ;;
       esac
     fi
@@ -1377,6 +1402,11 @@ collect() {
     if [ "$wagent" = "claude" ] && [ -s "$lg" ] && jq -e . "$lg" >/dev/null 2>&1; then
       tok="$(jq -r '[.modelUsage[]?.outputTokens] | add // empty' "$lg" 2>/dev/null || true)"
       cost="$(jq -r '[.modelUsage[]?.costUSD] | add // empty' "$lg" 2>/dev/null || true)"
+    elif [ "$wagent" = "pi" ] && [ -s "$lg" ]; then
+      # pi JSONL: sum the per-turn usage off turn_end events (agent_end carries no
+      # aggregate). cost is 0.00 for local providers — record it, don't drop it.
+      tok="$(jq -rs '[.[] | select(.type=="turn_end") | .message.usage.output // 0] | add // empty' "$lg" 2>/dev/null || true)"
+      cost="$(jq -rs '[.[] | select(.type=="turn_end") | .message.usage.cost.total // 0] | add // empty' "$lg" 2>/dev/null || true)"
     fi
     set_worker_usage "$SLICE" "${tok:-}" "${cost:-}"
     finish_collect "$SLICE" "$wwt" "${tok:-}" "${cost:-}"
@@ -1723,6 +1753,7 @@ headless_resume() { # headless_resume <slice> <signature> <session> — sets WAT
     case "$wagent" in
       claude) plan "cd '$wt' && nohup claude -p --resume '$sess' '$HEADLESS_RESUME_PROMPT' ${wmodel:+--model '$wmodel' }--dangerously-skip-permissions --output-format json > '$lg' 2> '$errlg' &" ;;
       codex)  plan "cd '$wt' && nohup codex exec --dangerously-bypass-approvals-and-sandbox resume --last '$HEADLESS_RESUME_PROMPT' > '$lg' 2> '$errlg' &   # cwd filter pins --last to this worktree" ;;
+      pi)     plan "cd '$wt' && nohup pi -p -a --session-id '$sess' ${wmodel:+--model '$wmodel' }--mode json '$HEADLESS_RESUME_PROMPT' > '$lg' 2> '$errlg' &   # --session-id resumes the exact recorded session" ;;
     esac
     plan "record new pid + start-time/comm in workers[] (state=working)"
     WATCH_TOKEN="$s=working/$sig:resumed$((n + 1))"
@@ -1739,6 +1770,10 @@ headless_resume() { # headless_resume <slice> <signature> <session> — sets WAT
       # `codex exec resume` filters recorded sessions by cwd; the worktree is
       # unique per slice, so --last IS this worker's session.
       ( cd "$wt" && nohup codex exec --dangerously-bypass-approvals-and-sandbox resume --last "$HEADLESS_RESUME_PROMPT" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
+    pi)
+      # `--session-id <id>` is exact-id resume (and would create the id if it were
+      # missing) — the same uuid dispatch recorded in workers[].session.
+      ( cd "$wt" && nohup pi -p -a --session-id "$sess" ${wmodel:+--model "$wmodel"} --mode json "$HEADLESS_RESUME_PROMPT" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
     *)
       watch_fail "$s" "worker_crash" "headless '$sig' — agent $wagent has no resume story"
       WATCH_TOKEN="$s=failed/$sig:no-resume-story"

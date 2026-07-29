@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 2.7.1
+version: 2.7.2
 description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator). ALSO trigger for meta-orchestration — when the user wants to be the "meta-orchestrator" / "orchestrator of orchestrators", oversee or launch multiple orchestrators (each driving its own herd of workers) across several missions/repos, or drive a portfolio of parallel missions with /goal-based autonomy (fleet-loop.sh / fleet-control). ALSO trigger for m2herd — the Claude Code (Fable) main-orchestrator context fabric — when the user mentions m2herd, .m2herd, "context fabric", wants to offload context into the repo folder (the folder holds the context, the orchestrator holds pointers), refile or archive notes/areas, push a project gist to fleet memory, or come back to a project via the resume file (RESUME.md).
 ---
 
@@ -927,7 +927,7 @@ The pane is a WATCHER, never a writer. On PATH as `m2herd-up`.
 
 ```
 m2herd-up.sh up       [--repo P] [--goal "…"] [--room-only]   # ensure herdr workspace for repo: the one-orchestrator + one-machineroom shape; runs m2herd.sh init if missing; --room-only never spawns an orchestrator pane
-m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor|opencode]
+m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor|opencode|pi]
                       [--runner pane|headless] [--headless [--model M]]
                                                     # worktree wip/m2herd-<S> off BASE (default: current branch), spawn worker, file-protocol dispatch of .m2herd/dispatch/S.task.md, record in overview.json workers[]; flags fall back to settings.json routing/defaults (§16.6)
 m2herd-up.sh collect  --slice S [--repo P]          # wait idle (pane) / exited (headless pid), keep/copy report to dispatch/S.out.md, update workers[] state (+tokens/cost); a dead pane / recycled pid / EMPTY REPORT is marked failed, never silently done (state honesty)
@@ -1039,8 +1039,22 @@ m2herd config set  <key> <value>      # validated (bad enum → exit 2); whole-f
 
 Keys the **engine** (`m2herd.sh config`) owns: `orchestrator.agent`/`orchestrator.runner`,
 `workers.agent`/`workers.runner`/`workers.max` (defaults `claude`/`pane`/3), and `routing` —
-an array of `{pattern, agent}` rules (optional `runner`); agents `claude|codex|cursor|opencode`,
+an array of `{pattern, agent}` rules (optional `runner`); agents `claude|codex|cursor|opencode|pi`,
 runners `pane|headless`.
+
+**pi workers (2.7.2).** `pi` (`@earendil-works/pi-coding-agent`) is a full worker agent:
+pane mode runs `pi -a` — `-a/--approve` is mandatory, since an interactive pi stops on the
+project-trust prompt in a fresh worktree and the worker never starts. Headless runs
+`pi -p -a --session-id <uuid> --mode json`, and because `--session-id` uses an exact id
+(creating it when missing), pi has the same pre-generated-uuid resume story as claude —
+`watch` resumes a crashed pi worker with the recorded id. `collect` salvages the report from
+the JSONL log's `agent_end` event and sums `turn_end` usage into `workers[]`. Note the
+headless model default `sonnet` is claude-only: pi resolves its own default (on this host
+that is a local `spark-glm` model, so pi workers cost $0 and do not draw on the Anthropic
+rate-limit pool — the constraint that stalled wave 1). `scripts/install.sh --pi` links the
+skill into `~/.pi/agent/skills/` and installs herdr's pi integration, which `watch` needs to
+read `agent_status`. pi as ORCHESTRATOR reads `CLAUDE.md`/`AGENTS.md` natively but has no
+shell hooks — the live fabric snapshot needs a `session_start` pi extension (wave 7).
 
 **Dispatch-side resolution (`m2herd-up`).** `dispatch` resolves each knob with the precedence
 **CLI flag → matching routing rule → workers.\* default → builtin**, and logs which source won.
