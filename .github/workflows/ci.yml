@@ -11,7 +11,7 @@ jobs:
     name: shell (syntax + lint + selftest + smokes)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # jq is preinstalled on ubuntu runners; node is present for the .js hook smokes.
       - name: bash -n (syntax) on all scripts and hooks
@@ -35,7 +35,7 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: shellcheck -S warning
         run: shellcheck -S warning scripts/*.sh hooks/*.sh
@@ -44,9 +44,9 @@ jobs:
     name: go (build + vet + test + tui artifact)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: stable
           cache-dependency-path: tui/go.sum
@@ -67,7 +67,7 @@ jobs:
         working-directory: tui
         run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o m2herd-tui-linux-amd64 .
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: m2herd-tui-linux-amd64
           path: tui/m2herd-tui-linux-amd64
