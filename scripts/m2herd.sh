@@ -22,9 +22,16 @@
 #   m2herd.sh next    [--dir P]               # self-prompting primitive: mechanical priority walk, prints exactly one "NEXT: " line
 #                                             #   (drift → context budget ≥75% → steer → machineroom → coach intent → refile notes
 #                                             #    → collect worker → failed worker → reap panes → open question → compare/dispatch)
+#   m2herd.sh graph lint  [--dir P]           # validate .m2herd/graph.json (declared topology): one finding per line,
+#                                             #   exit 0 valid / 2 invalid; prints the sentence form of every depends_on edge
+#   m2herd.sh graph show  [--dir P]           # human render: topological levels, live state per node from overview.json
+#                                             #   workers[], dependency lines, gate/human marked not-dispatchable (read-only)
+#   m2herd.sh graph next  [--dir P]           # MACHINE surface: ready slice ids, one per line, nothing else
+#                                             #   (empty + exit 0 = nothing ready; exit 2 = invalid/absent graph)
 #   m2herd.sh evolve analyze  [--dir P] [--run <id|latest|current>]
 #                                             # mechanical: read .m2herd/runs/<run-id>/, write signatures + skeleton
-#                                             #   proposals under .m2herd/evolver/; no LLM, no network; idempotent
+#                                             #   proposals under .m2herd/evolver/, plus runs/<run-id>/metrics.json
+#                                             #   (durations, idle gaps, critical path); no LLM, no network; idempotent
 #   m2herd.sh evolve proposals [--dir P]      # list proposals: id, kind, risk, status
 #   m2herd.sh evolve show <id> [--dir P]      # print a proposal file
 #   m2herd.sh evolve apply <id> [--dir P] [--ack-repo]
@@ -47,7 +54,8 @@
 #                                             #   sessions stop holding API connections — never $SELF, never a working pane
 #   m2herd.sh self-update [--check]           # --check: fetch the engine repo, cache behind-count in ~/.cache/m2herd/update-status
 #                                             #   (dashboard renders it); no flag: ff-only pull of the engine repo (refuses dirty tree)
-#   m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync (+--check drift) → archive → gist → next; jq asserts
+#   m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync (+--check drift) → archive → gist →
+#                                             #   next → graph lint/show/next → metrics.json; jq asserts
 #
 # --dir defaults to $PWD. Everything idempotent. jq required. overview.json writes are
 # whole-file rewrites through jq (never sed patching).
@@ -60,6 +68,12 @@ CMD="${1:-help}"; shift || true
 # show/apply/reject) is consumed here as EVOLVE_ACTION, same idiom as CMD itself.
 EVOLVE_ACTION=""
 if [ "$CMD" = "evolve" ]; then EVOLVE_ACTION="${1:-}"; shift || true; fi
+# `graph` is the same idiom (lint/show/next). Only a non-flag word is consumed, so
+# `graph --dir P` still reaches the usage line instead of eating the flag.
+GRAPH_ACTION=""
+if [ "$CMD" = "graph" ]; then
+  case "${1:-}" in -*|"") : ;; *) GRAPH_ACTION="$1"; shift ;; esac
+fi
 CONFIG_ACTION=""; CONFIG_PATH=""; CONFIG_VALUE=""
 DIR="$PWD"; GOAL=""; AREA=""; TEXT=""; CHECK=0; PUSH=0; WATCH=0; INTERVAL=2; RUN=""; ACK_REPO=0; DRYRUN=0
 while [ $# -gt 0 ]; do
@@ -281,6 +295,10 @@ init() {
   [ -f "$m2/evolver/LESSONS.md" ] || cp "$tmpl/evolver/LESSONS.md" "$m2/evolver/LESSONS.md" 2>/dev/null || true
   [ -f "$m2/runs/README.md" ]     || cp "$tmpl/runs/README.md"     "$m2/runs/README.md"     2>/dev/null || true
   [ -f "$m2/settings.json" ]       || cp "$tmpl/settings.json"      "$m2/settings.json"      2>/dev/null || settings_defaults_json > "$m2/settings.json"
+  # declared topology (v2.3). Seeded ONCE — an existing graph.json is never
+  # overwritten, and no other command in this script may write it (contract §4:
+  # topology edits ship as evolver proposals applied by a human).
+  [ -f "$m2/graph.json" ]          || cp "$tmpl/graph.json"         "$m2/graph.json"         2>/dev/null || graph_seed_json > "$m2/graph.json"
   if [ ! -f "$m2/overview.json" ]; then
     local tmp; tmp="$(mktemp "$m2/.overview.XXXXXX")"
     if jq --arg g "$GOAL" --arg ts "$(ts)" '.goal=$g | .updated_at=$ts' "$tmpl/overview.json" > "$tmp"
@@ -1012,6 +1030,243 @@ dashboard() {
   printf '%sread-only · steering: .m2herd/inbox/STEER.md%s\n' "$D" "$R"
 }
 
+# ---------- graph: the declared topology (.m2herd/graph.json) -----------------
+# v2.3: the folder already held the context; now it holds the TOPOLOGY. m2herd.sh
+# owns all graph REASONING (lint/show/next) and m2herd-up.sh shells out to
+# `graph next` instead of reimplementing the walk — `next` is the seam.
+#
+# graph.json is READ-ONLY at runtime (contract §4): `init` seeds it once and
+# nothing else here writes it. Topology edits ship as evolver proposals.
+GRAPH()         { echo "$DIR/.m2herd/graph.json"; }
+graph_seed_json() { jq -n '{schema_version: 1, updated_at: "1970-01-01T00:00:00Z", nodes: [], edges: []}'; }
+
+# slice → state map from overview.json.workers[]; a node with no entry is pending
+graph_state_map() {
+  jq -c 'reduce ((.workers // [])[]) as $w ({};
+           if (($w.slice | type) == "string") and ($w.slice != "")
+           then .[$w.slice] = ($w.state // "pending") else . end)' "$(OV)"
+}
+
+# The single graph walker. Reads graph.json + the worker state map and emits one
+# analysis object consumed by lint (errors/notes/sentences), show (nodes) and
+# next (ready). Malformed JSON becomes an errors[] entry, never a crash.
+graph_jq_program() { cat <<'JQ'
+def ow: if (.owns | type) == "array" then [ .owns[] | select(type == "string") ] else [] end;
+
+(if (.nodes | type) == "array" then .nodes else [] end) as $nodes
+| (if (.edges | type) == "array" then .edges else [] end) as $edges
+| [ $nodes[] | .id | select((type == "string") and (. != "")) ] as $ids
+| [ $edges[] | select(.type == "depends_on")
+    | select(((.from | type) == "string") and ((.to | type) == "string")) ] as $deps
+| [ $deps[] | select((.from | IN($ids[])) and (.to | IN($ids[]))) ] as $kdeps
+# adjacency over KNOWN depends_on edges: from → [to…] ("A depends on B" = A → B)
+| (reduce $kdeps[] as $e ({}; .[$e.from] = (((.[$e.from] // []) + [$e.to]) | unique))) as $adj
+# transitive closure by fixpoint (monotone, so it terminates even with cycles)
+| ({r: $adj, ch: true}
+   | until(.ch == false;
+       (.r | with_entries(.value = ((.value + ([ .value[] | $adj[.] // [] ] | add // [])) | unique))) as $n
+       | {r: $n, ch: ($n != .r)})
+   | .r) as $reach
+| [ $ids[] | select(. as $x | ($reach[$x] // []) | index($x)) ] as $cyclic
+# one group per cycle: mutually reachable cyclic nodes (an SCC), deduped
+| ([ $cyclic[] | . as $x
+     | ([$x] + [ $cyclic[] | select(. as $y | (($reach[$x] // []) | index($y))
+                                             and (($reach[$y] // []) | index($x))) ]) | unique ]
+   | unique) as $sccs
+| [ $sccs[] | . as $g | {group: $g, edges: [ $kdeps[] | select((.from | IN($g[])) and (.to | IN($g[]))) ]} ] as $cycles
+| [ $cycles[] | select([ .edges[] | select(((.max_traversals | type) != "number") or (.max_traversals < 1)) ] | length > 0) ] as $bad_cycles
+| [ $cycles[] | select([ .edges[] | select(((.max_traversals | type) != "number") or (.max_traversals < 1)) ] | length == 0) ] as $ok_cycles
+# depth = 1 + max(depth of depends_on targets); |nodes| synchronous rounds
+| (reduce range(0; ($ids | length)) as $_ (($ids | map({key: ., value: 0}) | from_entries);
+     . as $lv | reduce $ids[] as $k (.; .[$k] = ([ ($adj[$k] // [])[] | ($lv[.] // 0) + 1 ] + [0] | max)))) as $level
+| ([ $ids[] ] | group_by(.) | map(select(length > 1))) as $dups
+| {
+  errors: (
+    $idErrors
+    + (if (.schema_version | type) == "number" then [] else ["missing or non-numeric schema_version (expected 1)"] end)
+    + (if (has("nodes") and ((.nodes | type) != "array")) then ["nodes must be an array"] else [] end)
+    + (if (has("edges") and ((.edges | type) != "array")) then ["edges must be an array"] else [] end)
+    + [ $nodes[] | select(((.id | type) != "string") or (.id == ""))
+        | "nodes[] entry with a missing or non-string id: \(tojson | .[0:80])" ]
+    + [ $dups[] | "duplicate nodes[].id: \(.[0]) (\(length) entries)" ]
+    + [ $nodes[] | select((((.kind // "") | IN("slice", "gate", "human")) | not))
+        | "node \(.id // "?"): kind \((.kind // null) | tojson) is not one of slice|gate|human" ]
+    + [ $nodes[] | select(has("owns") and ((.owns | type) != "array"))
+        | "node \(.id // "?"): owns must be an array of repo-relative paths" ]
+    + [ range(0; ($edges | length)) as $i | $edges[$i]
+        | select((((.type // null) | IN("depends_on", "caused")) | not))
+        | "edges[\($i)]: unknown type \((.type // null) | tojson) (only depends_on, caused)" ]
+    + [ range(0; ($edges | length)) as $i | $edges[$i]
+        | select(((.from | type) != "string") or ((.from | IN($ids[])) | not))
+        | "edges[\($i)]: from references unknown node id \((.from // null) | tojson)" ]
+    + [ range(0; ($edges | length)) as $i | $edges[$i]
+        | select(((.to | type) != "string") or ((.to | IN($ids[])) | not))
+        | "edges[\($i)]: to references unknown node id \((.to // null) | tojson)" ]
+    + [ range(0; ($edges | length)) as $i | $edges[$i]
+        | select(has("max_traversals")
+                 and (((.max_traversals | type) != "number")
+                      or (.max_traversals < 0)
+                      or ((.max_traversals | floor) != .max_traversals)))
+        | "edges[\($i)]: max_traversals must be a non-negative integer (got \(.max_traversals | tojson))" ]
+    + [ $bad_cycles[]
+        | "cycle among depends_on edges where an edge omits max_traversals >= 1: \(.group | join(", ")) — declare a budget on every edge in the cycle or break it" ]
+    + [ range(0; ($nodes | length)) as $i | range($i + 1; ($nodes | length)) as $j
+        | ($nodes[$i]) as $A | ($nodes[$j]) as $B
+        | (($A | ow) - (($A | ow) - ($B | ow))) as $both
+        | select(($both | length) > 0)
+        | select((((($reach[$A.id]) // []) | index($B.id)) or ((($reach[$B.id]) // []) | index($A.id))) | not)
+        | "overlapping owns between \($A.id // "?") and \($B.id // "?") with no depends_on path between them: \($both | join(", ")) — parallel writers to the same path" ]
+  ),
+  notes: (
+    (if ((.schema_version | type) == "number") and (.schema_version != 1)
+     then ["schema_version \(.schema_version) is newer than this engine understands (1)"] else [] end)
+    + [ $ok_cycles[] | "declared cycle — legal, every edge carries max_traversals >= 1: \(.group | join(" <-> "))" ]
+    + [ range(0; ($edges | length)) as $i | $edges[$i]
+        | select((.type == "depends_on") and ((.max_traversals | type) == "number") and (.max_traversals == 0))
+        | "edges[\($i)]: max_traversals 0 — budget exhausted, \(.from) can never become ready while this edge exists" ]
+    + [ $nodes[] | select((.kind // "") | IN("gate", "human"))
+        | "node \(.id // "?") is kind \(.kind) — declared, never dispatched (reserved in v2.3)" ]
+  ),
+  # direction proofreading: reversing an edge is the likeliest authoring bug
+  sentences: [ $deps[] | "\(.from) depends on \(.to) (\(.to) must finish first)" ],
+  # READY (contract §5, verbatim): kind slice, own state not working|spawned|done,
+  # every depends_on target done, no exhausted max_traversals budget.
+  ready: ([ range(0; ($nodes | length)) as $i | ($nodes[$i]) as $n | (($n.id // "")) as $nid
+            | select((($n.id | type) == "string") and ($nid != ""))
+            | select(($n.kind // "") == "slice")
+            | select((($states[$nid] // "pending") | IN("working", "spawned", "done")) | not)
+            | select([ $deps[] | select(.from == $nid) ]
+                     | all((($states[(.to // "")] // "pending") == "done") and ((.max_traversals // 1) >= 1)))
+            | {id: $nid, level: ($level[$nid] // 0), i: $i} ]
+          | sort_by(.level, .i) | map(.id)),
+  nodes: ([ range(0; ($nodes | length)) as $i | ($nodes[$i]) as $n | (($n.id // "")) as $nid
+            | {id: ($n.id // "?"), kind: ($n.kind // "?"), owns: ($n | ow),
+               area: ($n.area // ""), summary: ($n.summary // ""),
+               level: ($level[$nid] // 0), state: ($states[$nid] // "pending"),
+               cyclic: (($cyclic | index($nid)) != null),
+               deps: [ $deps[] | select(.from == $nid) | .to ], i: $i } ]
+          | sort_by(.level, .i)),
+  counts: {nodes: ($nodes | length), edges: ($edges | length)}
+}
+JQ
+}
+
+graph_analyze() {
+  local gf prog id_errs="[]" id msg
+  gf="$(GRAPH)"
+  if ! jq -e 'type == "object"' "$gf" >/dev/null 2>&1; then
+    jq -n '{errors: [".m2herd/graph.json is not valid JSON (or not a JSON object)"],
+            notes: [], sentences: [], ready: [], nodes: [], counts: {nodes: 0, edges: 0}}'
+    return 0
+  fi
+  # node ids obey the slice token rule — reuse validate_token (it exits 2, so run
+  # it in a subshell and keep its message as the finding; no second validator)
+  while IFS= read -r id; do
+    [ -n "$id" ] || continue
+    if ! msg="$( ( validate_token "nodes[].id" "$id" ) 2>&1 )"; then
+      id_errs="$(jq --arg m "$msg" '. + [$m]' <<<"$id_errs")"
+    fi
+  done < <(jq -r '(.nodes // [])[]? | (.id // "") | tostring' "$gf" 2>/dev/null || true)
+  prog="$(graph_jq_program)"
+  jq -c --argjson idErrors "$id_errs" --argjson states "$(graph_state_map)" "$prog" "$gf"
+}
+
+graph_lint() {
+  resolve_dir; need_init
+  if [ ! -f "$(GRAPH)" ]; then
+    # §1: a missing graph.json is an error only for show/next — nothing to lint here
+    echo "note: no .m2herd/graph.json — nothing to lint (seed it with: m2herd init --dir $DIR)"
+    return 0
+  fi
+  local a n_err n_note out
+  a="$(graph_analyze)"
+  # accumulate then print once (a single write) so a downstream `grep -q`/`head`
+  # closing the pipe early can't SIGPIPE us mid-report — same idiom as evolve proposals
+  out="$(jq -r '(.errors[]? | "error: " + .), (.notes[]? | "note: " + .), (.sentences[]? | "edge: " + .)' <<<"$a")"
+  n_err="$(jq -r '.errors | length' <<<"$a")"
+  n_note="$(jq -r '.notes | length' <<<"$a")"
+  if [ "$n_err" -gt 0 ]; then
+    out="$out
+  graph lint: INVALID — $n_err error(s), $n_note note(s) in .m2herd/graph.json"
+    printf '%s\n' "$out"
+    exit 2
+  fi
+  out="$out
+  graph lint: ok — $(jq -r '.counts.nodes' <<<"$a") node(s), $(jq -r '.counts.edges' <<<"$a") edge(s), $n_note note(s)"
+  printf '%s\n' "${out#$'\n'}"
+}
+
+# MACHINE seam: ready slice ids, one per line, nothing else. Errors go to stderr
+# so stdout stays parseable by m2herd-up.sh.
+graph_next() {
+  resolve_dir; need_init
+  [ -f "$(GRAPH)" ] || {
+    echo "graph next: no such file: $DIR/.m2herd/graph.json (seed it with: m2herd init --dir $DIR)" >&2; exit 2; }
+  local a
+  a="$(graph_analyze)"
+  if [ "$(jq -r '.errors | length' <<<"$a")" -gt 0 ]; then
+    jq -r '.errors[] | "error: " + .' <<<"$a" >&2
+    echo "graph next: invalid graph — run: m2herd graph lint --dir $DIR" >&2
+    exit 2
+  fi
+  jq -r '.ready[]' <<<"$a"
+}
+
+# human render — read-only, hook/CI-safe, no --watch (the TUI owns the live view)
+graph_show() {
+  resolve_dir; need_init
+  [ -f "$(GRAPH)" ] || {
+    echo "graph show: no such file: $DIR/.m2herd/graph.json (seed it with: m2herd init --dir $DIR)" >&2; exit 2; }
+  local a lvl out
+  a="$(graph_analyze)"
+  # one accumulated write (SIGPIPE-safe under a downstream `grep -q`), same as lint
+  out="$(printf 'graph: %s node(s), %s edge(s) — %s' \
+    "$(jq -r '.counts.nodes' <<<"$a")" "$(jq -r '.counts.edges' <<<"$a")" ".m2herd/graph.json")"
+  if [ "$(jq -r '.errors | length' <<<"$a")" -gt 0 ]; then
+    out="$out
+$(jq -r '.errors[] | "! " + .' <<<"$a")
+! invalid graph — run: m2herd graph lint --dir $DIR (render below is best-effort)"
+  fi
+  if [ "$(jq -r '.counts.nodes' <<<"$a")" -eq 0 ]; then
+    printf '%s\n' "$out
+  (no nodes declared yet — the topology still lives only in the orchestrator's head)"
+    return 0
+  fi
+  local glyph id kind state flags owns deps
+  while IFS= read -r lvl; do
+    out="$out
+$(printf 'level %s' "$lvl")"
+    # jq emits one \x1f-joined record per node; bash does the column padding
+    while IFS=$'\x1f' read -r glyph id kind state flags owns deps; do
+      [ -n "$id" ] || continue
+      out="$out
+$(printf '  %s %-18s %-6s %-8s%s%s' "$glyph" "$id" "$kind" "$state" "$flags" "$owns")"
+      [ -z "$deps" ] || out="$out
+$(printf '      depends on -> %s' "$deps")"
+    done < <(jq -r --argjson l "$lvl" '
+      .nodes[] | select(.level == $l)
+      | [ (if .state == "done" then "●"
+           elif (.state | IN("working", "spawned")) then "◐"
+           elif .state == "failed" then "✗" else "○" end),
+          .id, .kind, .state,
+          ((if (.kind | IN("gate", "human")) then "  [not dispatchable: " + .kind + "]" else "" end)
+           + (if .cyclic then "  [in a declared cycle]" else "" end)),
+          (if ((.owns | length) > 0) then "  owns: " + (.owns | join(", ")) else "" end),
+          (.deps | join(", ")) ] | join("\u001f")' <<<"$a")
+  done < <(jq -r '[.nodes[].level] | unique | .[]' <<<"$a")
+  printf '%s\n' "$out
+$(printf 'ready now: %s' "$(jq -r 'if (.ready | length) == 0 then "(nothing)" else (.ready | join(", ")) end' <<<"$a")")"
+}
+
+graph_cmd() {
+  case "${GRAPH_ACTION:-}" in
+    lint) graph_lint ;;
+    show) graph_show ;;
+    next) graph_next ;;
+    *) echo "usage: m2herd.sh graph {lint|show|next} [--dir P]" >&2; exit 2 ;;
+  esac
+}
+
 # ---------- evolve: continual-harness factory evolver -------------------------
 # .m2herd/runs/ (written by m2herd-up.sh) → .m2herd/evolver/{signatures,proposals,LESSONS.md}
 # Mechanical only — no LLM, no network; same doctrine as `next`. See
@@ -1100,6 +1355,93 @@ Next run of this slice/signature does not recur.
 EOF
 }
 
+# ---------- metrics.json: what the declared topology actually cost -------------
+# .m2herd/runs/<run-id>/metrics.json, written by `evolve analyze`. Every number
+# comes from the EXISTING status.json fields — no new writer — and nothing is
+# fabricated: a slice without collected_at reports null, never 0.
+#
+#   wall_clock_seconds   max(collected_at) - min(dispatched_at) over the run
+#   worker_seconds_sum   Σ per-slice (collected_at - dispatched_at), nulls skipped
+#   parallel_efficiency  worker_seconds_sum / wall_clock_seconds (1.0 == fully serial)
+#   critical_path        longest depends_on chain by summed duration, execution order
+#   idle_gap_seconds     this slice's dispatched_at minus the LATEST collected_at
+#                        among its depends_on targets = time lost to hand-ordering
+write_run_metrics() {
+  local run_id="$1" run_dir="$2" run_json="$3"
+  local recs="[]" slice sf disp coll de ce tok cost deps='{}' cyc='[]' hasgraph=false ga tmp
+  while IFS= read -r slice; do
+    [ -n "$slice" ] || continue
+    sf="$run_dir/slices/$slice/status.json"
+    [ -f "$sf" ] || continue    # dispatched but no status.json → already a signature; no numbers to report
+    disp="$(jq -r '(.dispatched_at // "") | tostring' "$sf" 2>/dev/null || true)"
+    coll="$(jq -r '(.collected_at // "") | tostring' "$sf" 2>/dev/null || true)"
+    de=0; ce=0
+    [ -n "$disp" ] && de="$(epoch_of "$disp")"
+    [ -n "$coll" ] && ce="$(epoch_of "$coll")"
+    case "$de" in ''|*[!0-9]*) de=0 ;; esac
+    case "$ce" in ''|*[!0-9]*) ce=0 ;; esac
+    tok="$(jq -r '(.tokens // 0) | if type == "number" then . else 0 end' "$sf" 2>/dev/null || echo 0)"
+    cost="$(jq -r '(.cost_usd // 0) | if type == "number" then . else 0 end' "$sf" 2>/dev/null || echo 0)"
+    recs="$(jq --arg s "$slice" --argjson d "$de" --argjson c "$ce" \
+               --argjson t "${tok:-0}" --argjson u "${cost:-0}" \
+      '. + [{slice: $s,
+             dispatched: (if $d > 0 then $d else null end),
+             collected:  (if $c > 0 then $c else null end),
+             tokens: $t, cost_usd: $u}]' <<<"$recs")"
+  done < <(jq -r '.slices[]? // empty' "$run_json" 2>/dev/null || true)
+  # topology, when declared: depends_on adjacency + the cyclic nodes, straight
+  # from the graph walker (absent/unparseable graph.json → per-slice numbers only)
+  if [ -f "$(GRAPH)" ] && jq -e 'type == "object"' "$(GRAPH)" >/dev/null 2>&1; then
+    ga="$(graph_analyze)"
+    deps="$(jq -c 'reduce (.nodes[]) as $n ({}; .[$n.id] = $n.deps)' <<<"$ga")"
+    cyc="$(jq -c '[ .nodes[] | select(.cyclic) | .id ]' <<<"$ga")"
+    hasgraph=true
+  fi
+  tmp="$(mktemp "$run_dir/.metrics.XXXXXX")"
+  if jq -n --arg run_id "$run_id" --arg now "$(ts)" --argjson recs "$recs" \
+        --argjson deps "$deps" --argjson cyc "$cyc" --argjson hasgraph "$hasgraph" '
+    ($recs | map({key: .slice, value: .}) | from_entries) as $by
+    | ($recs | map(select(.dispatched != null) | .dispatched) | min) as $minD
+    | ($recs | map(select(.collected  != null) | .collected)  | max) as $maxC
+    | (if ($minD == null) or ($maxC == null) then null else ($maxC - $minD) end) as $wall
+    | ([ $recs[] | select((.dispatched != null) and (.collected != null)) | (.collected - .dispatched) ] | add // 0) as $sum
+    | [ $recs[] | . as $r | (($deps[$r.slice]) // []) as $tg
+        | {slice: $r.slice,
+           seconds: (if ($r.dispatched != null) and ($r.collected != null)
+                     then ($r.collected - $r.dispatched) else null end),
+           idle_gap_seconds: (
+             # unknown beats invented: any missing timestamp among the targets → null
+             if (($tg | length) == 0) or ($r.dispatched == null) then null
+             elif ([ $tg[] | (($by[.].collected) // null) ] | any(. == null)) then null
+             else ($r.dispatched - ([ $tg[] | $by[.].collected ] | max)) end),
+           tokens: $r.tokens, cost_usd: $r.cost_usd} ] as $slices
+    | ($slices | map({key: .slice, value: (.seconds // 0)}) | from_entries) as $dur
+    | ($recs | map(.slice)) as $ids
+    # longest chain by summed duration. Edges inside a declared cycle are dropped
+    # (a cycle has no longest path) and only slices IN THIS RUN can carry duration.
+    | (reduce $ids[] as $k ({};
+         .[$k] = [ (($deps[$k]) // [])[] | select(IN($ids[]))
+                   | select(((IN($cyc[])) and ($k | IN($cyc[]))) | not) ])) as $dadj
+    | (reduce range(0; ($ids | length)) as $_ (($ids | map({key: ., value: null}) | from_entries);
+         . as $b
+         | reduce $ids[] as $k (.;
+             ([ (($dadj[$k]) // [])[] | $b[.] | select(. != null) ] | max_by(.v)) as $best
+             | .[$k] = (if $best == null
+                        then {v: (($dur[$k]) // 0), path: [$k]}
+                        else {v: ((($dur[$k]) // 0) + $best.v), path: ($best.path + [$k])} end)))) as $best
+    | ([ $best[] | select(. != null) ] | max_by(.v)) as $cp
+    | {run_id: $run_id, computed_at: $now,
+       wall_clock_seconds: $wall,
+       worker_seconds_sum: $sum,
+       parallel_efficiency: (if ($wall == null) or ($wall <= 0) then null
+                             else ((($sum / $wall) * 1000) | round) / 1000 end),
+       critical_path:         (if $hasgraph then (($cp.path) // []) else [] end),
+       critical_path_seconds: (if $hasgraph then (($cp.v) // 0)   else 0  end),
+       slices: $slices}' > "$tmp"
+  then mv "$tmp" "$run_dir/metrics.json"; else rm -f "$tmp"; return 1; fi
+  log "metrics → .m2herd/runs/$run_id/metrics.json ($(jq -r '.slices | length' "$run_dir/metrics.json") slice(s))"
+}
+
 evolve_analyze() {
   resolve_dir; need_init; evolve_dirs
   if [ ! -d "$RUNS_DIR" ] || [ -z "$(ls -d "$RUNS_DIR"/r-* 2>/dev/null)" ]; then
@@ -1169,6 +1511,8 @@ evolve_analyze() {
     done
   fi
   log "proposals: $created new (re-run is idempotent — keyed on proposal-id)"
+  # the AUDIT obligation: a graph that cannot be measured cannot be justified
+  write_run_metrics "$run_id" "$run_dir" "$run_json"
 }
 
 evolve_proposals() {
@@ -1513,6 +1857,16 @@ selftest() {
   grep -qxF '.m2herd/' "$td/.gitignore" || fail ".m2herd/ not gitignored"
   [ -f "$td/.m2herd/inbox/STEER.md" ] || fail "init did not scaffold inbox/STEER.md"
   [ -f "$td/.m2herd/settings.json" ] || fail "init did not seed settings.json"
+  # graph seed: empty topology, schema_version 1 — and NEVER overwritten by a re-init
+  [ -f "$td/.m2herd/graph.json" ] || fail "init did not seed graph.json"
+  jq -e '(.schema_version==1) and (.nodes==[]) and (.edges==[]) and (.updated_at|type=="string")' \
+    "$td/.m2herd/graph.json" >/dev/null || fail "graph.json seed schema assert"
+  jq '.nodes=[{id:"seedcheck",kind:"slice",owns:[]}]' "$td/.m2herd/graph.json" > "$td/.m2herd/graph.json.t" \
+    && mv "$td/.m2herd/graph.json.t" "$td/.m2herd/graph.json"
+  step init --dir "$td"
+  jq -e '.nodes[0].id=="seedcheck"' "$td/.m2herd/graph.json" >/dev/null \
+    || fail "init overwrote an existing graph.json (must be idempotent)"
+  graph_seed_json > "$td/.m2herd/graph.json"
 
   # config: defaults, get/set round-trip, validation, missing-file fallback, JSON routing, locked writers
   [ "$("$self" config get workers.agent --dir "$td")" = "claude" ] || fail "config get: default workers.agent"
@@ -1770,6 +2124,130 @@ selftest() {
   rlines="$(printf '%s\n' "$resume_out" | wc -l | tr -d ' ')"
   [ "$rlines" -le 45 ] || fail "resume report is $rlines lines (want <= ~40)"
 
+  # ---- graph (v2.3 declared topology) ---------------------------------------
+  # graph.json is written DIRECTLY here (fixtures): no m2herd command may mutate it.
+  local gf="$td/.m2herd/graph.json" grc gout mrun mdir
+  bad_graph() {   # bad_graph <label> <graph-json>: every error class must exit 2
+    printf '%s\n' "$2" > "$gf"
+    grc=0; "$self" graph lint --dir "$td" >/dev/null 2>&1 || grc=$?
+    [ "$grc" -eq 2 ] || fail "graph lint($1) exited $grc (want 2)"
+  }
+  bad_graph malformed-json      '{nope'
+  bad_graph missing-schema      '{"nodes":[],"edges":[]}'
+  bad_graph duplicate-id        '{"schema_version":1,"nodes":[{"id":"a","kind":"slice"},{"id":"a","kind":"slice"}],"edges":[]}'
+  bad_graph bad-id-token        '{"schema_version":1,"nodes":[{"id":"../escape","kind":"slice"}],"edges":[]}'
+  bad_graph unknown-edge-target '{"schema_version":1,"nodes":[{"id":"a","kind":"slice"}],"edges":[{"from":"a","to":"ghost","type":"depends_on"}]}'
+  bad_graph unknown-edge-type   '{"schema_version":1,"nodes":[{"id":"a","kind":"slice"},{"id":"b","kind":"slice"}],"edges":[{"from":"a","to":"b","type":"supersedes"}]}'
+  bad_graph bad-kind            '{"schema_version":1,"nodes":[{"id":"a","kind":"worker"}],"edges":[]}'
+  bad_graph undeclared-cycle    '{"schema_version":1,"nodes":[{"id":"a","kind":"slice"},{"id":"b","kind":"slice"}],"edges":[{"from":"a","to":"b","type":"depends_on","max_traversals":2},{"from":"b","to":"a","type":"depends_on"}]}'
+  bad_graph owns-overlap        '{"schema_version":1,"nodes":[{"id":"a","kind":"slice","owns":["x.sh","y.sh"]},{"id":"b","kind":"slice","owns":["x.sh"]}],"edges":[]}'
+  # graph next on an invalid graph: exit 2, nothing on stdout
+  grc=0; gout="$("$self" graph next --dir "$td" 2>/dev/null)" || grc=$?
+  [ "$grc" -eq 2 ] || fail "graph next on an invalid graph exited $grc (want 2)"
+  [ -z "$gout" ] || fail "graph next printed '$gout' for an invalid graph (want nothing)"
+
+  # a declared cycle is LEGAL (every edge carries max_traversals) — note, not error
+  printf '%s\n' '{"schema_version":1,"nodes":[{"id":"a","kind":"slice"},{"id":"b","kind":"slice"}],"edges":[{"from":"a","to":"b","type":"depends_on","max_traversals":2},{"from":"b","to":"a","type":"depends_on","max_traversals":1}]}' > "$gf"
+  "$self" graph lint --dir "$td" | grep -q '^note: declared cycle' || fail "graph lint: declared cycle should be a note"
+  "$self" graph lint --dir "$td" >/dev/null || fail "graph lint: declared cycle should exit 0"
+  # overlapping owns WITH a depends_on path between the nodes is legal (serialized)
+  printf '%s\n' '{"schema_version":1,"nodes":[{"id":"a","kind":"slice","owns":["x.sh"]},{"id":"b","kind":"slice","owns":["x.sh"]}],"edges":[{"from":"b","to":"a","type":"depends_on"}]}' > "$gf"
+  "$self" graph lint --dir "$td" >/dev/null || fail "graph lint: overlapping owns with a depends_on path should exit 0"
+
+  # a valid two-tier graph + fake workers[] state → lint clean, next/show correct
+  cat > "$gf" <<'GRAPHEOF'
+{"schema_version": 1, "updated_at": "1970-01-01T00:00:00Z",
+ "nodes": [{"id": "engine",   "kind": "slice", "owns": ["scripts/m2herd.sh"]},
+           {"id": "dispatch", "kind": "slice", "owns": ["scripts/m2herd-up.sh"]},
+           {"id": "docs",     "kind": "slice", "owns": ["README.md"]},
+           {"id": "tuiwork",  "kind": "slice", "owns": ["tui/"]},
+           {"id": "gate1",    "kind": "gate",  "owns": []}],
+ "edges": [{"from": "dispatch", "to": "engine", "type": "depends_on"},
+           {"from": "docs",     "to": "engine", "type": "depends_on"},
+           {"from": "gate1",    "to": "engine", "type": "depends_on"},
+           {"from": "tuiwork",  "to": "docs",   "type": "depends_on"}]}
+GRAPHEOF
+  "$self" graph lint --dir "$td" >/dev/null || fail "graph lint: valid two-tier graph should exit 0"
+  "$self" graph lint --dir "$td" | grep -qF 'edge: dispatch depends on engine (engine must finish first)' \
+    || fail "graph lint: missing the depends_on sentence form"
+  "$self" graph lint --dir "$td" | grep -q '^note: node gate1 is kind gate' \
+    || fail "graph lint: gate node should be noted as never dispatched"
+  jq '.workers=[{slice:"engine",state:"done",pane_id:"-",branch:"wip/m2herd-engine"},
+                {slice:"tuiwork",state:"working",pane_id:"-",branch:"wip/m2herd-tuiwork"}]' \
+    "$ov" > "$ov.tmp" && mv "$ov.tmp" "$ov"
+  # ready = kind slice, own state not working|spawned|done, all depends_on targets done;
+  # topological order, nodes[] order for ties. engine(done)/tuiwork(working)/gate1(gate) are out.
+  gout="$("$self" graph next --dir "$td")"
+  [ "$gout" = "dispatch
+docs" ] || fail "graph next(two-tier) printed '$gout' (want 'dispatch\\ndocs')"
+  "$self" graph show --dir "$td" | grep -q '^level 0$' || fail "graph show: missing topological levels"
+  "$self" graph show --dir "$td" | grep -q 'engine .*done' || fail "graph show: missing live state from workers[]"
+  "$self" graph show --dir "$td" | grep -q 'gate1 .*\[not dispatchable: gate\]' || fail "graph show: gate not marked"
+  "$self" graph show --dir "$td" | grep -q 'depends on -> engine' || fail "graph show: missing dependency line"
+  # graph show is a pure renderer (same doctrine as dashboard)
+  before="$(find "$td/.m2herd" -type f -exec cksum {} + | sort)"
+  "$self" graph show --dir "$td" >/dev/null || fail "graph show exited non-zero"
+  "$self" graph next --dir "$td" >/dev/null || fail "graph next exited non-zero"
+  after="$(find "$td/.m2herd" -type f -exec cksum {} + | sort)"
+  [ "$before" = "$after" ] || fail "graph show/next WROTE to .m2herd/ (both are read-only)"
+  # absent graph.json: lint is a no-op note (§1), show/next are exit-2 errors naming the file
+  mv "$gf" "$gf.away"
+  "$self" graph lint --dir "$td" | grep -q '^note: no .m2herd/graph.json' || fail "graph lint(absent): want a note"
+  grc=0; "$self" graph show --dir "$td" >/dev/null 2>&1 || grc=$?
+  [ "$grc" -eq 2 ] || fail "graph show(absent graph.json) exited $grc (want 2)"
+  grc=0; gout="$("$self" graph next --dir "$td" 2>&1 >/dev/null)" || grc=$?
+  [ "$grc" -eq 2 ] || fail "graph next(absent graph.json) exited $grc (want 2)"
+  printf '%s\n' "$gout" | grep -q 'graph.json' || fail "graph next(absent graph.json) did not name the file on stderr"
+  mv "$gf.away" "$gf"
+
+  # ---- metrics.json over a synthetic run ------------------------------------
+  # engine 00:00→00:10 (600s), dispatch 00:15→00:35 (1200s), orphan never collected.
+  # wall = 00:35-00:00 = 2100; sum = 1800; efficiency = 0.857; dispatch idle gap = 300.
+  mrun="r-20260101T000000Z"; mdir="$td/.m2herd/runs/$mrun"
+  mkdir -p "$mdir/slices/engine" "$mdir/slices/dispatch" "$mdir/slices/orphan"
+  jq -n --arg id "$mrun" '{run_id:$id, created_at:"2026-01-01T00:00:00Z", goal:"metrics fixture",
+                           base:"main", slices:["engine","dispatch","orphan"]}' > "$mdir/run.json"
+  mk_status() {  # mk_status <slice> <dispatched_at> <collected_at> <tokens> <cost>
+    jq -n --arg s "$1" --arg d "$2" --arg c "$3" --argjson t "$4" --argjson u "$5" \
+      '{slice:$s, state:"done", agent:"claude", runner:"pane", model:"", branch:("wip/m2herd-"+$s),
+        worktree:"", dispatched_at:$d, collected_at:$c, tokens:$t, cost_usd:$u}' > "$mdir/slices/$1/status.json"
+    printf 'synthetic report\n' > "$mdir/slices/$1/report.md"
+  }
+  mk_status engine   2026-01-01T00:00:00Z 2026-01-01T00:10:00Z 1000 0.5
+  mk_status dispatch 2026-01-01T00:15:00Z 2026-01-01T00:35:00Z 2000 1.25
+  mk_status orphan   2026-01-01T00:00:00Z ""                   0    0
+  cat > "$gf" <<'GRAPHEOF'
+{"schema_version": 1, "updated_at": "1970-01-01T00:00:00Z",
+ "nodes": [{"id": "engine",   "kind": "slice", "owns": ["scripts/m2herd.sh"]},
+           {"id": "dispatch", "kind": "slice", "owns": ["scripts/m2herd-up.sh"]},
+           {"id": "orphan",   "kind": "slice", "owns": ["docs/orphan.md"]}],
+ "edges": [{"from": "dispatch", "to": "engine", "type": "depends_on"}]}
+GRAPHEOF
+  step evolve analyze --dir "$td" --run "$mrun"
+  [ -f "$mdir/metrics.json" ] || fail "evolve analyze did not write runs/$mrun/metrics.json"
+  jq -e --arg id "$mrun" '
+    (.run_id == $id) and (.computed_at | type == "string")
+    and (.wall_clock_seconds == 2100) and (.worker_seconds_sum == 1800)
+    and (.parallel_efficiency > 0.85) and (.parallel_efficiency < 0.86)
+    and (.critical_path == ["engine","dispatch"]) and (.critical_path_seconds == 1800)
+    and ([.slices[] | select(.slice=="engine")   | .seconds][0] == 600)
+    and ([.slices[] | select(.slice=="dispatch") | .seconds][0] == 1200)
+    and ([.slices[] | select(.slice=="dispatch") | .idle_gap_seconds][0] == 300)
+    and ([.slices[] | select(.slice=="engine")   | .idle_gap_seconds][0] == null)
+    and ([.slices[] | select(.slice=="orphan")   | .seconds][0] == null)
+    and ([.slices[] | select(.slice=="dispatch") | .tokens][0] == 2000)
+    and ([.slices[] | select(.slice=="dispatch") | .cost_usd][0] == 1.25)
+  ' "$mdir/metrics.json" >/dev/null || { cat "$mdir/metrics.json" >&2; fail "metrics.json field assert"; }
+  # absent graph.json → still written, critical_path [], per-slice numbers intact
+  mv "$gf" "$gf.away"
+  step evolve analyze --dir "$td" --run "$mrun"
+  jq -e '(.critical_path == []) and (.critical_path_seconds == 0) and (.wall_clock_seconds == 2100)
+         and ([.slices[] | select(.slice=="engine") | .seconds][0] == 600)
+         and ([.slices[] | select(.slice=="dispatch") | .idle_gap_seconds][0] == null)' \
+    "$mdir/metrics.json" >/dev/null || fail "metrics.json without graph.json: want critical_path [] + per-slice numbers"
+  mv "$gf.away" "$gf"
+  jq '.workers=[]' "$ov" > "$ov.tmp" && mv "$ov.tmp" "$ov"
+
   echo "selftest: PASS"
 }
 
@@ -1785,6 +2263,7 @@ case "$CMD" in
   archive)  archive ;;
   gist)     gist_cmd ;;
   next)      next_cmd ;;
+  graph)    graph_cmd ;;
   config)   config_cmd ;;
   doctor)   doctor_cmd ;;
   reap)     reap_cmd ;;
@@ -1814,5 +2293,5 @@ case "$CMD" in
     else dashboard_watch; fi ;;
   self-update) self_update_cmd ;;
   selftest)  selftest ;;
-  help|*)    sed -n '2,50p' "$0" ;;
+  help|*)    sed -n '2,58p' "$0" ;;
 esac
