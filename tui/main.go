@@ -14,7 +14,7 @@ import (
 )
 
 func main() {
-	dir, once, showVersion, err := parseFlags(os.Args[1:])
+	dir, once, graph, showVersion, err := parseFlags(os.Args[1:])
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "m2herd-tui: "+err.Error())
 		os.Exit(2)
@@ -29,7 +29,7 @@ func main() {
 	}
 
 	if once {
-		runOnce(dir)
+		runOnce(dir, graph)
 		return
 	}
 
@@ -40,7 +40,7 @@ func main() {
 	}
 }
 
-func parseFlags(args []string) (dir string, once, showVersion bool, err error) {
+func parseFlags(args []string) (dir string, once, graph, showVersion bool, err error) {
 	dir = "."
 	if wd, e := os.Getwd(); e == nil {
 		dir = wd
@@ -49,33 +49,39 @@ func parseFlags(args []string) (dir string, once, showVersion bool, err error) {
 		switch args[i] {
 		case "--dir":
 			if i+1 >= len(args) {
-				return "", false, false, fmt.Errorf("--dir needs a value")
+				return "", false, false, false, fmt.Errorf("--dir needs a value")
 			}
 			dir = args[i+1]
 			i++
 		case "--once":
 			once = true
+		case "--graph":
+			graph = true
 		case "--version":
 			showVersion = true
 		case "-h", "--help":
-			fmt.Println("m2herd-tui [--dir P] | --once [--dir P] | --version")
+			fmt.Println("m2herd-tui [--dir P] | --once [--graph] [--dir P] | --version")
 			os.Exit(0)
 		default:
-			return "", false, false, fmt.Errorf("unknown arg: %s", args[i])
+			return "", false, false, false, fmt.Errorf("unknown arg: %s", args[i])
 		}
 	}
-	return dir, once, showVersion, nil
+	return dir, once, graph, showVersion, nil
 }
 
 // runOnce renders exactly one frame to stdout, no altscreen, no tick.
-func runOnce(dir string) {
+func runOnce(dir string, graph bool) {
 	snap, err := BuildSnapshot(dir)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "m2herd-tui: "+err.Error())
 		os.Exit(1)
 	}
 	width := terminalWidth()
-	fmt.Println(Render(snap, width, SteerFooter{}))
+	if graph {
+		fmt.Println(RenderGraph(snap, width, 0))
+	} else {
+		fmt.Println(Render(snap, width, SteerFooter{}))
+	}
 }
 
 func terminalWidth() int {

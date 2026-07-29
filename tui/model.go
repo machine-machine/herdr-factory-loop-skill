@@ -20,8 +20,8 @@ type model struct {
 	width  int
 	height int
 
-	snap *Snapshot
-	err  error
+	snap  *Snapshot
+	err   error
 	errAt time.Time
 
 	loading bool
@@ -32,7 +32,9 @@ type model struct {
 	showResume bool
 	resumeVP   viewport.Model
 
-	showHelp bool
+	showHelp    bool
+	showGraph   bool
+	graphCursor int
 
 	settings *settingsView
 
@@ -106,6 +108,25 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.settings != nil {
 			return m.updateSettingsKey(msg)
 		}
+		if m.showGraph {
+			switch msg.String() {
+			case "ctrl+c", "q":
+				return m, tea.Quit
+			case "esc", "g":
+				m.showGraph = false
+			case "?":
+				m.showHelp = true
+			case "j", "down":
+				if m.snap != nil && m.snap.Graph != nil && m.graphCursor+1 < len(m.snap.Graph.Nodes) {
+					m.graphCursor++
+				}
+			case "k", "up":
+				if m.graphCursor > 0 {
+					m.graphCursor--
+				}
+			}
+			return m, nil
+		}
 		if m.showResume {
 			switch msg.String() {
 			case "ctrl+c":
@@ -132,6 +153,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, loadSettingsCmd(m.dir)
 		case "r":
 			return m, loadResumeCmd(m.dir)
+		case "g":
+			m.showGraph = true
+			m.graphCursor = 0
+			return m, nil
 		case "i":
 			m.steerActive = true
 			m.steerValue = ""
@@ -265,6 +290,9 @@ func (m model) View() string {
 			Padding(0, 1).
 			Width(m.width - 2)
 		return box.Render(title + "\n\n" + m.resumeVP.View())
+	}
+	if m.showGraph {
+		return RenderGraph(m.snap, m.width, m.graphCursor)
 	}
 	if m.snap == nil {
 		// Full error screen only when there has never been a good snapshot.

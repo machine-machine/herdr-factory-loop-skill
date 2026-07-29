@@ -30,6 +30,8 @@ type Snapshot struct {
 	Warnings   []string
 	// SteerPending counts undrained steering lines below the STEER.md marker.
 	SteerPending int
+	Graph        *Graph
+	GraphTraces  map[string]SliceTrace
 }
 
 // BuildSnapshot gathers every read-only data source in one pass.
@@ -49,23 +51,34 @@ func BuildSnapshot(dir string) (*Snapshot, error) {
 		ages[a.Name] = AreaAge(dir, a.Name)
 	}
 	agents, agentsOK := HerdrAgents()
+	graph, _ := LoadGraph(dir)
+	traces := map[string]SliceTrace{}
+	if graph != nil {
+		for _, n := range graph.Nodes {
+			if n.Kind == "slice" {
+				traces[n.ID] = LatestSliceTrace(dir, n.ID)
+			}
+		}
+	}
 	return &Snapshot{
-		Dir:        dir,
-		Overview:   ov,
-		DriftClean: clean,
-		Missing:    missing,
-		Orphan:     orphan,
-		Next:       next,
-		NextOK:     nextOK,
-		Budget:     LoadBudget(),
-		Update:     LoadUpdateBanner(),
-		Notes:      NotesTail(dir, 5),
-		AreaAges:   ages,
-		Agents:     agents,
-		AgentsOK:   agentsOK,
+		Dir:          dir,
+		Overview:     ov,
+		DriftClean:   clean,
+		Missing:      missing,
+		Orphan:       orphan,
+		Next:         next,
+		NextOK:       nextOK,
+		Budget:       LoadBudget(),
+		Update:       LoadUpdateBanner(),
+		Notes:        NotesTail(dir, 5),
+		AreaAges:     ages,
+		Agents:       agents,
+		AgentsOK:     agentsOK,
 		Resumes:      SliceResumes(dir),
 		Warnings:     warnings,
 		SteerPending: SteerPendingCount(dir),
+		Graph:        graph,
+		GraphTraces:  traces,
 	}, nil
 }
 
@@ -217,7 +230,7 @@ func footerLine(steer SteerFooter) string {
 	if steer.Active {
 		return styleCyanBold.Render("steer> ") + steer.Value + styleDim.Render("  enter send · esc cancel")
 	}
-	hint := styleDim.Render("read-only · [,] settings [r]esume [i] steer [s] $EDITOR [?] help [q]uit")
+	hint := styleDim.Render("read-only · [g]raph [,] settings [r]esume [i] steer [s] $EDITOR [?] help [q]uit")
 	if steer.ToastLive {
 		if steer.ToastRed {
 			return hint + " · " + styleRed.Render(steer.Toast)
@@ -451,6 +464,7 @@ func RenderHelp(width int) string {
 		styleCyanBold.Render("m2herd keys") + " " + styleDim.Render("(esc to close)"),
 		"",
 		styleBold.Render("DASHBOARD"),
+		key("g", "graph viewer and node drill-down"),
 		key(",", "settings editor"),
 		key("r", "RESUME.md viewer"),
 		key("i", "steer — minibuffer, appends below the STEER.md marker"),
@@ -468,6 +482,7 @@ func RenderHelp(width int) string {
 		key("esc", "back to dashboard"),
 		"",
 		styleBold.Render("MODALS"),
+		key("graph", "j/k or ↑/↓ select · g/esc return · ? help"),
 		key("RESUME", "↑/↓ pgup/pgdn scroll · ? help · esc/q close"),
 		key("steer", "enter send · esc cancel · paste joins lines with '; '"),
 		key("minibuffer", "enter save · esc discard (invalid input stays open)"),
