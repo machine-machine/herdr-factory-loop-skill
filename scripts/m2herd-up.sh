@@ -642,7 +642,7 @@ trace_dispatch_write() { # trace_dispatch_write <slice> <runner:pane|headless> <
   jq -n --arg slice "$slice" --arg agent "$AGENT" --arg runner "$runner" --arg model "$model" \
         --arg branch "$branch" --arg wt "$wt" --arg ts "$(utc_now)" --arg sess "$session" \
     '{slice:$slice, state:"spawned", agent:$agent, runner:$runner, model:$model, branch:$branch,
-      worktree:$wt, dispatched_at:$ts, collected_at:"", tokens:0, cost_usd:0}
+      worktree:$wt, dispatched_at:$ts, collected_at:"", tokens:null, cost_usd:null}
      + (if $sess != "" then {session:$sess} else {} end)' \
     > "$dir/status.json" 2>/dev/null || trace_warn "write $dir/status.json failed"
 }
@@ -693,9 +693,11 @@ trace_collect_write() { # trace_collect_write <slice> <state:done|failed> [token
     ' "$sj" > "$tmp" 2>/dev/null && mv "$tmp" "$sj" || { rm -f "$tmp"; trace_warn "update $sj failed"; }
   else
     trace_warn "no status.json at $sj — writing a fresh one"
-    jq -n --arg slice "$slice" --arg st "$state" --arg ts "$(utc_now)" --arg tok "${tok:-0}" --arg cost "${cost:-0}" \
+    jq -n --arg slice "$slice" --arg st "$state" --arg ts "$(utc_now)" --arg tok "$tok" --arg cost "$cost" \
       '{slice:$slice, state:$st, agent:"", runner:"", model:"", branch:"", worktree:"",
-        dispatched_at:"", collected_at:$ts, tokens:($tok|tonumber), cost_usd:($cost|tonumber)}' \
+        dispatched_at:"", collected_at:$ts,
+        tokens:   (if $tok  != "" then ($tok  | tonumber) else null end),
+        cost_usd: (if $cost != "" then ($cost | tonumber) else null end)}' \
       > "$sj" 2>/dev/null || trace_warn "write $sj failed"
   fi
 }
@@ -1505,6 +1507,65 @@ trace_append_failure() { # trace_append_failure <slice> <kind> <evidence>
 # collect path funnels through here. On verify FAIL the slice is marked failed
 # in BOTH overview.json and the trace status.json and collect exits 1 — a report
 # that doesn't survive independent verification is not "done".
+# ---------- pane-mode usage accounting ----------------------------------------
+# Headless workers hand us their usage on stdout; PANE workers never did, so every
+# pane wave reported tokens=0/cost_usd=0 and metrics.json's spend columns were blind
+# for the DEFAULT runner. Each agent does keep a per-project session transcript on
+# disk, so read it there. Every lookup is best-effort: an unreadable/missing/renamed
+# transcript yields empty, never a fabricated number, and never fails a collect.
+#
+#   claude  ~/.claude/projects/<cwd with [./] -> ->/<session>.jsonl
+#           Σ .message.usage.output_tokens               cost: NOT recorded -> unknown
+#   codex   ~/.codex/sessions/<Y>/<M>/<D>/rollout-*.jsonl (session_meta carries cwd)
+#           last .payload.info.total_token_usage.output_tokens   cost: unknown
+#   pi      ~/.pi/agent/sessions/--<cwd with / -> ->--/<ts>_<uuid>.jsonl
+#           Σ .message.usage.output   AND  Σ .message.usage.cost.total
+#
+# Only pi reports cost. claude/codex cost stays EMPTY (→ absent in overview.json and
+# null in metrics.json) rather than 0.00: "no cost recorded" and "free" are different
+# facts and a 0 would quietly under-report a paid wave.
+pane_tokens_cost() { # pane_tokens_cost <agent> <cwd> [session-id] -> "<tokens>\t<cost>"
+  local agent="$1" cwd="$2" sess="${3:-}" dir="" f="" tok="" cost=""
+  case "$agent" in
+    claude)
+      dir="$HOME/.claude/projects/$(printf '%s' "$cwd" | tr './' '--')"
+      [ -d "$dir" ] || { printf '\t\n'; return 0; }
+      [ -n "$sess" ] && [ -f "$dir/$sess.jsonl" ] && f="$dir/$sess.jsonl"
+      [ -n "$f" ] || f="$(ls -t "$dir"/*.jsonl 2>/dev/null | head -1)"
+      [ -n "$f" ] || { printf '\t\n'; return 0; }
+      tok="$(jq -rs '[.[]? | .message.usage.output_tokens // empty] | add // empty' "$f" 2>/dev/null || true)"
+      ;;
+    pi)
+      # pi drops the LEADING slash before replacing the rest, and keeps dots:
+      # /home/m2.2/.herdr/x -> --home-m2.2-.herdr-x--
+      dir="$HOME/.pi/agent/sessions/--$(printf '%s' "${cwd#/}" | tr '/' '-')--"
+      [ -d "$dir" ] || { printf '\t\n'; return 0; }
+      [ -n "$sess" ] && f="$(ls -t "$dir"/*"$sess"*.jsonl 2>/dev/null | head -1)"
+      [ -n "$f" ] || f="$(ls -t "$dir"/*.jsonl 2>/dev/null | head -1)"
+      [ -n "$f" ] || { printf '\t\n'; return 0; }
+      tok="$(jq -rs '[.[]? | select(.type=="message") | .message.usage.output // empty] | add // empty' "$f" 2>/dev/null || true)"
+      cost="$(jq -rs '[.[]? | select(.type=="message") | .message.usage.cost.total // empty] | add // empty' "$f" 2>/dev/null || true)"
+      ;;
+    codex)
+      # codex partitions by date, not by cwd, and the cwd lives INSIDE the file —
+      # so match on it. Bounded to the last 3 days of rollouts to stay cheap.
+      while IFS= read -r cand; do
+        [ -n "$cand" ] || continue
+        if head -c 4096 "$cand" 2>/dev/null | grep -qF "\"cwd\":\"$cwd\""; then f="$cand"; break; fi
+      done <<EOF
+$(find "$HOME/.codex/sessions" -name 'rollout-*.jsonl' -mtime -3 -printf '%T@ %p\n' 2>/dev/null | sort -rn | cut -d' ' -f2-)
+EOF
+      [ -n "$f" ] || { printf '\t\n'; return 0; }
+      # total_token_usage is CUMULATIVE per turn — take the last one, never a sum
+      tok="$(jq -rs '[.[]? | .payload.info.total_token_usage.output_tokens // empty] | last // empty' "$f" 2>/dev/null || true)"
+      ;;
+  esac
+  case "$tok" in ''|*[!0-9]*) tok="" ;; esac
+  # cost is a decimal; keep only a plain number
+  case "$cost" in ''|*[!0-9.]*) cost="" ;; esac
+  printf '%s\t%s\n' "$tok" "$cost"
+}
+
 finish_collect() { # finish_collect <slice> <wt> [tokens] [cost_usd]
   local slice="$1" wt="$2" tok="${3:-}" cost="${4:-}" vcmd="" vrc=0
   VERIFY_LOG=""
@@ -1563,9 +1624,13 @@ collect() {
   fi
 
   [ -f "$OV" ] || { echo "no overview.json at $OV" >&2; exit 1; }
-  local wmode wpid wwt
+  # wagent is resolved HERE, not inside the headless branch: the pane path needs it
+  # too now (usage lookup), and a `local` that only executes in one branch leaves the
+  # other branch referencing an unbound variable under `set -u`.
+  local wmode wpid wwt wagent
   wmode="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .mode // "tui"' "$OV")"
   wwt="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .worktree // empty' "$OV")"
+  wagent="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .agent // "claude"' "$OV")"
 
   # HEADLESS collect: wait for the pid to exit — but only after proving it is
   # still OUR worker (start-time recorded at dispatch; a recycled pid must not
@@ -1573,8 +1638,7 @@ collect() {
   # (tokens / cost) from the runner's JSON log into workers[].
   if [ "$wmode" = "headless" ]; then
     wpid="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .pid // empty' "$OV")"
-    local wagent wstart
-    wagent="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .agent // "claude"' "$OV")"
+    local wstart
     wstart="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .pid_start // empty' "$OV")"
     local lg="$REPO/.m2herd/dispatch/$SLICE.log" errlg="$REPO/.m2herd/dispatch/$SLICE.stderr.log"
     local waited=0 max=$((WAIT_TIMEOUT / 1000))
@@ -1652,8 +1716,11 @@ collect() {
   if [ -n "$known_panes" ] && ! printf '%s\n' "$known_panes" | grep -qxF "$pane"; then
     if [ -s "$out" ]; then
       log "pane $pane is gone but the worker already wrote $out — keeping it"
-      finish_collect "$SLICE" "$wwt"
-      log "collect: done — $SLICE state=done (pane closed after writing its report)"
+      local gtc gtok gcost
+      gtc="$(pane_tokens_cost "$wagent" "$wwt" "")"; gtok="${gtc%%$'\t'*}"; gcost="${gtc##*$'\t'}"
+      set_worker_usage "$SLICE" "$gtok" "$gcost"
+      finish_collect "$SLICE" "$wwt" "$gtok" "$gcost"
+      log "collect: done — $SLICE state=done (pane closed after writing its report)${gtok:+, ${gtok} out-tokens}"
       return 0
     fi
     echo "worker pane $pane for $SLICE no longer exists — marking failed" >&2
@@ -1687,8 +1754,17 @@ collect() {
   # State honesty: an empty report is a FAILED collect — say so in BOTH
   # overview.json and the trace status.json, never a hollow "done".
   if [ -s "$out" ]; then
-    finish_collect "$SLICE" "$wwt"
-    log "collect: done — $SLICE state=done, report at $out"
+    # pane usage: read it from the agent's own session transcript. The session id is
+    # resolved from herdr while the pane still exists (collect runs before down); the
+    # newest-transcript fallback covers agents that expose no session id.
+    local psess ptc ptok pcost
+    psess="$(herdr agent list 2>/dev/null \
+      | jq -r --arg p "$pane" '.result.agents[]? | select(.pane_id==$p) | .agent_session.value // empty' 2>/dev/null | head -1 || true)"
+    ptc="$(pane_tokens_cost "$wagent" "$wwt" "$psess")"; ptok="${ptc%%$'\t'*}"; pcost="${ptc##*$'\t'}"
+    [ -n "$ptok" ] || log "! no usage found for $SLICE ($wagent pane) — reporting unknown, not zero"
+    set_worker_usage "$SLICE" "$ptok" "$pcost"
+    finish_collect "$SLICE" "$wwt" "$ptok" "$pcost"
+    log "collect: done — $SLICE state=done, report at $out${ptok:+, ${ptok} out-tokens}${pcost:+, \$${pcost}}"
   else
     echo "worker $SLICE went idle but produced no report ($out empty)" >&2
     set_worker_state "$SLICE" "failed"
