@@ -2124,6 +2124,17 @@ selftest() {
   rlines="$(printf '%s\n' "$resume_out" | wc -l | tr -d ' ')"
   [ "$rlines" -le 45 ] || fail "resume report is $rlines lines (want <= ~40)"
 
+  # ---- dispatcher honesty: unknown subcommand FAILS -------------------------
+  # `dispatch --all` shells out to `graph next`; a fallback that printed usage and
+  # exited 0 was parsed by the caller as a ready-slice list. `help` still exits 0.
+  local urc=0 uout
+  uout="$("$self" definitely-not-a-subcommand --dir "$td" 2>&1 >/dev/null)" || urc=$?
+  [ "$urc" -eq 2 ] || fail "unknown subcommand exited $urc (want 2)"
+  printf '%s' "$uout" | grep -q 'unknown subcommand' || fail "unknown subcommand: no message on stderr"
+  [ -z "$("$self" definitely-not-a-subcommand --dir "$td" 2>/dev/null)" ] \
+    || fail "unknown subcommand wrote to stdout (must be stderr only, so callers cannot parse it)"
+  "$self" help >/dev/null 2>&1 || fail "help must still exit 0"
+
   # ---- graph (v2.3 declared topology) ---------------------------------------
   # graph.json is written DIRECTLY here (fixtures): no m2herd command may mutate it.
   local gf="$td/.m2herd/graph.json" grc gout mrun mdir
@@ -2293,5 +2304,10 @@ case "$CMD" in
     else dashboard_watch; fi ;;
   self-update) self_update_cmd ;;
   selftest)  selftest ;;
-  help|*)    sed -n '2,58p' "$0" ;;
+  help)      sed -n '2,58p' "$0" ;;
+  # An unknown subcommand must FAIL, not print usage and exit 0. `dispatch --all`
+  # shells out to `graph next`; against a pre-v2.3 engine the old fallback returned
+  # exit 0 plus 57 lines of this header, which the caller then parsed as a ready-slice
+  # list. Every caller of every subcommand had the same hazard.
+  *)         printf 'unknown subcommand: %s\n\n' "$CMD" >&2; sed -n '2,58p' "$0" >&2; exit 2 ;;
 esac
