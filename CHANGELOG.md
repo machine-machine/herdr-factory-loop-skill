@@ -94,6 +94,23 @@ CI-only patch: the TUI's tests now actually run, and both workflows are off the
 deprecated Node 20 action runtime.
 
 ### Fixed
+- **Pane-mode workers now report usage.** Headless runners hand their usage to `collect` on
+  stdout; pane workers — the **default** runner — never did, so every pane wave recorded
+  `tokens: 0, cost_usd: 0` and `metrics.json`'s spend columns were blind. Each agent does
+  keep a per-project session transcript, so `collect` reads it there: claude from
+  `~/.claude/projects/<slug>/<session>.jsonl` (Σ `output_tokens`), codex from the
+  date-partitioned `~/.codex/sessions/**/rollout-*.jsonl` matched on the recorded `cwd`
+  (last cumulative `total_token_usage`), pi from `~/.pi/agent/sessions/--<slug>--/*.jsonl`
+  (Σ `usage.output`, plus real `usage.cost.total`). The session id is resolved from herdr
+  while the pane still exists, with a newest-transcript fallback. Every lookup is
+  best-effort and can never fail a collect. Measured against wave 7, which had reported all
+  zeros: graph-engine 173,158 output tokens, graph-dispatch 104,659, graph-tui 12,518,
+  pi-orchestrator 76,067.
+- **Unknown usage is `null`, not `0`.** `trace_dispatch_write` seeded `tokens: 0, cost_usd: 0`
+  and the fresh-status fallback defaulted to `0`, so "nothing recorded" was written as
+  "this slice was free" — a different claim, and a false one for a paid wave. Both now write
+  `null`, and `metrics.json` propagates `null` instead of coercing to `0`. Only pi reports
+  cost, so claude/codex cost stays `null` rather than being invented. Selftest asserts it.
 - **`prebuilt/` is now verifiable — reproducible builds + a guard that actually guards.**
   `release.yml` claimed the attached binaries let the committed `prebuilt/` set "be
   cross-checked". It could not: every hash differed. Not a Go version skew (CI and local

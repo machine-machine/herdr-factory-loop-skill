@@ -1380,10 +1380,16 @@ write_run_metrics() {
     [ -n "$coll" ] && ce="$(epoch_of "$coll")"
     case "$de" in ''|*[!0-9]*) de=0 ;; esac
     case "$ce" in ''|*[!0-9]*) ce=0 ;; esac
-    tok="$(jq -r '(.tokens // 0) | if type == "number" then . else 0 end' "$sf" 2>/dev/null || echo 0)"
-    cost="$(jq -r '(.cost_usd // 0) | if type == "number" then . else 0 end' "$sf" 2>/dev/null || echo 0)"
+    # unknown beats invented, same rule as the durations: a status.json with no usage
+    # recorded (an agent whose transcript could not be read, or a runner that reports
+    # none) stays null. A 0 would assert "this slice was free", which is a different
+    # claim — and for a paid wave, a false one.
+    tok="$(jq -r 'if (.tokens | type) == "number" then .tokens else "null" end' "$sf" 2>/dev/null || echo null)"
+    cost="$(jq -r 'if (.cost_usd | type) == "number" then .cost_usd else "null" end' "$sf" 2>/dev/null || echo null)"
+    case "$tok" in ''|*[!0-9]*) tok="null" ;; esac
+    case "$cost" in ''|*[!0-9.]*) cost="null" ;; esac
     recs="$(jq --arg s "$slice" --argjson d "$de" --argjson c "$ce" \
-               --argjson t "${tok:-0}" --argjson u "${cost:-0}" \
+               --argjson t "${tok:-null}" --argjson u "${cost:-null}" \
       '. + [{slice: $s,
              dispatched: (if $d > 0 then $d else null end),
              collected:  (if $c > 0 then $c else null end),
@@ -2249,6 +2255,18 @@ GRAPHEOF
     and ([.slices[] | select(.slice=="dispatch") | .tokens][0] == 2000)
     and ([.slices[] | select(.slice=="dispatch") | .cost_usd][0] == 1.25)
   ' "$mdir/metrics.json" >/dev/null || { cat "$mdir/metrics.json" >&2; fail "metrics.json field assert"; }
+  # unknown usage stays NULL, never 0: "no usage recorded" and "this slice was free"
+  # are different claims. A pane worker whose transcript cannot be read must not be
+  # reported as costing nothing.
+  jq '.tokens=null | .cost_usd=null' "$mdir/slices/engine/status.json" > "$mdir/slices/engine/status.json.t" \
+    && mv "$mdir/slices/engine/status.json.t" "$mdir/slices/engine/status.json"
+  step evolve analyze --dir "$td" --run "$mrun"
+  jq -e '([.slices[] | select(.slice=="engine") | .tokens][0] == null)
+         and ([.slices[] | select(.slice=="engine") | .cost_usd][0] == null)
+         and ([.slices[] | select(.slice=="engine") | .seconds][0] == 600)' \
+    "$mdir/metrics.json" >/dev/null || { cat "$mdir/metrics.json" >&2; fail "metrics.json: unknown usage must be null, not 0"; }
+  mk_status engine 2026-01-01T00:00:00Z 2026-01-01T00:10:00Z 1000 0.5
+  step evolve analyze --dir "$td" --run "$mrun"
   # absent graph.json → still written, critical_path [], per-slice numbers intact
   mv "$gf" "$gf.away"
   step evolve analyze --dir "$td" --run "$mrun"
