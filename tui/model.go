@@ -38,6 +38,8 @@ type model struct {
 
 	settings *settingsView
 
+	splash *splash
+
 	steerActive    bool
 	steerValue     string
 	steerToast     string
@@ -47,7 +49,13 @@ type model struct {
 
 func newModel(dir string) model {
 	// seq 1 / loading true match the load dispatched by Init.
-	return model{dir: dir, width: 100, height: 40, seq: 1, loading: true}
+	m := model{dir: dir, width: 100, height: 40, seq: 1, loading: true}
+	// The startup reveal is decoration: skipped when piped or opted out, and the
+	// snapshot load runs underneath it either way, so it costs no time to first data.
+	if !splashDisabled() {
+		m.splash = newSplash(time.Now().UnixNano())
+	}
+	return m
 }
 
 type snapshotMsg struct {
@@ -84,7 +92,11 @@ func loadResumeCmd(dir string) tea.Cmd {
 }
 
 func (m model) Init() tea.Cmd {
-	return tea.Batch(loadSnapshotCmd(m.dir, m.seq), tickCmd())
+	cmds := []tea.Cmd{loadSnapshotCmd(m.dir, m.seq), tickCmd()}
+	if m.splash != nil {
+		cmds = append(cmds, splashTickCmd(m.splash.fps()))
+	}
+	return tea.Batch(cmds...)
 }
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
@@ -95,7 +107,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.resumeVP.Height = max(0, msg.Height-4)
 		return m, nil
 
+	case splashTickMsg:
+		if m.splash == nil {
+			return m, nil
+		}
+		if m.splash.Tick() {
+			m.splash = nil
+			return m, nil
+		}
+		return m, splashTickCmd(m.splash.fps())
+
 	case tea.KeyMsg:
+		// Any key dismisses the reveal — ctrl+c still quits, everything else just
+		// skips ahead to the dashboard rather than being swallowed twice.
+		if m.splash != nil {
+			m.splash = nil
+			if msg.String() == "ctrl+c" {
+				return m, tea.Quit
+			}
+			return m, nil
+		}
 		if m.showHelp {
 			switch msg.String() {
 			case "ctrl+c":
@@ -276,6 +307,9 @@ func suspendForSteerCmd(dir string) tea.Cmd {
 }
 
 func (m model) View() string {
+	if m.splash != nil {
+		return m.splash.View(m.width, m.height)
+	}
 	if m.showHelp {
 		return RenderHelp(m.width)
 	}

@@ -9,6 +9,16 @@ adheres to [Semantic Versioning](https://semver.org/).
 Adds `pi` as a first-class m2herd worker agent, and unblocks the first dispatch of any wave.
 
 ### Added
+- **TUI startup reveal.** `m2herd-tui` now animates an `M2HERD` wordmark into place on
+  launch, using one of seven randomly chosen effects (`typewriter`, `scanline`, `rain`,
+  `fade`, `crt`, `glitch`, `dissolve`) rendered in half-block cells. The effect set and the
+  half-block technique are borrowed from pi's `armin.js` easter egg
+  (`@earendil-works/pi-coding-agent`, MIT); the artwork is ours and the state machines are a
+  fresh Go implementation. It is decoration and behaves like it: writes nothing, never runs
+  in `--once` (hooks and CI keep getting one clean frame), skipped when stdout is not a tty
+  or `M2HERD_NO_SPLASH=1`, dismissed by any keypress, and hard-capped at 48 frames so a slow
+  terminal cannot leave the dashboard stuck behind it. The snapshot load runs underneath, so
+  it costs nothing in time-to-first-data.
 - **`pi` worker support** (`@earendil-works/pi-coding-agent`). Accepted by `valid_agent`,
   `settings_validate_agent` and `routing[].agent`. Pane mode runs `pi -a` — `--approve` is
   mandatory, since an interactive pi stops on the project-trust prompt in a fresh worktree
