@@ -94,6 +94,20 @@ CI-only patch: the TUI's tests now actually run, and both workflows are off the
 deprecated Node 20 action runtime.
 
 ### Fixed
+- **`prebuilt/` is now verifiable — reproducible builds + a guard that actually guards.**
+  `release.yml` claimed the attached binaries let the committed `prebuilt/` set "be
+  cross-checked". It could not: every hash differed. Not a Go version skew (CI and local
+  both run 1.26.5) but two embedded-metadata sources — absolute build paths
+  (`/home/m2.2/…` vs `/home/runner/work/…`) and Go's default VCS stamping
+  (`vcs.revision`/`vcs.time`/`vcs.modified`), which can *never* agree for a committed
+  artifact since the prebuilt is built before the commit containing it exists. All builds
+  now pass `-trimpath -buildvcs=false`; verified byte-identical from three different
+  checkout paths. New `make prebuilt-check` rebuilds all four targets into a scratch dir
+  and byte-compares against the committed set, naming any target that drifted; wired into
+  `make ci`, the CI go job, and — critically — `release.yml` *before* `tui-release`
+  overwrites `prebuilt/`, since a check afterwards would only compare the build against
+  itself. Verified in both directions: passes on a clean tree, and fails with
+  `DRIFT: m2herd-tui-linux-arm64` when a single byte of a committed binary is flipped.
 - **`go test` runs in CI.** `tui/steer_test.go` (5 cases) had never been executed by
   either `make ci` or `.github/workflows/ci.yml` — both stopped at `go build` + `go vet`.
   Both now run `go test ./...` as well. Verified against Go 1.26.5.

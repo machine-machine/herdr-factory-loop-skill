@@ -1,8 +1,10 @@
 name: Release
 
-# Prebuilt-rot guard: every v* tag rebuilds all four m2herd-tui targets and
-# attaches them to the GitHub release, so the committed prebuilt/ set can be
-# cross-checked (and users can always download current binaries).
+# Prebuilt-rot guard: every v* tag first PROVES the committed prebuilt/ set
+# reproduces byte-for-byte (make prebuilt-check — possible because the Makefile
+# builds with -trimpath -buildvcs=false), then rebuilds all four m2herd-tui
+# targets and attaches them to the release, so the attached binaries are provably
+# the committed ones and users can always download current binaries.
 on:
   push:
     tags: ["v*"]
@@ -20,6 +22,12 @@ jobs:
         with:
           go-version: stable
           cache-dependency-path: tui/go.sum
+
+      # Cross-check BEFORE rebuilding: `tui-release` overwrites prebuilt/, so a
+      # check afterwards would only compare the build against itself. This is the
+      # step that makes the attached binaries provably the committed ones.
+      - name: prebuilt-check (committed prebuilt/ matches this tag)
+        run: make prebuilt-check
 
       - name: build all release targets
         run: make tui-release

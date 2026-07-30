@@ -63,9 +63,16 @@ jobs:
         working-directory: tui
         run: go test ./...
 
+      # The prebuilt-rot guard that actually guards: rebuilds all four targets and
+      # byte-compares them against the committed prebuilt/ set. Only meaningful
+      # because the Makefile builds with -trimpath -buildvcs=false, so a CI build
+      # and a laptop build of the same commit are identical.
+      - name: prebuilt-check (committed prebuilt/ reproduces byte-for-byte)
+        run: make prebuilt-check
+
       - name: build m2herd-tui linux-amd64
         working-directory: tui
-        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags "-s -w" -o m2herd-tui-linux-amd64 .
+        run: CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags "-s -w" -o m2herd-tui-linux-amd64 .
 
       - uses: actions/upload-artifact@v7
         with:
