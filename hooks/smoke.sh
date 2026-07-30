@@ -221,6 +221,44 @@ else
   SKIP=$((SKIP+1))
 fi
 
+# --- m2herd-session.pi.ts (pi orchestrator extension) -----------------------
+# (1) The extension file parses (TypeScript syntax via node --experimental-
+#     strip-types, probed for portability across node versions).
+# (2) The hook's stdout shape is exactly what the extension's parser reads:
+#     .hookSpecificOutput.additionalContext is a non-empty string and
+#     .hookSpecificOutput.hookEventName == "SessionStart". Uses its own temp
+#     fabric dir so it does not touch the other m2herd-session.sh assertions.
+PI_PROBE="$(mktemp).ts"
+printf 'export default function (_: any): void {}\n' > "$PI_PROBE"
+PI_STRIP=0
+if [ "$HAVE_NODE" -eq 1 ] && node --experimental-strip-types --check "$PI_PROBE" >/dev/null 2>&1; then PI_STRIP=1; fi
+rm -f "$PI_PROBE"
+if [ "$PI_STRIP" -eq 1 ] && [ -f "$HERE/m2herd-session.pi.ts" ]; then
+  if node --experimental-strip-types --check "$HERE/m2herd-session.pi.ts" >/dev/null 2>&1; then
+    PASS=$((PASS+1))
+  else
+    echo "FAIL m2herd-session.pi.ts(parse): extension did not parse (node --experimental-strip-types --check)"
+    FAIL=$((FAIL+1))
+  fi
+else
+  echo "SKIP m2herd-session.pi.ts(parse): node strip-types unavailable or file absent"
+  SKIP=$((SKIP+1))
+fi
+PI_FABRIC_DIR="$(mktemp -d)"
+mkdir -p "$PI_FABRIC_DIR/.m2herd"
+printf '{"goal":"pi goal","status":"pi testing","areas":["x","y"]}\n' > "$PI_FABRIC_DIR/.m2herd/overview.json"
+printf '# pi resume\npi resume line\n' > "$PI_FABRIC_DIR/.m2herd/RESUME.md"
+pi_hook_out="$(printf '%s' "$SESSION_SAMPLE" | env M2HERD_DIR="$PI_FABRIC_DIR" bash "$HERE/m2herd-session.sh" 2>/dev/null)" || true
+pi_ac="$(printf '%s' "$pi_hook_out" | jq -r '.hookSpecificOutput.additionalContext // ""' 2>/dev/null)"
+pi_he="$(printf '%s' "$pi_hook_out" | jq -r '.hookSpecificOutput.hookEventName // ""' 2>/dev/null)"
+if [ -n "$pi_ac" ] && [ "$pi_he" = "SessionStart" ]; then
+  PASS=$((PASS+1))
+else
+  echo "FAIL m2herd-session.pi.ts(hook-shape): additionalContext empty or hookEventName != SessionStart (he='$pi_he', ac_len=${#pi_ac})"
+  FAIL=$((FAIL+1))
+fi
+rm -rf "$PI_FABRIC_DIR"
+
 # --- summary -----------------------------------------------------------------
 
 echo "smoke: $PASS passed, $FAIL failed, $SKIP skipped"

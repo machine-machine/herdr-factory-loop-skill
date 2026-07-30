@@ -7,10 +7,10 @@
 #   ./scripts/install.sh --hermes        # ~/.hermes/skills/herdr
 #   ./scripts/install.sh --claude        # ~/.claude/skills/herdr
 #   ./scripts/install.sh --cursor        # ~/.cursor/skills/herdr
-#   ./scripts/install.sh --pi            # ~/.pi/agent/skills/herdr (+ herdr integration)
+#   ./scripts/install.sh --pi            # ~/.pi/agent/skills/herdr (+ herdr integration + orchestrator extension)
 #   ./scripts/install.sh --local         # install from the local repo (no clone)
 #   ./scripts/install.sh --no-nudge-hook # skip the UserPromptSubmit/pre_llm_call nudge hook
-#   ./scripts/install.sh --no-m2herd-hooks # skip the m2herd SessionStart/PreCompact/PostToolUse hooks
+#   ./scripts/install.sh --no-m2herd-hooks # skip the m2herd SessionStart/PreCompact/PostToolUse hooks (and the pi orchestrator extension)
 #   ./scripts/install.sh --no-statusline # skip the ctx-bridge statusline registration (claude)
 #   ./scripts/install.sh --uninstall
 #
@@ -515,7 +515,92 @@ register_pi_integration() {
       echo "[pi] WARNING: 'herdr integration install pi' failed — worker state will read as unknown to watch" >&2
     fi
   fi
-  echo "[pi] note: pi works as an m2herd WORKER now. As an ORCHESTRATOR it reads CLAUDE.md/AGENTS.md natively, but the live fabric snapshot that Claude Code gets from hooks/m2herd-session.sh needs pi's session_start extension — not installed by this script yet." >&2
+  if [ "$m2herd_hooks" -eq 1 ]; then
+    echo "[pi] note: pi works as an m2herd WORKER now. As an ORCHESTRATOR it also gets the same live fabric snapshot Claude Code gets — the session_start extension (hooks/m2herd-session.pi.ts wrapping hooks/m2herd-session.sh) is registered next." >&2
+  else
+    echo "[pi] note: pi works as an m2herd WORKER now. The ORCHESTRATOR session_start extension was skipped (--no-m2herd-hooks); pi reads CLAUDE.md/AGENTS.md natively but gets no live fabric snapshot." >&2
+  fi
+}
+
+# --- pi orchestrator: the m2herd session_start extension (~/.pi/agent/extensions/m2herd-session/).
+# This is the pi equivalent of Claude Code's m2herd SessionStart hook: a pi
+# extension (hooks/m2herd-session.pi.ts) that shells out to hooks/m2herd-session.sh
+# at session_start and injects the fabric snapshot as system context, so a pi
+# ORCHESTRATOR starts oriented the same way Claude Code does. One code path, one
+# snapshot format — the extension only wraps the existing bash hook.
+#
+# Placement: the extension + hook are symlinked into a SUBDIR of
+# ~/.pi/agent/extensions/ that intentionally has NO index.ts, so pi does NOT
+# auto-discover it (pi only auto-discovers extensions/*.ts and */index.ts — see
+# docs/extensions.md §Extension Locations). The extension is loaded SOLELY via
+# the ~/.pi/agent/settings.json extensions[] entry registered below. This makes
+# --no-m2herd-hooks mean "inactive" (files present but unregistered), exactly
+# like the Claude Code m2herd hooks, and keeps the load path single (no
+# auto-discovery + settings duplication to dedupe).
+M2HERD_PI_EXTENSION="m2herd-session.pi.ts"
+M2HERD_PI_HOOK="m2herd-session.sh"
+M2HERD_PI_SUBDIR="m2herd-session"
+
+register_pi_extension() {
+  local ext_dir="$HOME/.pi/agent/extensions"
+  local sub_dir="$ext_dir/$M2HERD_PI_SUBDIR"
+  local settings="$HOME/.pi/agent/settings.json"
+  local ext_path="$sub_dir/$M2HERD_PI_EXTENSION"
+
+  # Always ensure the dirs exist (herdr integration install also creates
+  # ext_dir, but this slice must not depend on it).
+  if [ "$uninstall" -ne 1 ]; then
+    mkdir -p "$sub_dir"
+  fi
+
+  # Symlink the extension and the hook it wraps side-by-side in the subdir.
+  # install_hook_file symlinks $HOOKS_SRC_DIR/<name> into <dir>/<name> and
+  # removes the symlink on uninstall. Both files share a hooks/ source dir, so
+  # the extension resolves the hook next to its own (realpath) location at
+  # runtime; the .sh symlink beside it is a fallback.
+  install_hook_file "$sub_dir" "pi" "$M2HERD_PI_EXTENSION"
+  install_hook_file "$sub_dir" "pi" "$M2HERD_PI_HOOK"
+
+  # Uninstall: strip the settings entry and drop the now-empty subdir. Always
+  # done (independent of --no-m2herd-hooks) so a plain --uninstall removes all
+  # traces of a prior m2herd_hooks=1 install.
+  if [ "$uninstall" -eq 1 ]; then
+    if [ -f "$settings" ] && command -v jq >/dev/null 2>&1; then
+      settings_json_ok "$settings" pi || return 0
+      backup_file "$settings"
+      local tmp="$settings.tmp.$$"
+      track_tmp "$tmp"
+      jq --arg p "$ext_path" '.extensions = ((.extensions // []) | map(select(. != $p)))' \
+        "$settings" > "$tmp" && mv "$tmp" "$settings"
+      echo "[pi] removed m2herd session_start extension from $settings (extensions[])"
+    fi
+    rmdir "$sub_dir" 2>/dev/null || true
+    return 0
+  fi
+
+  # Opt-out: --no-m2herd-hooks leaves the files symlinked but unregistered
+  # (inert — not auto-discovered, not in extensions[]), matching the Claude
+  # Code m2herd hooks' --no-m2herd-hooks behavior.
+  [ "$m2herd_hooks" -eq 1 ] || return 0
+
+  if ! command -v jq >/dev/null 2>&1; then
+    echo "[pi] warn: jq not found — extension symlinked into $sub_dir but NOT registered in $settings extensions[] (inactive until wired manually)" >&2
+    return 0
+  fi
+  settings_json_ok "$settings" pi || return 0
+  [ -f "$settings" ] || echo '{}' > "$settings"
+  backup_file "$settings"
+  local tmp="$settings.tmp.$$"
+  track_tmp "$tmp"
+  # Idempotent: append the absolute path only if it is not already present.
+  # This entry is the sole load path (the subdir is not auto-discovered), so it
+  # is required — not redundant — for the extension to load.
+  jq --arg p "$ext_path" '
+    .extensions = ((.extensions // []) as $arr |
+      if ($arr | map(select(. == $p)) | length) > 0 then $arr
+      else $arr + [$p] end)
+  ' "$settings" > "$tmp" && mv "$tmp" "$settings"
+  echo "[pi] registered m2herd session_start extension in $settings (extensions[]) — orchestrator fabric snapshot wired for pi"
 }
 
 if [ "$install_hermes" -eq 1 ]; then
@@ -553,6 +638,7 @@ if [ "$install_pi" -eq 1 ]; then
   # SKILL.md under ~/.pi/agent/skills/ (docs/skills.md § Locations).
   install_one "$HOME/.pi/agent/skills" "pi"
   register_pi_integration
+  register_pi_extension
   install_m2herd_bins
 fi
 

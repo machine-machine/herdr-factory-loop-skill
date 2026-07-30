@@ -2,7 +2,7 @@
 # onboard.sh — interactive onboarding TUI for the herdr factory loop.
 #
 # Walks you through:
-#   1. Choosing an orchestrator: Claude Code, Hermes, Cursor, or all
+#   1. Choosing an orchestrator: Claude Code, Hermes, Cursor, pi, or all
 #   2. Verifying the substrate (herdr server, jq, git)
 #   3. Installing this skill for the chosen orchestrator(s)
 #   4. Installing spec-kit's `specify` CLI (github/spec-kit)
@@ -11,7 +11,7 @@
 #
 # Usage:
 #   ./scripts/onboard.sh                # interactive TUI
-#   ./scripts/onboard.sh --orchestrator claude|hermes|cursor|all \
+#   ./scripts/onboard.sh --orchestrator claude|hermes|cursor|pi|all \
 #                        [--repo /path/to/repo] [--yes] [--force]
 #   --yes    non-interactive; assumes claude when --orchestrator is omitted
 #   --force  pass --force through to 'specify init' (overwrite existing files)
@@ -143,14 +143,15 @@ if [ -z "$ORCHESTRATOR" ]; then
     "claude  — Claude Code drives spec-kit + the herd" \
     "hermes  — Hermes drives spec-kit + the herd" \
     "cursor  — Cursor (cursor-agent) drives spec-kit + the herd" \
+    "pi      — pi (earendil-works/pi-coding-agent) drives spec-kit + the herd" \
     "all     — install for all, pick per-session")
   ORCHESTRATOR="${CHOICE%% *}"
 fi
 # `both` accepted as a legacy alias for `all` (pre-cursor onboarding).
 [ "$ORCHESTRATOR" = "both" ] && ORCHESTRATOR="all"
 case "$ORCHESTRATOR" in
-  claude|hermes|cursor|all) ok "orchestrator: ${BOLD}$ORCHESTRATOR${RESET}" ;;
-  *) fail "invalid orchestrator '$ORCHESTRATOR' (claude|hermes|cursor|all)"; exit 1 ;;
+  claude|hermes|cursor|pi|all) ok "orchestrator: ${BOLD}$ORCHESTRATOR${RESET}" ;;
+  *) fail "invalid orchestrator '$ORCHESTRATOR' (claude|hermes|cursor|pi|all)"; exit 1 ;;
 esac
 
 # ---------- step 2: substrate checks -------------------------------------------
@@ -204,6 +205,9 @@ esac
 case "$ORCHESTRATOR" in
   cursor|all) command -v cursor-agent >/dev/null 2>&1 && ok "cursor-agent CLI found" || warn "cursor-agent CLI not on PATH (install: https://cursor.com/cli)" ;;
 esac
+case "$ORCHESTRATOR" in
+  pi|all) command -v pi >/dev/null 2>&1 && ok "pi CLI found" || warn "pi CLI not on PATH (install: npm i -g @earendil-works/pi-coding-agent)" ;;
+esac
 if [ "$MISSING" -eq 1 ]; then
   fail "fix the missing required tools above, then re-run onboarding"
   exit 1
@@ -223,6 +227,7 @@ case "$ORCHESTRATOR" in
   claude) "$SCRIPT_DIR/install.sh" --local --claude ;;
   hermes) "$SCRIPT_DIR/install.sh" --local --hermes ;;
   cursor) "$SCRIPT_DIR/install.sh" --local --cursor ;;
+  pi)     "$SCRIPT_DIR/install.sh" --local --pi ;;
   all)    "$SCRIPT_DIR/install.sh" --local ;;
 esac
 # install.sh runs install-hermes-context.sh for hermes/all — the context-budget
@@ -312,13 +317,21 @@ if [ -n "$TARGET_REPO" ]; then
         fi ;;
       claude) INIT_ARGS+=("$AGENT_FLAG" claude) ;;
       cursor) INIT_ARGS+=("$AGENT_FLAG" cursor) ;;  # native; prompts → .cursor/commands/
-      all)    INIT_ARGS+=("$AGENT_FLAG" claude) ;;  # claude native; hermes reads .claude/commands/*.md; re-run with --integration cursor for .cursor/commands/
+      pi)     if [ "$HAS_GENERIC" -eq 1 ]; then
+                INIT_ARGS+=("$AGENT_FLAG" generic --integration-options="--commands-dir .pi/prompts/")
+              else
+                INIT_ARGS+=("$AGENT_FLAG" claude --ignore-agent-tools)
+              fi ;;  # pi is not spec-kit-native; generic lands /speckit.* as prompt templates in .pi/prompts/ (pi loads *.md there as /name commands)
+      all)    INIT_ARGS+=("$AGENT_FLAG" claude) ;;  # claude native; hermes reads .claude/commands/*.md; re-run with --integration cursor/pi for those
     esac
     say "  Running: specify ${INIT_ARGS[*]}  (in $TARGET_REPO)"
     if confirm "Proceed?"; then
       (cd "$TARGET_REPO" && specify_cmd "${INIT_ARGS[@]}")
       SPECKIT_INITIALIZED="true"
       ok "spec-kit initialized — /speckit.* commands are now available in $TARGET_REPO"
+      if [ "$ORCHESTRATOR" = "pi" ]; then
+        warn "pi is not a spec-kit-native integration: /speckit.* are wired as pi prompt-template slash commands in .pi/prompts/ (pi loads *.md there as /name); the 'specify' CLI works regardless"
+      fi
     else
       warn "skipped spec-kit init"
     fi
