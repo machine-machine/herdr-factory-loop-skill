@@ -9,6 +9,46 @@ adheres to [Semantic Versioning](https://semver.org/).
 Adds `pi` as a first-class m2herd worker agent, and unblocks the first dispatch of any wave.
 
 ### Added
+- **Declared topology — `.m2herd/graph.json` (contract amendment v2.3).** m2herd was always
+  a graph (dispatch → worker → verify gate → collect, `watch` as reconciler, `evolve` as the
+  slow outer loop, `routing[]` and the watch ladder as conditional edges, `--max-resumes` as
+  a bounded cycle) but the topology lived only in the orchestrator's context window, so a
+  fresh session recovered goal/notes/areas/runs/lessons from the fabric and never the graph.
+  Now it is a file:
+  - `m2herd graph lint|show|next`. `lint` reports one finding per line and exits 2 on any
+    error: malformed JSON, duplicate or non-token ids, unknown edge endpoints or types,
+    bad `kind`, a cycle where an edge omits `max_traversals`, and **overlapping `nodes[].owns`
+    between nodes with no `depends_on` path between them** — the parallel-write bug the
+    single-owner doctrine exists to prevent. It also prints the sentence form of every
+    `depends_on` edge ("A depends on B — B must finish first") so a human can proofread
+    direction, the likeliest authoring mistake.
+  - `graph next` is the machine seam: bare ready-slice ids on stdout, errors on stderr,
+    empty + exit 0 = nothing ready, exit 2 = invalid graph.
+  - `m2herd-up dispatch --all` selects via `graph next` and dispatches each slice through
+    the **existing** single-slice path (`dispatch()` refactored to `dispatch_one()`), so the
+    two modes cannot drift. Stops at `workers.max`, reports deferred slices instead of
+    queuing them, skips a ready slice with no task file loudly, and is idempotent — re-run
+    after each collect; that is the operating loop.
+  - Only two edge types ship: `depends_on` (gates dispatch) and `caused` (provenance).
+    `supersedes`/`decided_by` were declined — an edge type with no mechanical consumer is
+    decoration. Cycles are legal when declared with `max_traversals`, because agent graphs
+    are not DAGs and `watch`'s resume ladder is already one.
+  - `graph.json` is read-only to `dispatch`/`collect`/`watch`/the TUI; topology edits ship as
+    evolver proposals applied by a human.
+- **`evolve analyze` writes `runs/<run-id>/metrics.json`.** Wall clock, summed worker
+  seconds, parallel efficiency, critical path by summed duration, and per-slice
+  `idle_gap_seconds` — time lost to hand-ordering, which is the empirical case for or against
+  widening the graph. All derived from existing `status.json` timestamps; a slice without
+  `collected_at` reports `null`, never a fabricated `0`.
+- **TUI graph view.** `--graph` on `--once`, plus a live view keyed in the dashboard:
+  topological levels, live state glyphs from `workers[]`, dependency lines, `gate`/`human`
+  nodes marked not-dispatchable, and tier-3 drill-down into a node's run trace.
+- **pi as an ORCHESTRATOR.** `hooks/m2herd-session.pi.ts`, a pi `session_start` extension
+  that shells out to the existing `hooks/m2herd-session.sh` and injects its
+  `additionalContext` — one code path and one snapshot format for both harnesses, never a
+  reimplementation of the digest. Every failure mode (missing hook, timeout, non-zero exit,
+  unparseable output) degrades to "no snapshot"; a session with no `.m2herd/` spawns nothing
+  at all. Registered by `install.sh --pi`, selectable via `onboard.sh --orchestrator pi`.
 - **TUI startup reveal.** `m2herd-tui` now animates an `M2HERD` wordmark into place on
   launch, using one of seven randomly chosen effects (`typewriter`, `scanline`, `rain`,
   `fade`, `crt`, `glitch`, `dissolve`) rendered in half-block cells. The effect set and the
