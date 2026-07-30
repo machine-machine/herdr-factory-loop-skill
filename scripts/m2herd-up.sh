@@ -410,17 +410,31 @@ maybe_self() {
   [ "$1" = "$SELF" ]
 }
 
+# herdr may register a pane's cwd under a DIFFERENT path than the one we passed
+# when the home is bind-mounted or symlinked (observed on m2o desktops:
+# script passes /home/developer/.herdr/worktrees/…, herdr registers
+# /agent_home/home/developer/.herdr/worktrees/…). realpath cannot unify bind
+# mounts, so exact cwd equality is not enough. For WORKTREE paths the tail
+# ".herdr/worktrees/<repo>/<slug>" is unique fleet-wide — match on that suffix
+# as a fallback. Non-worktree paths get an empty suffix (suffix matching off).
+cwd_suffix() { # cwd_suffix <path> -> "/.herdr/worktrees/…" or ""
+  case "$1" in
+    */.herdr/worktrees/*) printf '/%s' "${1#*/.herdr/}" | sed 's|^/|/.herdr/|' ;;
+    *) printf '' ;;
+  esac
+}
+
 # Binding rule: the pane_id returned by `agent start` can be off by one — always
 # RE-RESOLVE by cwd from `herdr agent list` (prefer a name match when given).
 resolve_pane_by_cwd() { # resolve_pane_by_cwd <cwd> [name] -> pane_id (retries; list can lag)
-  local cwd="$1" name="${2:-}" pane=""
+  local cwd="$1" name="${2:-}" pane="" suf; suf="$(cwd_suffix "$cwd")"
   for _ in 1 2 3 4 5; do
     if [ -n "$name" ]; then
-      pane="$(herdr agent list 2>/dev/null | jq -r --arg c "$cwd" --arg n "$name" \
-        '[.result.agents[] | select(.cwd==$c and .name==$n)] | last | .pane_id // empty' 2>/dev/null || true)"
+      pane="$(herdr agent list 2>/dev/null | jq -r --arg c "$cwd" --arg suf "$suf" --arg n "$name" \
+        '[.result.agents[] | select((.cwd==$c or ($suf != "" and ((.cwd // "")|endswith($suf)))) and .name==$n)] | last | .pane_id // empty' 2>/dev/null || true)"
     fi
-    [ -n "$pane" ] || pane="$(herdr agent list 2>/dev/null | jq -r --arg c "$cwd" \
-      '[.result.agents[] | select(.cwd==$c)] | last | .pane_id // empty' 2>/dev/null || true)"
+    [ -n "$pane" ] || pane="$(herdr agent list 2>/dev/null | jq -r --arg c "$cwd" --arg suf "$suf" \
+      '[.result.agents[] | select(.cwd==$c or ($suf != "" and ((.cwd // "")|endswith($suf))))] | last | .pane_id // empty' 2>/dev/null || true)"
     [ -n "$pane" ] && break
     sleep 1
   done
@@ -471,12 +485,13 @@ worker_panes_in_tab() { # worker_panes_in_tab <tab_id> <orch_pane> -> pane ids, 
 }
 
 # Resolve a freshly-split pane by cwd from `herdr pane list` (retries; the list
-# can lag the split). A slice's worktree path is unique, so cwd pins the pane.
+# can lag the split). A slice's worktree path is unique, so cwd pins the pane —
+# matched suffix-aware (cwd_suffix) to survive bind-mounted/symlinked homes.
 resolve_pane_by_cwd_panes() { # resolve_pane_by_cwd_panes <cwd> -> pane_id
-  local cwd="$1" pane=""
+  local cwd="$1" pane="" suf; suf="$(cwd_suffix "$cwd")"
   for _ in 1 2 3 4 5; do
-    pane="$(herdr pane list 2>/dev/null | jq -r --arg c "$cwd" \
-      '[.result.panes[] | select(.cwd==$c)] | last | .pane_id // empty' 2>/dev/null || true)"
+    pane="$(herdr pane list 2>/dev/null | jq -r --arg c "$cwd" --arg suf "$suf" \
+      '[.result.panes[] | select(.cwd==$c or ($suf != "" and ((.cwd // "")|endswith($suf))))] | last | .pane_id // empty' 2>/dev/null || true)"
     [ -n "$pane" ] && break
     sleep 1
   done
@@ -1164,12 +1179,39 @@ dispatch_one() { # dispatch_one <slice>
     else
       ws="$(resolve_repo_ws)"
       [ -n "$ws" ] || { echo "cannot resolve or create workspace 'm2herd:$(basename "$REPO")' (herdr server up?)" >&2; exit 1; }
-      log "! orchestrator pane unresolved (pane='${orch_pane:-}' tab='${orch_tab:-}') — falling back to 'agent start --no-focus' in workspace $ws"
-      herdr agent start "$wname" --workspace "$ws" --cwd "$wt" --no-focus -- "$(command -v "$bin")" $flag >/dev/null 2>&1 || true
-      pane="$(resolve_pane_by_cwd "$wt" "$wname")"
-      [ -n "$pane" ] || { echo "worker pane never appeared in agent list (cwd $wt)" >&2; exit 1; }
-      is_self "$pane" && { echo "resolved worker pane is \$SELF ($pane) — refusing" >&2; exit 1; }
-      log "worker spawned (fallback): pane $pane ($wname) in workspace $ws"
+      # Prefer splitting an EXISTING pane of the target workspace: `agent start
+      # --workspace` is not honored by every herdr build (0.7.5 observed dropping
+      # each worker into a fresh workspace labeled after the agent name — the
+      # "new workspace, agent on the left" bug). A split can only land in the
+      # workspace that owns the split target, so it cannot stray.
+      local anchor
+      anchor="$(herdr pane list 2>/dev/null | jq -r --arg w "$ws" \
+        '[.result.panes[] | select(.workspace_id==$w)] | first | .pane_id // empty' 2>/dev/null || true)"
+      if [ -n "$anchor" ] && ! is_self "$anchor"; then
+        log "! orchestrator pane unresolved (pane='${orch_pane:-}' tab='${orch_tab:-}') — splitting anchor pane $anchor in workspace $ws"
+        herdr pane split "$anchor" --direction right --ratio 0.5 --cwd "$wt" --no-focus >/dev/null 2>&1 || true
+        pane="$(resolve_pane_by_cwd_panes "$wt")"
+        [ -n "$pane" ] || { echo "new worker pane never appeared in pane list (cwd $wt)" >&2; exit 1; }
+        is_self "$pane" && { echo "resolved worker pane is \$SELF ($pane) — refusing" >&2; exit 1; }
+        sleep 1   # let the fresh pane's shell come up before we launch the worker
+        herdr pane run "$pane" "$runcmd" >/dev/null 2>&1 || true
+        log "worker started (fallback split): pane $pane in workspace $ws"
+      else
+        log "! orchestrator pane unresolved and workspace $ws has no anchor pane — last resort 'agent start --no-focus'"
+        herdr agent start "$wname" --workspace "$ws" --cwd "$wt" --no-focus -- "$(command -v "$bin")" $flag >/dev/null 2>&1 || true
+        pane="$(resolve_pane_by_cwd "$wt" "$wname")"
+        [ -n "$pane" ] || { echo "worker pane never appeared in agent list (cwd $wt)" >&2; exit 1; }
+        is_self "$pane" && { echo "resolved worker pane is \$SELF ($pane) — refusing" >&2; exit 1; }
+        # Verify the pin actually held — herdr builds that ignore --workspace
+        # strand the worker in a fresh workspace; make that loud, not silent.
+        local actual_ws
+        actual_ws="$(herdr pane list 2>/dev/null | jq -r --arg p "$pane" \
+          '[.result.panes[] | select(.pane_id==$p)] | first | .workspace_id // empty' 2>/dev/null || true)"
+        if [ -n "$actual_ws" ] && [ "$actual_ws" != "$ws" ]; then
+          log "! WARNING: worker pane $pane landed in workspace $actual_ws, not $ws — this herdr build ignores 'agent start --workspace' (stray-workspace bug)"
+        fi
+        log "worker spawned (fallback): pane $pane ($wname) in workspace $ws"
+      fi
       sleep 2   # let the TUI boot before the pointer lands
     fi
   else
@@ -1196,7 +1238,7 @@ dispatch_one() { # dispatch_one <slice>
     else
       herdr pane split "$split_pane" --direction "$split_dir" --ratio 0.5 --cwd "$wt" --no-focus >/dev/null 2>&1 || true
       pane="$(resolve_pane_by_cwd_panes "$wt")"
-      [ -n "$pane" ] || { echo "new worker pane never appeared in pane list (cwd $wt)" >&2; exit 1; }
+      [ -n "$pane" ] || { echo "new worker pane never appeared in pane list (cwd $wt) — the split may have created an orphan agentless pane in tab $orch_tab; close it by hand" >&2; exit 1; }
       is_self "$pane" && { echo "resolved worker pane is \$SELF ($pane) — refusing" >&2; exit 1; }
       log "worker pane split beside orchestrator: $pane (split $split_pane --direction $split_dir @0.5)"
       sleep 1   # let the fresh pane's shell come up before we launch the worker
