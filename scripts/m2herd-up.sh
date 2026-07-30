@@ -410,17 +410,28 @@ maybe_self() {
   [ "$1" = "$SELF" ]
 }
 
+# herdr may report a pane's cwd through a container bind-mount prefix
+# (/agent_home/home/developer/… for /home/developer/…), so an exact string compare
+# against the path WE passed in silently finds nothing and dispatch dies with
+# "pane never appeared". Every cwd match therefore tests both spellings.
+cwd_alt() { # cwd_alt <path> -> the same path with the /agent_home prefix flipped
+  case "$1" in
+    /agent_home/*) printf '%s' "${1#/agent_home}" ;;
+    *)             printf '%s' "/agent_home$1" ;;
+  esac
+}
+
 # Binding rule: the pane_id returned by `agent start` can be off by one — always
 # RE-RESOLVE by cwd from `herdr agent list` (prefer a name match when given).
 resolve_pane_by_cwd() { # resolve_pane_by_cwd <cwd> [name] -> pane_id (retries; list can lag)
-  local cwd="$1" name="${2:-}" pane=""
+  local cwd="$1" name="${2:-}" pane="" alt; alt="$(cwd_alt "$cwd")"
   for _ in 1 2 3 4 5; do
     if [ -n "$name" ]; then
-      pane="$(herdr agent list 2>/dev/null | jq -r --arg c "$cwd" --arg n "$name" \
-        '[.result.agents[] | select(.cwd==$c and .name==$n)] | last | .pane_id // empty' 2>/dev/null || true)"
+      pane="$(herdr agent list 2>/dev/null | jq -r --arg c "$cwd" --arg c2 "$alt" --arg n "$name" \
+        '[.result.agents[] | select((.cwd==$c or .cwd==$c2) and .name==$n)] | last | .pane_id // empty' 2>/dev/null || true)"
     fi
-    [ -n "$pane" ] || pane="$(herdr agent list 2>/dev/null | jq -r --arg c "$cwd" \
-      '[.result.agents[] | select(.cwd==$c)] | last | .pane_id // empty' 2>/dev/null || true)"
+    [ -n "$pane" ] || pane="$(herdr agent list 2>/dev/null | jq -r --arg c "$cwd" --arg c2 "$alt" \
+      '[.result.agents[] | select(.cwd==$c or .cwd==$c2)] | last | .pane_id // empty' 2>/dev/null || true)"
     [ -n "$pane" ] && break
     sleep 1
   done
@@ -473,10 +484,10 @@ worker_panes_in_tab() { # worker_panes_in_tab <tab_id> <orch_pane> -> pane ids, 
 # Resolve a freshly-split pane by cwd from `herdr pane list` (retries; the list
 # can lag the split). A slice's worktree path is unique, so cwd pins the pane.
 resolve_pane_by_cwd_panes() { # resolve_pane_by_cwd_panes <cwd> -> pane_id
-  local cwd="$1" pane=""
+  local cwd="$1" pane="" alt; alt="$(cwd_alt "$cwd")"
   for _ in 1 2 3 4 5; do
-    pane="$(herdr pane list 2>/dev/null | jq -r --arg c "$cwd" \
-      '[.result.panes[] | select(.cwd==$c)] | last | .pane_id // empty' 2>/dev/null || true)"
+    pane="$(herdr pane list 2>/dev/null | jq -r --arg c "$cwd" --arg c2 "$alt" \
+      '[.result.panes[] | select(.cwd==$c or .cwd==$c2)] | last | .pane_id // empty' 2>/dev/null || true)"
     [ -n "$pane" ] && break
     sleep 1
   done
@@ -724,7 +735,15 @@ submit_pointer() { # submit_pointer <pane> <text>
     plan "herdr pane send-keys '$pane' Enter"
     return 0
   fi
-  herdr agent send "$pane" "$text" >/dev/null 2>&1 || true
+  # herdr renamed the text-injection verb: `agent send` is gone, `agent prompt`
+  # replaced it. The old call failed silently into /dev/null, so dispatch reported
+  # "pointer submitted" while the worker sat at an empty prompt. Try the verbs in
+  # order and keep the pane-level send-text as the last resort.
+  if herdr agent prompt "$pane" "$text" >/dev/null 2>&1 \
+     || herdr agent send "$pane" "$text" >/dev/null 2>&1 \
+     || herdr pane send-text "$pane" "$text" >/dev/null 2>&1; then :; else
+    log "! pointer injection failed on pane $pane (no working herdr verb) — check the pane by hand"
+  fi
   sleep "$SUBMIT_SETTLE"
   herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
 }
