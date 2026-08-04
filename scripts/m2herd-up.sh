@@ -734,12 +734,22 @@ submit_pointer() { # submit_pointer <pane> <text>
   local pane="$1" text="$2"
   is_self "$pane" && { log "! refusing to send to \$SELF pane $pane"; return 0; }
   if [ "$DRY_RUN" -eq 1 ]; then
-    plan "herdr agent send '$pane' \"$text\""
+    plan "herdr agent prompt '$pane' \"$text\"   # falls back to: agent send, pane send-text"
     plan "sleep $SUBMIT_SETTLE   # settle so the Enter doesn't race the text injection"
     plan "herdr pane send-keys '$pane' Enter"
     return 0
   fi
-  herdr agent send "$pane" "$text" >/dev/null 2>&1 || true
+  # herdr renamed the text-injection verb: `agent send` is gone, `agent prompt` replaced
+  # it. The old call swallowed its own failure into /dev/null with `|| true`, so dispatch
+  # logged "pointer submitted" while the worker sat at an empty prompt — three separate
+  # sessions lost a wave to this before anyone read a pane. Try the verbs in order, and
+  # say so loudly when none of them works instead of failing silently.
+  if herdr agent prompt "$pane" "$text" >/dev/null 2>&1 \
+     || herdr agent send "$pane" "$text" >/dev/null 2>&1 \
+     || herdr pane send-text "$pane" "$text" >/dev/null 2>&1; then :; else
+    log "! pointer injection failed on pane $pane — no herdr verb accepted it (tried agent prompt, agent send, pane send-text)"
+    return 1
+  fi
   sleep "$SUBMIT_SETTLE"
   herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
 }
@@ -773,32 +783,48 @@ verify_submission() { # verify_submission <pane> <pointer-text>
   local pane="$1" text="$2" frag norm status try
   is_self "$pane" && return 0
   if [ "$DRY_RUN" -eq 1 ]; then
-    plan "verify submission: wait settle, re-read pane '$pane'; pointer still unsubmitted → re-send Enter (up to 2x); input empty + status working → ok"
+    plan "verify submission: wait settle, re-read pane '$pane'; pointer visible → re-send Enter (up to 2x); agent working/done → ok; input empty AND agent idle → FAIL (never injected)"
     return 0
   fi
   frag="$(printf '%.60s' "$text" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
   for try in 1 2 3; do
     sleep "$SUBMIT_SETTLE"
     status="$(agent_status_of "$pane")"
-    if [ "$status" = "working" ]; then
-      log "dispatch: pointer submitted (agent working)"
-      return 0
-    fi
+    # Receipt is proven by the AGENT MOVING, never by the input box being empty.
+    case "$status" in
+      working|done|blocked)
+        log "dispatch: pointer submitted (agent $status)"
+        return 0 ;;
+    esac
     norm="$(pane_norm_text "$pane" 60)"
     case "$norm" in
       *"$frag"*)
+        # Text is sitting in the input: injected but not submitted. Enter fixes it.
         if [ "$try" -le 2 ]; then
           log "dispatch: pointer still unsubmitted in pane $pane (status $status) — re-sending Enter ($try/2)"
           herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
         else
           log "! dispatch: pointer may still be unsubmitted in pane $pane after 2 Enter re-sends — check the pane"
-          return 0
+          return 1
         fi ;;
       *)
-        log "dispatch: pane input clear (status $status) — pointer submitted"
-        return 0 ;;
+        # Empty input AND the agent has not moved. This used to be reported as
+        # "pane input clear — pointer submitted", which is precisely backwards:
+        # an empty input is what you see when the injection never landed at all.
+        # It cost three sessions a full wave of workers, each sitting at an empty
+        # prompt while dispatch claimed success. Retry, then fail loudly.
+        if [ "$try" -le 2 ]; then
+          log "dispatch: pane $pane empty and agent $status — retrying pointer injection ($try/2)"
+          submit_pointer "$pane" "$text" || true
+        else
+          log "! dispatch: pointer NEVER REACHED pane $pane (input empty, agent still $status after $try tries)."
+          log "! the worker is idle at an empty prompt — re-send by hand:"
+          log "!   herdr agent prompt $pane \"<pointer>\""
+          return 1
+        fi ;;
     esac
   done
+  return 1
 }
 
 # ---------- up: workspace bootstrap -------------------------------------------
@@ -1258,12 +1284,23 @@ dispatch_one() { # dispatch_one <slice>
   local wtask2 pointer
   wtask2="$(copy_task_into_wt "$wt")"
   pointer="$(confinement_line "$wt" "$branch") Read $wtask2 and follow its instructions exactly.$(lessons_pointer_suffix)"
-  submit_pointer "$pane" "$pointer"
-  verify_submission "$pane" "$pointer"
+  local dispatch_state="spawned"
+  submit_pointer "$pane" "$pointer" || true
+  # The recorded state must match what actually happened. Recording "spawned" for a
+  # worker that never received its pointer is how three sessions came back to a fabric
+  # claiming a wave was running while every pane sat idle at an empty prompt.
+  if ! verify_submission "$pane" "$pointer"; then
+    dispatch_state="spawned-no-pointer"
+  fi
 
   # 4. record in overview.json workers[]
-  record_worker "$SLICE" "$pane" "$wt" "$branch" "spawned"
+  record_worker "$SLICE" "$pane" "$wt" "$branch" "$dispatch_state"
   trace_dispatch_write "$SLICE" "pane" "" "$branch" "$wt" || true
+  if [ "$dispatch_state" = "spawned-no-pointer" ]; then
+    log "! dispatch: $SLICE recorded as state=spawned-no-pointer — the pane is up but IDLE and has no task."
+    log "! nothing is running for this slice until the pointer is re-sent."
+    return 1
+  fi
   log "dispatch: done — $SLICE recorded in overview.json (state=spawned)"
 }
 
