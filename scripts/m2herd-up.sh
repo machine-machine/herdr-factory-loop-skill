@@ -15,7 +15,7 @@
 #                                                   #   auto-kick path where the calling Claude Code session IS the orchestrator
 #   m2herd-up.sh room     [--repo P]                # ensure the machineroom pane AND (re)start its viewer fresh — guarantees the pane
 #                                                   #   runs the latest TUI/engine and shows live data (up alone assumes a running viewer)
-#   m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor|opencode]
+#   m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor|opencode|pi|prime]
 #                         [--runner pane|headless] [--headless [--model M]]
 #                                                   # worktree wip/m2herd-<S> off BASE (default: workers.base, else current branch), spawn worker,
 #                                                   # file-protocol dispatch of .m2herd/dispatch/S.task.md, record in overview.json workers[]
@@ -247,7 +247,7 @@ settings_get() { # settings_get <jq-path> <default>
 }
 
 valid_agent() {
-  case "$1" in claude|codex|cursor|opencode|pi) return 0 ;; *) return 1 ;; esac
+  case "$1" in claude|codex|cursor|opencode|pi|prime) return 0 ;; *) return 1 ;; esac
 }
 
 valid_runner() {
@@ -300,7 +300,7 @@ resolve_dispatch_settings() {
   fi
 
   if [ "$AGENT_EXPLICIT" -eq 1 ]; then
-    valid_agent "$AGENT" || { echo "invalid --agent '$AGENT' (expected claude|codex|cursor|opencode)" >&2; exit 2; }
+    valid_agent "$AGENT" || { echo "invalid --agent '$AGENT' (expected claude|codex|cursor|opencode|pi|prime)" >&2; exit 2; }
     AGENT_SOURCE="cli"
   elif [ -n "$route_agent" ]; then
     AGENT="$route_agent"; AGENT_SOURCE="routing: $route_pattern"
@@ -508,6 +508,10 @@ worker_argv() {
     # project-local files for the run. Without it an interactive pi stops on the
     # project-trust prompt in a fresh worktree and the worker never starts.
     pi)     printf '%s\t%s\n' "pi" "-a" ;;
+    # prime-agent (Prime Intellect) has no per-tool approval gate at all — tools
+    # run by default, so no auto-approve flag is needed. Binary name differs from
+    # the agent key. No herdr integration exists yet: pane lifecycle is heuristic.
+    prime)  printf '%s\t%s\n' "prime-agent" "" ;;
     *) printf '%s\t%s\n' "$1" "" ;;
   esac
 }
@@ -1055,8 +1059,8 @@ dispatch_one() { # dispatch_one <slice>
     # verified 2026-07-02: `claude -p` works on the Max plan (usage JSON incl. costUSD);
     # codex exec / opencode run are the non-Anthropic fallbacks. cursor has no headless mode.
     case "$AGENT" in
-      claude|codex|opencode|pi) : ;;
-      *) echo "--headless supports --agent claude|codex|opencode|pi (cursor has no headless mode)" >&2; exit 2 ;;
+      claude|codex|opencode|pi|prime) : ;;
+      *) echo "--headless supports --agent claude|codex|opencode|pi|prime (cursor has no headless mode)" >&2; exit 2 ;;
     esac
   fi
 
@@ -1124,6 +1128,12 @@ dispatch_one() { # dispatch_one <slice>
         hsession="$(gen_uuid)"
         [ -n "$hsession" ] || log "! no uuid source (uuidgen//proc/python3) — dispatching WITHOUT --session-id; watch cannot resume this worker"
         ;;
+      prime)
+        # prime-agent has no pre-set session id, but `--session-dir <dir>` pins where
+        # the session lands; a per-slice dir under gitignored .m2herd/ gives an exact
+        # resume target (`-c --session-dir <dir>`) without dirtying the worktree.
+        hsession="$REPO/.m2herd/dispatch/$SLICE.prime-session"
+        ;;
     esac
     if [ "$DRY_RUN" -eq 1 ]; then
       case "$AGENT" in
@@ -1131,6 +1141,7 @@ dispatch_one() { # dispatch_one <slice>
         codex)    plan "cd '$wt' && nohup codex exec --dangerously-bypass-approvals-and-sandbox '<pointer>' > '$lg' 2> '$errlg' &   # resume story: codex exec resume --last (cwd-filtered)" ;;
         opencode) plan "cd '$wt' && nohup opencode run '<pointer>' > '$lg' 2> '$errlg' &   # no resume story" ;;
         pi)       plan "cd '$wt' && nohup pi -p -a ${hsession:+--session-id '$hsession' }${MODEL:+--model '$MODEL' }--mode json '<pointer>' > '$lg' 2> '$errlg' &   # resume story: pi -p --session-id '$hsession'" ;;
+        prime)    plan "cd '$wt' && nohup prime-agent -p --session-dir '$hsession' ${MODEL:+--model '$MODEL' }'<pointer>' > '$lg' 2> '$errlg' &   # resume story: prime-agent -p -c --session-dir '$hsession'" ;;
       esac
       plan "record pid + its start-time/comm (ps -o lstart=/-o comm=) so collect can verify the pid was not recycled"
       record_worker "$SLICE" "-" "$wt" "$branch" "spawned" "headless" "$MODEL" "" "" "" "$hsession"
@@ -1155,6 +1166,12 @@ dispatch_one() { # dispatch_one <slice>
         else
           ( cd "$wt" && nohup pi -p -a ${MODEL:+--model "$MODEL"} --mode json "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
         fi ;;
+      prime)
+        # plain text mode (not --mode json): the salvage fallback tails the log, and
+        # prime's JSONL event schema is not depended on anywhere yet. MODEL is only
+        # passed when explicitly set — prime resolves its own provider default.
+        mkdir -p "$hsession" 2>/dev/null || true
+        ( cd "$wt" && nohup prime-agent -p --session-dir "$hsession" ${MODEL:+--model "$MODEL"} "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
     esac
     hpid="$(cat "$lg.pid" 2>/dev/null || true)"; rm -f "$lg.pid"
     [ -n "$hpid" ] || { echo "headless spawn failed (no pid) — see $lg / $errlg" >&2; exit 1; }
@@ -2134,6 +2151,7 @@ headless_resume() { # headless_resume <slice> <signature> <session> — sets WAT
       claude) plan "cd '$wt' && nohup claude -p --resume '$sess' '$HEADLESS_RESUME_PROMPT' ${wmodel:+--model '$wmodel' }--dangerously-skip-permissions --output-format json > '$lg' 2> '$errlg' &" ;;
       codex)  plan "cd '$wt' && nohup codex exec --dangerously-bypass-approvals-and-sandbox resume --last '$HEADLESS_RESUME_PROMPT' > '$lg' 2> '$errlg' &   # cwd filter pins --last to this worktree" ;;
       pi)     plan "cd '$wt' && nohup pi -p -a --session-id '$sess' ${wmodel:+--model '$wmodel' }--mode json '$HEADLESS_RESUME_PROMPT' > '$lg' 2> '$errlg' &   # --session-id resumes the exact recorded session" ;;
+      prime)  plan "cd '$wt' && nohup prime-agent -p -c --session-dir '$sess' ${wmodel:+--model '$wmodel' }'$HEADLESS_RESUME_PROMPT' > '$lg' 2> '$errlg' &   # -c continues the only session in the per-slice dir" ;;
     esac
     plan "record new pid + start-time/comm in workers[] (state=working)"
     WATCH_TOKEN="$s=working/$sig:resumed$((n + 1))"
@@ -2154,6 +2172,10 @@ headless_resume() { # headless_resume <slice> <signature> <session> — sets WAT
       # `--session-id <id>` is exact-id resume (and would create the id if it were
       # missing) — the same uuid dispatch recorded in workers[].session.
       ( cd "$wt" && nohup pi -p -a --session-id "$sess" ${wmodel:+--model "$wmodel"} --mode json "$HEADLESS_RESUME_PROMPT" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
+    prime)
+      # workers[].session holds the per-slice --session-dir; `-c` continues the
+      # most recent (= only) session saved there.
+      ( cd "$wt" && nohup prime-agent -p -c --session-dir "$sess" ${wmodel:+--model "$wmodel"} "$HEADLESS_RESUME_PROMPT" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
     *)
       watch_fail "$s" "worker_crash" "headless '$sig' — agent $wagent has no resume story"
       WATCH_TOKEN="$s=failed/$sig:no-resume-story"
