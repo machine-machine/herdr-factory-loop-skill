@@ -279,7 +279,7 @@ m2herd selftest                           # tmpdir end-to-end with jq asserts
 ### m2herd-up — workspace + worker dispatch
 ```
 m2herd-up up       [--repo P] [--goal "…"] [--room-only]
-m2herd-up dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor|opencode]
+m2herd-up dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor|opencode|pi|prime]
                    [--runner pane|headless] [--headless [--model M]]
 m2herd-up collect  --slice S [--repo P]
 m2herd-up down     [--slice S | --all] [--repo P] [--force]

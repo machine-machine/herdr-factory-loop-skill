@@ -4,6 +4,28 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.0] - 2026-08-07
+
+Adds **Prime Agent** (Prime Intellect's open-source harness) to the worker selection.
+
+### Added
+- **`prime` worker agent** across the factory: `m2herd-up dispatch --agent prime`
+  (pane + `--headless`), settings routing, and the §9.1 worker table. Binary
+  `prime-agent` (Node ≥ 20.6, `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh`);
+  no auto-approve flag needed — prime has no per-tool approval gate. Headless runs
+  `prime-agent -p --session-dir <.m2herd/dispatch/<slice>.prime-session>` (plain text
+  mode; salvage falls back to the log tail; `--model` only passed when explicitly
+  set — prime resolves its own provider default). Resume story: `watch` respawns with
+  `-p -c --session-dir <same>`, continuing the per-slice session. Token/cost parsing
+  intentionally absent until prime's usage schema is verified — "no cost recorded"
+  stays distinct from "free".
+- **goal_support.md**: prime row — launch-time `--goal <objective>` + `--autonomous`
+  gates; no verified in-TUI `/goal` slash command (fleet-loop re-nudges on idle).
+
+### Notes
+- No herdr integration for prime exists yet — pane lifecycle detection is heuristic;
+  prefer `--headless` for prime workers until one lands.
+
 ## [2.7.2] - 2026-07-30
 
 Adds `pi` as a first-class m2herd worker agent, and unblocks the first dispatch of any wave.

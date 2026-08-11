@@ -26,6 +26,7 @@ It only does this for agents whose `/goal` is supported (below / `_config/goal_s
 | claude  | ✅ | Claude Code `/goal` slash command → session Stop hook (auto-clears when met) | arm `/goal`, re-arm on idle |
 | codex   | ✅ | Codex goal/Stop equivalent | arm `/goal`, re-arm on idle |
 | cursor  | ❌ | no standing-goal hook | re-nudge each tick (resend "continue your mission") |
+| prime   | ✅* | launch-time `--goal <objective>` flag (+ `--autonomous` gates headless); no verified in-TUI `/goal` slash command | pass `--goal` at launch; re-nudge on idle |
 | opencode / others | ❌ | varies | re-nudge each tick |
 
 Override per fleet in `_config/goal_support.txt` (`<agent> <yes|no>`). When in doubt, mark an

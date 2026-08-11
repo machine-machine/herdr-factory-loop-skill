@@ -185,7 +185,7 @@ settings_effective_json() {
 }
 
 settings_validate_agent() {
-  case "$2" in claude|codex|cursor|opencode|pi) return 0 ;; esac
+  case "$2" in claude|codex|cursor|opencode|pi|prime) return 0 ;; esac
   echo "config set: $1 must be one of: claude, codex, cursor, opencode, pi" >&2; exit 2
 }
 settings_validate_runner() {
