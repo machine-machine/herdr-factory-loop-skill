@@ -15,7 +15,7 @@
 #                                                   #   auto-kick path where the calling Claude Code session IS the orchestrator
 #   m2herd-up.sh room     [--repo P]                # ensure the machineroom pane AND (re)start its viewer fresh — guarantees the pane
 #                                                   #   runs the latest TUI/engine and shows live data (up alone assumes a running viewer)
-#   m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor|opencode|pi|prime]
+#   m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor|opencode|pi|prime|zcode]
 #                         [--runner pane|headless] [--headless [--model M]]
 #                                                   # worktree wip/m2herd-<S> off BASE (default: workers.base, else current branch), spawn worker,
 #                                                   # file-protocol dispatch of .m2herd/dispatch/S.task.md, record in overview.json workers[]
@@ -247,7 +247,7 @@ settings_get() { # settings_get <jq-path> <default>
 }
 
 valid_agent() {
-  case "$1" in claude|codex|cursor|opencode|pi|prime) return 0 ;; *) return 1 ;; esac
+  case "$1" in claude|codex|cursor|opencode|pi|prime|zcode) return 0 ;; *) return 1 ;; esac
 }
 
 valid_runner() {
@@ -300,7 +300,7 @@ resolve_dispatch_settings() {
   fi
 
   if [ "$AGENT_EXPLICIT" -eq 1 ]; then
-    valid_agent "$AGENT" || { echo "invalid --agent '$AGENT' (expected claude|codex|cursor|opencode|pi|prime)" >&2; exit 2; }
+    valid_agent "$AGENT" || { echo "invalid --agent '$AGENT' (expected claude|codex|cursor|opencode|pi|prime|zcode)" >&2; exit 2; }
     AGENT_SOURCE="cli"
   elif [ -n "$route_agent" ]; then
     AGENT="$route_agent"; AGENT_SOURCE="routing: $route_pattern"
@@ -512,8 +512,90 @@ worker_argv() {
     # run by default, so no auto-approve flag is needed. Binary name differs from
     # the agent key. No herdr integration exists yet: pane lifecycle is heuristic.
     prime)  printf '%s\t%s\n' "prime-agent" "" ;;
+    # zcode = GLM (z.ai) behind the claude BINARY. z.ai ships no CLI of its own
+    # (ZCode is a desktop app); the documented terminal path for a GLM Coding Plan
+    # is Claude Code pointed at z.ai's Anthropic-compatible endpoint through env
+    # vars (see zai_env_write). Same binary and auto-approve flag as claude, so the
+    # whole claude plumbing — session resume, JSON envelope, usage parsing, and the
+    # herdr claude integration's authoritative pane lifecycle — works unchanged.
+    zcode)  printf '%s\t%s\n' "claude" "--dangerously-skip-permissions" ;;
     *) printf '%s\t%s\n' "$1" "" ;;
   esac
+}
+
+# ---------- zcode (z.ai GLM Coding Plan) credentials --------------------------
+# The key lives in ONE file, never in argv/ps (workers SOURCE it), never in
+# overview.json, never echoed back. Default ~/.config/m2herd/zai.env; override
+# with $M2HERD_ZAI_ENV. Plain env-file format, so both the pane runner (a shell)
+# and the headless runner (a subshell) can `set -a; . "$f"; set +a`.
+zai_env_file() { printf '%s' "${M2HERD_ZAI_ENV:-$HOME/.config/m2herd/zai.env}"; }
+
+# Write the env file from a key. Model mapping per z.ai's docs: the claude binary
+# asks for the sonnet/opus tier, the endpoint maps that name to a GLM model — so
+# `--model sonnet` (m2herd's headless default) resolves to GLM-5.3.
+zai_env_write() { # zai_env_write <key>
+  local f; f="$(zai_env_file)"
+  mkdir -p "$(dirname "$f")" || return 1
+  ( umask 077; cat > "$f" <<EOF
+# m2herd zcode worker — z.ai GLM Coding Plan credentials for the claude binary.
+# Written by m2herd-up. Key from https://z.ai/manage-apikey/apikey-list
+# Sourced by zcode workers only; never committed, never printed.
+ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic
+ANTHROPIC_AUTH_TOKEN=$1
+ANTHROPIC_DEFAULT_SONNET_MODEL=${M2HERD_ZAI_MODEL:-glm-5.3[1m]}
+ANTHROPIC_DEFAULT_OPUS_MODEL=${M2HERD_ZAI_MODEL:-glm-5.3[1m]}
+ANTHROPIC_DEFAULT_HAIKU_MODEL=${M2HERD_ZAI_HAIKU_MODEL:-glm-4.7}
+API_TIMEOUT_MS=3000000
+CLAUDE_CODE_AUTO_COMPACT_WINDOW=1000000
+EOF
+  ) || return 1
+  chmod 600 "$f" 2>/dev/null || true
+}
+
+# First-run provisioning. Order: existing file → $ZAI_API_KEY from the environment
+# → interactive silent prompt (TTY only). Non-interactive runs (cron, scripted
+# dispatch) never hang: they fail with the exact command that fixes it.
+ensure_zai_key() {
+  local f key; f="$(zai_env_file)"
+  if [ -s "$f" ] && grep -q '^ANTHROPIC_AUTH_TOKEN=..*' "$f" 2>/dev/null; then
+    return 0
+  fi
+  if [ -n "${ZAI_API_KEY:-}" ]; then
+    zai_env_write "$ZAI_API_KEY" || { echo "could not write $f" >&2; return 1; }
+    log "zcode: wrote $f from \$ZAI_API_KEY (mode 600)"
+    return 0
+  fi
+  if [ ! -t 0 ] || [ ! -t 2 ] || [ ! -r /dev/tty ]; then
+    cat >&2 <<EOF
+zcode worker needs a z.ai GLM Coding Plan key and this run is not interactive.
+Provide it once, either way:
+  ZAI_API_KEY=<key> m2herd-up dispatch --slice <S> --agent zcode …
+  # or run any zcode dispatch from a terminal and paste the key when prompted
+Key: https://z.ai/manage-apikey/apikey-list   Stored at: $f (mode 600)
+EOF
+    return 1
+  fi
+  printf 'zcode worker: no z.ai key yet.\n' >&2
+  printf 'Get one at https://z.ai/manage-apikey/apikey-list (GLM Coding Plan).\n' >&2
+  printf 'It is stored in %s (mode 600) and reused by every later zcode worker.\n' "$f" >&2
+  printf 'z.ai API key (input hidden): ' >&2
+  IFS= read -r -s key < /dev/tty || { printf '\n' >&2; echo "no key read" >&2; return 1; }
+  printf '\n' >&2
+  case "$key" in
+    '') echo "empty key — aborting" >&2; return 1 ;;
+    *[![:print:]]*) echo "key contains non-printable characters — aborting" >&2; return 1 ;;
+  esac
+  zai_env_write "$key" || { echo "could not write $f" >&2; return 1; }
+  key=""
+  log "zcode: key stored in $f (mode 600)"
+}
+
+# Shell prefix that loads the zcode env for a spawned worker; empty for every
+# other agent. SOURCING (not `env KEY=…`) keeps the secret out of argv/ps and out
+# of the pane's visible command line — only the file path is ever displayed.
+zcode_env_prefix() { # zcode_env_prefix <agent> -> "set -a; . <f>; set +a; " | ""
+  [ "$1" = "zcode" ] || { printf ''; return 0; }
+  printf 'set -a; . %s; set +a; ' "$(printf '%q' "$(zai_env_file)")"
 }
 
 # ---------- overview.json writers (always rewrite the whole file with jq) -----
@@ -1033,10 +1115,13 @@ dispatch_one() { # dispatch_one <slice>
   resolve_dispatch_settings
   [ -n "$BASE" ] || BASE="$(git -C "$REPO" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
   local branch="wip/m2herd-$SLICE" task="$REPO/.m2herd/dispatch/$SLICE.task.md"
-  # "sonnet" is a claude-only default: codex/opencode/pi resolve their own default
-  # model, and passing an Anthropic name to pi (default provider google) would
-  # either fuzzy-match something unintended or fail outright.
-  if [ "$HEADLESS" -eq 1 ] && [ -z "$MODEL" ] && [ "$AGENT" = "claude" ]; then
+  # "sonnet" is a claude-binary default: codex/opencode/pi/prime resolve their own
+  # default model, and passing an Anthropic name to pi (default provider google)
+  # would either fuzzy-match something unintended or fail outright. zcode shares it
+  # BECAUSE it runs the claude binary: the z.ai endpoint maps the sonnet tier to
+  # GLM-5.3 (ANTHROPIC_DEFAULT_SONNET_MODEL in the env file), so "sonnet" here means
+  # "the plan's main coding model", not an Anthropic one.
+  if [ "$HEADLESS" -eq 1 ] && [ -z "$MODEL" ] && { [ "$AGENT" = "claude" ] || [ "$AGENT" = "zcode" ]; }; then
     MODEL="sonnet"
     MODEL_SOURCE="headless default"
   fi
@@ -1059,14 +1144,20 @@ dispatch_one() { # dispatch_one <slice>
     # verified 2026-07-02: `claude -p` works on the Max plan (usage JSON incl. costUSD);
     # codex exec / opencode run are the non-Anthropic fallbacks. cursor has no headless mode.
     case "$AGENT" in
-      claude|codex|opencode|pi|prime) : ;;
-      *) echo "--headless supports --agent claude|codex|opencode|pi|prime (cursor has no headless mode)" >&2; exit 2 ;;
+      claude|codex|opencode|pi|prime|zcode) : ;;
+      *) echo "--headless supports --agent claude|codex|opencode|pi|prime|zcode (cursor has no headless mode)" >&2; exit 2 ;;
     esac
   fi
 
   local av bin flag; av="$(worker_argv "$AGENT")"; bin="${av%%$'\t'*}"; flag="${av##*$'\t'}"
   if [ "$DRY_RUN" -eq 0 ] && ! command -v "$bin" >/dev/null 2>&1; then
     echo "worker binary '$bin' not on PATH" >&2; exit 1
+  fi
+
+  # zcode: make sure the z.ai key exists BEFORE a worktree/pane is created —
+  # first run prompts for it once, later runs reuse the stored file.
+  if [ "$AGENT" = "zcode" ] && [ "$DRY_RUN" -eq 0 ]; then
+    ensure_zai_key || exit 1
   fi
 
   # 1. isolated worktree off BASE
@@ -1117,7 +1208,7 @@ dispatch_one() { # dispatch_one <slice>
     # opencode: no resume flag in `opencode run` — session stays empty (no resume).
     local hsession=""
     case "$AGENT" in
-      claude)
+      claude|zcode)
         hsession="$(gen_uuid)"
         [ -n "$hsession" ] || log "! no uuid source (uuidgen//proc/python3) — dispatching WITHOUT --session-id; watch cannot resume this worker"
         ;;
@@ -1142,6 +1233,7 @@ dispatch_one() { # dispatch_one <slice>
         opencode) plan "cd '$wt' && nohup opencode run '<pointer>' > '$lg' 2> '$errlg' &   # no resume story" ;;
         pi)       plan "cd '$wt' && nohup pi -p -a ${hsession:+--session-id '$hsession' }${MODEL:+--model '$MODEL' }--mode json '<pointer>' > '$lg' 2> '$errlg' &   # resume story: pi -p --session-id '$hsession'" ;;
         prime)    plan "cd '$wt' && nohup prime-agent -p --session-dir '$hsession' ${MODEL:+--model '$MODEL' }'<pointer>' > '$lg' 2> '$errlg' &   # resume story: prime-agent -p -c --session-dir '$hsession'" ;;
+        zcode)    plan "cd '$wt' && set -a; . '$(zai_env_file)'; set +a; nohup claude -p '<pointer>' ${hsession:+--session-id '$hsession' }--model '$MODEL' --dangerously-skip-permissions --output-format json > '$lg' 2> '$errlg' &   # GLM via z.ai; env file sourced so the key never enters argv" ;;
       esac
       plan "record pid + its start-time/comm (ps -o lstart=/-o comm=) so collect can verify the pid was not recycled"
       record_worker "$SLICE" "-" "$wt" "$branch" "spawned" "headless" "$MODEL" "" "" "" "$hsession"
@@ -1155,6 +1247,16 @@ dispatch_one() { # dispatch_one <slice>
           ( cd "$wt" && nohup claude -p "$hprompt" --session-id "$hsession" --model "$MODEL" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
         else
           ( cd "$wt" && nohup claude -p "$hprompt" --model "$MODEL" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
+        fi ;;
+      zcode)
+        # Same binary/flags as claude; the ONLY difference is the sourced env file
+        # that repoints the endpoint at z.ai and maps the sonnet tier to GLM-5.3.
+        # Sourcing happens inside the subshell, so the key never reaches argv/ps
+        # and never leaks into this process's environment.
+        if [ -n "$hsession" ]; then
+          ( cd "$wt" && set -a && . "$(zai_env_file)" && set +a && nohup claude -p "$hprompt" --session-id "$hsession" --model "$MODEL" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
+        else
+          ( cd "$wt" && set -a && . "$(zai_env_file)" && set +a && nohup claude -p "$hprompt" --model "$MODEL" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
         fi ;;
       codex)    ( cd "$wt" && nohup codex exec --dangerously-bypass-approvals-and-sandbox "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
       opencode) ( cd "$wt" && nohup opencode run "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
@@ -1191,7 +1293,10 @@ dispatch_one() { # dispatch_one <slice>
   #     bottom-right 25%; each further worker halves the LAST worker pane. We drive
   #     this with `herdr pane split` — NOT `agent start --split` (stray-pane bug).
   inside_herdr || warn_not_in_herdr " …or use --headless"
-  local wname="$AGENT-m2herd-$SLICE" pane runcmd="$bin${flag:+ $flag}"
+  # zcode prefixes the command with `set -a; . <env file>; set +a;` so the pane's
+  # claude picks up the z.ai endpoint. Only the PATH is visible in the pane.
+  local wname="$AGENT-m2herd-$SLICE" pane runcmd
+  runcmd="$(zcode_env_prefix "$AGENT")$bin${flag:+ $flag}"
   local orch_pane orch_tab last_worker split_pane split_dir
   orch_pane="$(resolve_orch_pane)"
   orch_tab=""
@@ -1216,7 +1321,11 @@ dispatch_one() { # dispatch_one <slice>
     if [ "$DRY_RUN" -eq 1 ]; then
       log "! orchestrator pane unresolved (pane='${orch_pane:-}' tab='${orch_tab:-}') — falling back to 'agent start --no-focus'"
       plan "resolve/create workspace by label 'm2herd:$(basename "$REPO")' (herdr workspace list/create)"
-      plan "herdr agent start '$wname' --workspace '<ws>' --cwd '$wt' --no-focus -- \"\$(command -v $bin)\" $flag"
+      if [ "$AGENT" = "zcode" ]; then
+        plan "herdr agent start '$wname' --workspace '<ws>' --cwd '$wt' --no-focus -- /bin/bash -lc '$runcmd'   # shell wrapper so the z.ai env file is sourced (key never in argv)"
+      else
+        plan "herdr agent start '$wname' --workspace '<ws>' --cwd '$wt' --no-focus -- \"\$(command -v $bin)\" $flag"
+      fi
       plan "re-resolve worker pane by cwd from 'herdr agent list' (returned pane_id can be off by one)"
       pane="PANE-DRYRUN"
     else
@@ -1241,7 +1350,16 @@ dispatch_one() { # dispatch_one <slice>
         log "worker started (fallback split): pane $pane in workspace $ws"
       else
         log "! orchestrator pane unresolved and workspace $ws has no anchor pane — last resort 'agent start --no-focus'"
-        herdr agent start "$wname" --workspace "$ws" --cwd "$wt" --no-focus -- "$(command -v "$bin")" $flag >/dev/null 2>&1 || true
+        if [ "$AGENT" = "zcode" ]; then
+          # `agent start` execs the binary directly, which would bypass the z.ai env
+          # and silently run the worker against Anthropic instead. Wrap it in a shell
+          # that sources the env file first. NOT `--env KEY=VALUE`: that would put the
+          # key in this process's argv (visible in ps).
+          herdr agent start "$wname" --workspace "$ws" --cwd "$wt" --no-focus -- \
+            /bin/bash -lc "$runcmd" >/dev/null 2>&1 || true
+        else
+          herdr agent start "$wname" --workspace "$ws" --cwd "$wt" --no-focus -- "$(command -v "$bin")" $flag >/dev/null 2>&1 || true
+        fi
         pane="$(resolve_pane_by_cwd "$wt" "$wname")"
         [ -n "$pane" ] || { echo "worker pane never appeared in agent list (cwd $wt)" >&2; exit 1; }
         is_self "$pane" && { echo "resolved worker pane is \$SELF ($pane) — refusing" >&2; exit 1; }
@@ -1775,7 +1893,7 @@ collect() {
       # worker didn't write its report file — salvage per agent: claude logs a
       # JSON envelope (.result), codex/opencode/anything else log plain text
       case "$wagent" in
-        claude) jq -r '.result // empty' "$lg" > "$out" 2>/dev/null || true ;;
+        claude|zcode) jq -r '.result // empty' "$lg" > "$out" 2>/dev/null || true ;;
         # pi --mode json is JSONL, one event per line: the final assistant text
         # is the last text block of the agent_end event.
         pi)     jq -rs 'map(select(.type=="agent_end")) | last | .messages // [] | map(select(.role=="assistant")) | last | .content // [] | map(select(.type=="text") | .text) | join("\n")' "$lg" > "$out" 2>/dev/null || true ;;
@@ -1784,7 +1902,7 @@ collect() {
     fi
     [ -s "$out" ] || { echo "headless worker $SLICE produced no report ($out empty; see $lg and $errlg)" >&2; set_worker_state "$SLICE" "failed"; trace_collect_write "$SLICE" "failed" "" "" || true; exit 1; }
     local tok="" cost=""
-    if [ "$wagent" = "claude" ] && [ -s "$lg" ] && jq -e . "$lg" >/dev/null 2>&1; then
+    if { [ "$wagent" = "claude" ] || [ "$wagent" = "zcode" ]; } && [ -s "$lg" ] && jq -e . "$lg" >/dev/null 2>&1; then
       tok="$(jq -r '[.modelUsage[]?.outputTokens] | add // empty' "$lg" 2>/dev/null || true)"
       cost="$(jq -r '[.modelUsage[]?.costUSD] | add // empty' "$lg" 2>/dev/null || true)"
     elif [ "$wagent" = "pi" ] && [ -s "$lg" ]; then
@@ -2152,6 +2270,7 @@ headless_resume() { # headless_resume <slice> <signature> <session> — sets WAT
       codex)  plan "cd '$wt' && nohup codex exec --dangerously-bypass-approvals-and-sandbox resume --last '$HEADLESS_RESUME_PROMPT' > '$lg' 2> '$errlg' &   # cwd filter pins --last to this worktree" ;;
       pi)     plan "cd '$wt' && nohup pi -p -a --session-id '$sess' ${wmodel:+--model '$wmodel' }--mode json '$HEADLESS_RESUME_PROMPT' > '$lg' 2> '$errlg' &   # --session-id resumes the exact recorded session" ;;
       prime)  plan "cd '$wt' && nohup prime-agent -p -c --session-dir '$sess' ${wmodel:+--model '$wmodel' }'$HEADLESS_RESUME_PROMPT' > '$lg' 2> '$errlg' &   # -c continues the only session in the per-slice dir" ;;
+      zcode)  plan "cd '$wt' && set -a; . '$(zai_env_file)'; set +a; nohup claude -p --resume '$sess' '$HEADLESS_RESUME_PROMPT' ${wmodel:+--model '$wmodel' }--dangerously-skip-permissions --output-format json > '$lg' 2> '$errlg' &   # same resume story as claude, GLM endpoint" ;;
     esac
     plan "record new pid + start-time/comm in workers[] (state=working)"
     WATCH_TOKEN="$s=working/$sig:resumed$((n + 1))"
@@ -2163,6 +2282,13 @@ headless_resume() { # headless_resume <slice> <signature> <session> — sets WAT
         ( cd "$wt" && nohup claude -p --resume "$sess" "$HEADLESS_RESUME_PROMPT" --model "$wmodel" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
       else
         ( cd "$wt" && nohup claude -p --resume "$sess" "$HEADLESS_RESUME_PROMPT" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
+      fi ;;
+    zcode)
+      # identical to claude, with the z.ai env sourced inside the subshell.
+      if [ -n "$wmodel" ]; then
+        ( cd "$wt" && set -a && . "$(zai_env_file)" && set +a && nohup claude -p --resume "$sess" "$HEADLESS_RESUME_PROMPT" --model "$wmodel" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
+      else
+        ( cd "$wt" && set -a && . "$(zai_env_file)" && set +a && nohup claude -p --resume "$sess" "$HEADLESS_RESUME_PROMPT" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
       fi ;;
     codex)
       # `codex exec resume` filters recorded sessions by cwd; the worktree is

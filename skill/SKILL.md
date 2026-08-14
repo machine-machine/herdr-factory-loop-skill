@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 2.8.0
+version: 2.9.0
 description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator). ALSO trigger for meta-orchestration — when the user wants to be the "meta-orchestrator" / "orchestrator of orchestrators", oversee or launch multiple orchestrators (each driving its own herd of workers) across several missions/repos, or drive a portfolio of parallel missions with /goal-based autonomy (fleet-loop.sh / fleet-control). ALSO trigger for m2herd — the Claude Code (Fable) main-orchestrator context fabric — when the user mentions m2herd, .m2herd, "context fabric", wants to offload context into the repo folder (the folder holds the context, the orchestrator holds pointers), refile or archive notes/areas, push a project gist to fleet memory, or come back to a project via the resume file (RESUME.md).
 ---
 
@@ -186,8 +186,13 @@ If the work is a single small fix, just do it inline — do not fan out. Fan out
    | claude | `claude` | `"$(command -v claude)" --dangerously-skip-permissions` |
    | cursor | `cursor` | `"$(command -v cursor-agent)" --force` |
    | prime  | `prime`  | `"$(command -v prime-agent)"` |
+   | zcode  | `zcode`  | `"$(command -v claude)" --dangerously-skip-permissions` (+ z.ai env) |
 
-   (`cursor-agent --force` = run the Cursor agent TUI auto-approving all commands — the cursor analog of claude's `--dangerously-skip-permissions`. herdr's `cursor` integration is installed, so cursor panes report authoritative lifecycle state like any other agent. `prime` = [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent), Prime Intellect's open-source harness: binary `prime-agent`, no auto-approve flag needed — it has no per-tool approval gate. No herdr integration exists for it yet, so pane lifecycle detection is heuristic; prefer `--headless` for prime workers. Requires Node ≥ 20.6.)
+   (`cursor-agent --force` = run the Cursor agent TUI auto-approving all commands — the cursor analog of claude's `--dangerously-skip-permissions`. herdr's `cursor` integration is installed, so cursor panes report authoritative lifecycle state like any other agent. `prime` = [Prime Agent](https://github.com/PrimeIntellect-ai/prime-agent), Prime Intellect's open-source harness: binary `prime-agent`, no auto-approve flag needed — it has no per-tool approval gate. No herdr integration exists for it yet, so pane lifecycle detection is heuristic; prefer `--headless` for prime workers. Requires Node ≥ 20.6.
+
+   `zcode` = **GLM (z.ai) behind the claude binary**. z.ai ships no CLI of its own — ZCode is a desktop app — so the documented terminal path for a [GLM Coding Plan](https://z.ai/subscribe) is Claude Code pointed at z.ai's Anthropic-compatible endpoint. m2herd does that wiring for you: a zcode worker runs the same `claude` binary with the same auto-approve flag, but sources an env file that sets `ANTHROPIC_BASE_URL=https://api.z.ai/api/anthropic` and maps the sonnet/opus tier to **GLM-5.3** (`glm-5.3[1m]`, 1M context). Everything claude-shaped therefore works unchanged: session resume, the `--output-format json` envelope, usage parsing, and the herdr `claude` integration's authoritative pane lifecycle.
+
+   **First run asks for the key.** The first `--agent zcode` dispatch prompts once (silent input) for a z.ai API key from <https://z.ai/manage-apikey/apikey-list>, stores it at `~/.config/m2herd/zai.env` (mode 600), and reuses it forever after. Non-interactive runs never hang — pass `ZAI_API_KEY=<key>` in the environment for the first dispatch, or pre-create the file. Overrides: `$M2HERD_ZAI_ENV` (file path), `$M2HERD_ZAI_MODEL` (default `glm-5.3[1m]`). The key is **sourced**, never passed as `--env` or in argv, so it never appears in `ps`, in a pane's scrollback, or in `overview.json`.)
 7. **Write the plan down before spawning.** Capture the decomposition in `/tmp/herd-plan.md`: intent, base ref, one line per slice (name → concrete deliverable → files it owns). The plan is the source of truth — every worker prompt in §9.2 derives from it, the converge summary in §9.5 reports against it, and the run report in §10 archives it. If the herd is risky (≥4 workers, or touches deploy/infra/data), post the plan to the channel and get an ack **before** spawning.
 8. **Check for prior art.** Before decomposing from scratch, look for an earlier run report on a similar intent (`ls ~/.herdr/runs/ | grep -i <keyword>`, or query fleet memory). A past run's splits, prompts, and "next time" notes are usually a better starting point than a fresh guess.
 
@@ -928,7 +933,7 @@ The pane is a WATCHER, never a writer. On PATH as `m2herd-up`.
 
 ```
 m2herd-up.sh up       [--repo P] [--goal "…"] [--room-only]   # ensure herdr workspace for repo: the one-orchestrator + one-machineroom shape; runs m2herd.sh init if missing; --room-only never spawns an orchestrator pane
-m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor|opencode|pi|prime]
+m2herd-up.sh dispatch --slice S [--repo P] [--base BRANCH] [--agent claude|codex|cursor|opencode|pi|prime|zcode]
                       [--runner pane|headless] [--headless [--model M]]
                                                     # worktree wip/m2herd-<S> off BASE (default: current branch), spawn worker, file-protocol dispatch of .m2herd/dispatch/S.task.md, record in overview.json workers[]; flags fall back to settings.json routing/defaults (§16.6)
 m2herd-up.sh collect  --slice S [--repo P]          # wait idle (pane) / exited (headless pid), keep/copy report to dispatch/S.out.md, update workers[] state (+tokens/cost); a dead pane / recycled pid / EMPTY REPORT is marked failed, never silently done (state honesty)
@@ -990,6 +995,13 @@ delegated down-tier: **sonnet** for standard implementation slices and review fa
 Default reviewers to sonnet explicitly. TUI panes are for slices that need mid-flight
 steering; headless is the default for everything else.
 
+**zcode workers spend a z.ai plan, not the Anthropic pool** — the same lever `pi` gives
+for local models, but for a hosted frontier coding model. When the Anthropic rate limit is
+the binding constraint on a wave, route implementation slices to `--agent zcode`
+(GLM-5.3, 1M context) and keep Fable for judgment. Cost is not recorded for zcode workers:
+the z.ai endpoint returns no `costUSD`, so `collect` records tokens only — "no cost
+recorded" is not "free", it draws down the GLM Coding Plan's quota.
+
 #### 16.4 The three Claude Code hooks
 
 The heartbeat of the living harness. All three key on `.m2herd/` presence in the cwd (or
@@ -1040,7 +1052,7 @@ m2herd config set  <key> <value>      # validated (bad enum → exit 2); whole-f
 
 Keys the **engine** (`m2herd.sh config`) owns: `orchestrator.agent`/`orchestrator.runner`,
 `workers.agent`/`workers.runner`/`workers.max` (defaults `claude`/`pane`/3), and `routing` —
-an array of `{pattern, agent}` rules (optional `runner`); agents `claude|codex|cursor|opencode|pi|prime`,
+an array of `{pattern, agent}` rules (optional `runner`); agents `claude|codex|cursor|opencode|pi|prime|zcode`,
 runners `pane|headless`.
 
 **pi workers (2.7.2).** `pi` (`@earendil-works/pi-coding-agent`) is a full worker agent:
