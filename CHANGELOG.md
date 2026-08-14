@@ -4,6 +4,37 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.9.0] - 2026-08-14
+
+Adds **zcode** — z.ai's GLM Coding Plan (GLM-5.3) as a first-class worker.
+
+### Added
+- **`zcode` worker agent** across the factory: `m2herd-up dispatch --agent zcode`
+  (pane + `--headless`), settings routing enum, §9.1 worker table, §16.3 model-tier
+  policy. z.ai ships no CLI (ZCode is a desktop app), so zcode runs the **claude
+  binary** against z.ai's Anthropic-compatible endpoint — the path z.ai documents
+  for a GLM Coding Plan. Consequence: session resume, the `--output-format json`
+  envelope, report salvage, token parsing, and the herdr `claude` integration's
+  authoritative pane lifecycle all work unchanged. `--model sonnet` (the headless
+  default) resolves to `glm-5.3[1m]` server-side via `ANTHROPIC_DEFAULT_SONNET_MODEL`.
+- **First-run key provisioning**: the first zcode dispatch prompts once (silent
+  input) for a z.ai API key and stores it at `~/.config/m2herd/zai.env` (mode 600);
+  later dispatches reuse it. Non-interactive runs never hang — they fail with the
+  `ZAI_API_KEY=<key>` one-liner that fixes it. Overrides: `$M2HERD_ZAI_ENV`,
+  `$M2HERD_ZAI_MODEL`, `$M2HERD_ZAI_HAIKU_MODEL`.
+
+### Security
+- The key is **sourced** by the spawned worker (`set -a; . <file>; set +a`), never
+  passed via `herdr agent start --env` and never interpolated into a command line —
+  so it cannot appear in `ps`, in a pane's scrollback, in `overview.json`, or in
+  `--dry-run` output. The `agent start` last-resort fallback wraps the worker in
+  `/bin/bash -lc` for the same reason: execing the binary directly would silently
+  run a zcode worker against Anthropic instead of z.ai.
+
+### Notes
+- No cost is recorded for zcode workers (the endpoint returns no `costUSD`); tokens
+  are. "No cost recorded" is not "free" — it draws down the GLM Coding Plan quota.
+
 ## [2.8.0] - 2026-08-07
 
 Adds **Prime Agent** (Prime Intellect's open-source harness) to the worker selection.
