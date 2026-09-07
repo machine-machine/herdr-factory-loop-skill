@@ -839,10 +839,12 @@ render_areas() {
     fi
   done <<<"$names"
 }
-# desired vs observed: ONE `herdr agent list` query; mismatch marked "!"; degrades to "-"
+# desired vs observed: ONE room query; mismatch marked "!"; degrades to "-".
+# Dieselbe Quelle wie reap — sonst zeigt die Tafel "gone" fuer ein Pane, das im
+# Raum noch steht, und die beiden Kommandos widersprechen sich.
 render_workers() {
-  local agents="" slice desired pane branch mode model tokens obs mark runner
-  command -v herdr >/dev/null 2>&1 && agents="$(herdr agent list 2>/dev/null || true)"
+  local room="" slice desired pane branch mode model tokens obs mark runner
+  command -v herdr >/dev/null 2>&1 && room="$(room_panes)"
   echo "WORKERS"
   printf '  %-10s %-9s %-10s %-14s %s\n' "slice" "desired" "observed" "runner" "branch"
   jq -r '(.workers//[])[] | [.slice, (.state//"?"), (.pane_id//""), (.branch//"-"),
@@ -855,8 +857,8 @@ render_workers() {
         if [ -n "$tokens" ]; then
           if [ "$tokens" -ge 1000 ] 2>/dev/null; then runner="$runner $((tokens / 1000))k"; else runner="$runner ${tokens}t"; fi
         fi
-      elif [ -n "$agents" ]; then
-        obs="$(jq -r --arg p "$pane" '[.result.agents[]? | select(.pane_id==$p) | .agent_status][0] // "gone"' <<<"$agents")"
+      elif [ -n "$room" ]; then
+        obs="$(pane_obs "$room" "$pane")"
         case "$desired:$obs" in
           spawned:idle|spawned:gone|working:idle|working:gone|done:working|failed:working) mark=" !" ;;
         esac
@@ -1604,12 +1606,47 @@ evolve_reject() {
 # those panes mechanically and clears the pane_id bookkeeping in overview.json.
 # Safety mirrors m2herd-up.sh: NEVER $SELF (unknown self = fail safe, skip),
 # never a pane whose LIVE agent_status is still "working" (state mismatch —
-# collect first), headless workers untouched (no pane to close).
+# collect first), headless workers untouched (no pane to close). A pane that is
+# still in the ROOM but no longer runs an agent is the NORMAL finished case and
+# gets closed; only a pane absent from the room is "gone" (bookkeeping only).
 #
 # Self resolution (same idiom as m2herd-up.sh): walk THIS process's ancestry
 # and match agent-binary ancestors' cwd against `herdr agent list`. Ambiguous
 # or unreachable → $SELF stays EMPTY = UNKNOWN, and maybe_self() treats
 # unknown as "could be me".
+# ---------- room listing: the pane source of truth -----------------------------
+# `herdr agent list` knows only panes that STILL RUN AN AGENT. A finished
+# worker's TUI exits, the pane loses its agent and drops out of that listing —
+# while the pane itself stays in the room. Observing reap against `agent list`
+# therefore reads "gone" for exactly the panes it is supposed to close: reap
+# then cleared the pane_id bookkeeping to "-" and moved on, and since no worker
+# row pointed at that pane any more, no later reap could ever find it. The leak
+# was one-way, and it is why a room fills up with idle panes while
+# `m2herd next` reports nothing to reap (measured 2026-09-07: 37 panes in the
+# room, 3 with an agent).
+#
+# `herdr pane list` is the room itself and carries agent_status per pane, so it
+# answers both questions at once. Older herdr builds without it fall back to
+# `agent list` — degraded exactly as before, never worse.
+room_panes() {
+  local out
+  out="$(herdr pane list 2>/dev/null \
+    | jq -c '[.result.panes[]? | {pane_id, agent_status: (.agent_status // "unknown")}]' 2>/dev/null || true)"
+  case "${out:-}" in
+    ""|"[]"|null) : ;;
+    *) printf '%s' "$out"; return 0 ;;
+  esac
+  herdr agent list 2>/dev/null \
+    | jq -c '[.result.agents[]? | {pane_id, agent_status: (.agent_status // "unknown")}]' 2>/dev/null \
+    || printf '[]'
+}
+
+# Observed status of ONE pane in a room listing. "gone" means absent from the
+# ROOM — not merely "no agent runs there", which is the normal finished state.
+pane_obs() {  # $1 = room listing json, $2 = pane id
+  jq -r --arg p "$2" '[.[] | select(.pane_id==$p) | (.agent_status // "unknown")][0] // "gone"' <<<"$1"
+}
+
 SELF=""
 resolve_self() {
   SELF=""
@@ -1655,10 +1692,10 @@ maybe_self() {
 # `next` reap rung; 0 when herdr is absent/unreachable (nothing actionable)
 reapable_count() {
   command -v herdr >/dev/null 2>&1 || { echo 0; return 0; }
-  local agents panes
-  agents="$(herdr agent list 2>/dev/null || true)"
-  [ -n "$agents" ] || { echo 0; return 0; }
-  panes="$(jq -c '[.result.agents[]?.pane_id]' <<<"$agents" 2>/dev/null || echo '[]')"
+  local room panes
+  room="$(room_panes)"
+  [ -n "$room" ] && [ "$room" != "[]" ] || { echo 0; return 0; }
+  panes="$(jq -c '[.[].pane_id]' <<<"$room" 2>/dev/null || echo '[]')"
   jq -r --argjson p "$panes" '
     [ (.workers//[])[]
       | select((.state//"")=="done" or (.state//"")=="failed")
@@ -1670,8 +1707,8 @@ reapable_count() {
 reap_cmd() {
   resolve_dir; need_init
   command -v herdr >/dev/null 2>&1 || { log "reap: herdr not on PATH — no panes to close"; return 0; }
-  local agents; agents="$(herdr agent list 2>/dev/null || true)"
-  [ -n "$agents" ] || { log "reap: herdr server unreachable — no panes to close"; return 0; }
+  local room; room="$(room_panes)"
+  [ -n "$room" ] || { log "reap: herdr server unreachable — no panes to close"; return 0; }
   resolve_self
   local closed=0 gone=0 skipped=0 slice state pane mode obs
   # the jq snapshot streams from the pre-rewrite inode; ov_put's atomic rename
@@ -1680,7 +1717,7 @@ reap_cmd() {
     [ -n "$slice" ] || continue
     case "$state" in done|failed) : ;; *) continue ;; esac
     if [ "$mode" = "headless" ] || [ "$pane" = "-" ] || [ -z "$pane" ]; then continue; fi
-    obs="$(jq -r --arg p "$pane" '[.result.agents[]? | select(.pane_id==$p) | .agent_status][0] // "gone"' <<<"$agents")"
+    obs="$(pane_obs "$room" "$pane")"
     if [ "$obs" = "gone" ]; then
       if [ "$DRYRUN" -eq 1 ]; then
         log "reap: would clear pane bookkeeping for $slice (pane $pane already gone)"
@@ -1983,6 +2020,18 @@ selftest() {
     || fail "next(budget): want context-offload line at 80%"
   rm -f "$td/bridge/claude-ctx-selftest.json"
   "$self" next --dir "$td" | grep -q '^NEXT: compare RESUME.md' || fail "next(budget): rung did not clear with the bridge file"
+
+  # pane_obs: the distinction the reap bug turned on. A pane that is still in
+  # the ROOM but no longer runs an agent is NOT gone — it is exactly the
+  # finished worker whose pane has to be closed. Pure function, no fleet needed.
+  _room='[{"pane_id":"w1:p1","agent_status":"unknown"},{"pane_id":"w1:p2","agent_status":"working"}]'
+  [ "$(pane_obs "$_room" "w1:p1")" = "unknown" ] \
+    || fail "pane_obs: an agentless pane in the room must report its room status, not 'gone'"
+  [ "$(pane_obs "$_room" "w1:p2")" = "working" ] \
+    || fail "pane_obs: a working pane must stay working"
+  [ "$(pane_obs "$_room" "w9:p9")" = "gone" ] \
+    || fail "pane_obs: a pane absent from the room is gone"
+  unset _room
 
   # reap: a done worker whose pane vanished → exit 0, bookkeeping cleared;
   # --dry-run touches nothing. Needs a live fleet — skipped gracefully without one.
