@@ -35,7 +35,8 @@ tui-release: check-go
 # prebuilt-rot guard, for real this time: rebuild every target into a scratch dir
 # and byte-compare against the committed set. This is what makes `prebuilt/` a
 # verifiable artifact rather than a promise — it only works because $(REPRO)
-# makes the build reproducible across machines and paths.
+# makes the build reproducible across machines and paths and CI uses the compiler
+# version pinned in .go-version.
 prebuilt-check: check-go
 	@set -e; \
 	tmp=$$(mktemp -d); \

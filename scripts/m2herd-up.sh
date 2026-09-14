@@ -2445,10 +2445,14 @@ EOF
 }
 
 # ---------- herdr-free compatibility selftest ---------------------------------
+selftest_cleanup() {
+  [ -n "${SELFTEST_TMPDIR:-}" ] && rm -rf -- "$SELFTEST_TMPDIR"
+}
+
 selftest() {
   local td pid comm old_path
-  td="$(mktemp -d)"; old_path="$PATH"
-  trap "rm -rf '$td'" EXIT
+  td="$(mktemp -d)"; SELFTEST_TMPDIR="$td"; old_path="$PATH"
+  trap selftest_cleanup EXIT
 
   mkdir -p "$td/old" "$td/new"
   printf '#!/usr/bin/env bash\nprintf "%%s\\n" "  --session <path|id>"\n' > "$td/old/pi"

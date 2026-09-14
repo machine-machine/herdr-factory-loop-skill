@@ -17,6 +17,9 @@ adheres to [Semantic Versioning](https://semver.org/).
   before startup completes.
 - Add a herdr-free `m2herd-up selftest` covering both Pi CLI generations and
   proving the recorded PID belongs to the launched command.
+- Pin CI and release builds to the Go 1.26.5 toolchain used by the committed
+  prebuilts; a floating `stable` compiler made byte-for-byte checks fail whenever
+  Go released a patch update.
 
 ## [2.8.0] - 2026-08-07
 
