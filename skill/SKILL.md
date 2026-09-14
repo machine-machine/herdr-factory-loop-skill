@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 2.8.0
+version: 2.8.1
 description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator). ALSO trigger for meta-orchestration — when the user wants to be the "meta-orchestrator" / "orchestrator of orchestrators", oversee or launch multiple orchestrators (each driving its own herd of workers) across several missions/repos, or drive a portfolio of parallel missions with /goal-based autonomy (fleet-loop.sh / fleet-control). ALSO trigger for m2herd — the Claude Code (Fable) main-orchestrator context fabric — when the user mentions m2herd, .m2herd, "context fabric", wants to offload context into the repo folder (the folder holds the context, the orchestrator holds pointers), refile or archive notes/areas, push a project gist to fleet memory, or come back to a project via the resume file (RESUME.md).
 ---
 
@@ -858,6 +858,7 @@ m2herd.sh evolve <analyze|proposals|show|apply|reject> …   # the factory learn
 m2herd.sh dashboard [--dir P] [--watch [--interval N]]     # read-only tier-1 TUI: a pure renderer over existing state — no new state, no fabric writes; --watch = flicker-free repaint loop (prefers the Go m2herd-tui when installed; M2HERD_NO_TUI=1 forces the bash renderer)
 m2herd.sh self-update [--check]           # ff-only pull of the engine repo; --check caches the behind-count for the dashboard header
 m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync → status → resume (+ next cases, config, dashboard smoke); asserts schema fields with jq
+m2herd-up.sh selftest                     # herdr-free Pi CLI compatibility + detached-worker PID check
 ```
 
 `next` is the pulse of the agentic loop — it walks a fixed priority ladder and prints exactly
@@ -1043,12 +1044,11 @@ Keys the **engine** (`m2herd.sh config`) owns: `orchestrator.agent`/`orchestrato
 an array of `{pattern, agent}` rules (optional `runner`); agents `claude|codex|cursor|opencode|pi|prime`,
 runners `pane|headless`.
 
-**pi workers (2.7.2).** `pi` (`@earendil-works/pi-coding-agent`) is a full worker agent:
-pane mode runs `pi -a` — `-a/--approve` is mandatory, since an interactive pi stops on the
-project-trust prompt in a fresh worktree and the worker never starts. Headless runs
-`pi -p -a --session-id <uuid> --mode json`, and because `--session-id` uses an exact id
-(creating it when missing), pi has the same pre-generated-uuid resume story as claude —
-`watch` resumes a crashed pi worker with the recorded id. `collect` salvages the report from
+**pi workers (2.7.2).** `pi` (`@earendil-works/pi-coding-agent`) is a full worker agent.
+Because Pi's CLI changed across releases, dispatch inspects `pi --help`: it passes
+`--approve` only when advertised and selects `--session-id` or `--session` for exact-session
+resume. If neither session form exists, the worker still runs but resume is disabled loudly.
+`collect` salvages the report from
 the JSONL log's `agent_end` event and sums `turn_end` usage into `workers[]`. Note the
 headless model default `sonnet` is claude-only: pi resolves its own default (on this host
 that is a local `spark-glm` model, so pi workers cost $0 and do not draw on the Anthropic

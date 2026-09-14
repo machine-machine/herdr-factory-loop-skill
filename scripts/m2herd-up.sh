@@ -88,6 +88,7 @@
 #                                                   #   (else kept + reported), set workers[] state=down. Idempotent.
 #                                                   #   retry a slice = clean `down --slice S`, then dispatch it again.
 #   m2herd-up.sh --dry-run <same args>              # print every herdr/git command instead of running it
+#   m2herd-up.sh selftest                            # herdr-free launch/Pi compatibility checks
 #
 # Settings: .m2herd/settings.json is read-only config here; missing/invalid
 # values fall back to built-ins. Keys follow the settled engine schema
@@ -175,6 +176,35 @@ log()        { printf '  %s\n' "$*"; }
 plan()       { log "[dry-run] $*"; }
 need()       { command -v "$1" >/dev/null 2>&1 || { echo "required tool not on PATH: $1" >&2; exit 1; }; }
 utc_now()    { date -u +%Y-%m-%dT%H:%M:%SZ; }
+
+# Pi has changed its trust/session flags across releases. Detect capabilities
+# from the installed binary instead of pinning m2herd to one Pi CLI generation.
+pi_cli_flag() { # pi_cli_flag approve|session -> supported long option or empty
+  local help
+  help="$(pi --help 2>&1 || true)"
+  case "$1" in
+    approve) grep -q -- '--approve' <<<"$help" && printf '%s' '--approve' ;;
+    session)
+      if grep -q -- '--session-id' <<<"$help"; then printf '%s' '--session-id'
+      elif grep -q -- '--session <' <<<"$help"; then printf '%s' '--session'
+      fi ;;
+  esac
+}
+
+# Start one detached command and record the PID of the command itself. Keep the
+# background operator out of a `cd && command &` list: in bash that records the
+# asynchronous wrapper's PID, which may exit before the actual worker starts.
+spawn_detached() { # <cwd> <stdout> <stderr> <pidfile> <argv...>
+  local cwd="$1" stdout="$2" stderr="$3" pidfile="$4"; shift 4
+  (
+    cd "$cwd" || exit 1
+    # A detached worker must not inherit the dispatch caller's stdin pipe.
+    # Codex probes stdin for appended prompt content; when that pipe disappears
+    # with the launcher it can exit before writing either log or report.
+    nohup "$@" > "$stdout" 2> "$stderr" < /dev/null &
+    printf '%s\n' "$!" > "$pidfile"
+  )
+}
 
 # UUID for `claude -p --session-id` (the resume story needs the id KNOWN at
 # dispatch time — `claude -p` also reports session_id in its JSON envelope, but
@@ -504,10 +534,9 @@ worker_argv() {
     codex)  printf '%s\t%s\n' "codex" "--dangerously-bypass-approvals-and-sandbox" ;;
     claude) printf '%s\t%s\n' "claude" "--dangerously-skip-permissions" ;;
     cursor) printf '%s\t%s\n' "cursor-agent" "--force" ;;
-    # pi has no per-tool approval gate; `-a/--approve` trusts the worktree's
-    # project-local files for the run. Without it an interactive pi stops on the
-    # project-trust prompt in a fresh worktree and the worker never starts.
-    pi)     printf '%s\t%s\n' "pi" "-a" ;;
+    # Some Pi releases expose --approve for project trust; others removed it.
+    # Pass it only when this installed Pi advertises it.
+    pi)     printf '%s\t%s\n' "pi" "$(pi_cli_flag approve)" ;;
     # prime-agent (Prime Intellect) has no per-tool approval gate at all — tools
     # run by default, so no auto-approve flag is needed. Binary name differs from
     # the agent key. No herdr integration exists yet: pane lifecycle is heuristic.
@@ -1115,7 +1144,7 @@ dispatch_one() { # dispatch_one <slice>
     # codex: `codex exec resume --last` filters sessions by cwd, and the worktree
     # is unique per slice — the sentinel "last" is the whole session story.
     # opencode: no resume flag in `opencode run` — session stays empty (no resume).
-    local hsession=""
+    local hsession="" pi_session_opt="" pi_approve_opt=""
     case "$AGENT" in
       claude)
         hsession="$(gen_uuid)"
@@ -1123,10 +1152,14 @@ dispatch_one() { # dispatch_one <slice>
         ;;
       codex) hsession="last" ;;
       pi)
-        # pi's `--session-id <id>` uses the exact id, CREATING it if missing, so the
-        # same pre-generated-uuid story as claude works for both dispatch and resume.
-        hsession="$(gen_uuid)"
-        [ -n "$hsession" ] || log "! no uuid source (uuidgen//proc/python3) — dispatching WITHOUT --session-id; watch cannot resume this worker"
+        pi_session_opt="$(pi_cli_flag session)"
+        pi_approve_opt="$(pi_cli_flag approve)"
+        if [ -n "$pi_session_opt" ]; then
+          hsession="$(gen_uuid)"
+          [ -n "$hsession" ] || log "! no uuid source (uuidgen//proc/python3) — dispatching WITHOUT a Pi session id; watch cannot resume this worker"
+        else
+          log "! installed Pi exposes no exact-session flag — dispatching without resume support"
+        fi
         ;;
       prime)
         # prime-agent has no pre-set session id, but `--session-dir <dir>` pins where
@@ -1140,7 +1173,7 @@ dispatch_one() { # dispatch_one <slice>
         claude)   plan "cd '$wt' && nohup claude -p '<pointer>' ${hsession:+--session-id '$hsession' }--model '$MODEL' --dangerously-skip-permissions --output-format json > '$lg' 2> '$errlg' &" ;;
         codex)    plan "cd '$wt' && nohup codex exec --dangerously-bypass-approvals-and-sandbox '<pointer>' > '$lg' 2> '$errlg' &   # resume story: codex exec resume --last (cwd-filtered)" ;;
         opencode) plan "cd '$wt' && nohup opencode run '<pointer>' > '$lg' 2> '$errlg' &   # no resume story" ;;
-        pi)       plan "cd '$wt' && nohup pi -p -a ${hsession:+--session-id '$hsession' }${MODEL:+--model '$MODEL' }--mode json '<pointer>' > '$lg' 2> '$errlg' &   # resume story: pi -p --session-id '$hsession'" ;;
+        pi)       plan "cd '$wt' && nohup pi -p ${pi_approve_opt:+$pi_approve_opt }${hsession:+$pi_session_opt '$hsession' }${MODEL:+--model '$MODEL' }--mode json '<pointer>' > '$lg' 2> '$errlg' &" ;;
         prime)    plan "cd '$wt' && nohup prime-agent -p --session-dir '$hsession' ${MODEL:+--model '$MODEL' }'<pointer>' > '$lg' 2> '$errlg' &   # resume story: prime-agent -p -c --session-dir '$hsession'" ;;
       esac
       plan "record pid + its start-time/comm (ps -o lstart=/-o comm=) so collect can verify the pid was not recycled"
@@ -1149,30 +1182,32 @@ dispatch_one() { # dispatch_one <slice>
       log "dispatch: dry-run headless plan complete for $SLICE${hsession:+ (session $hsession)}"
       return 0
     fi
+    local -a headless_cmd
     case "$AGENT" in
       claude)
         if [ -n "$hsession" ]; then
-          ( cd "$wt" && nohup claude -p "$hprompt" --session-id "$hsession" --model "$MODEL" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
+          headless_cmd=(claude -p "$hprompt" --session-id "$hsession" --model "$MODEL" --dangerously-skip-permissions --output-format json)
         else
-          ( cd "$wt" && nohup claude -p "$hprompt" --model "$MODEL" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
+          headless_cmd=(claude -p "$hprompt" --model "$MODEL" --dangerously-skip-permissions --output-format json)
         fi ;;
-      codex)    ( cd "$wt" && nohup codex exec --dangerously-bypass-approvals-and-sandbox "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
-      opencode) ( cd "$wt" && nohup opencode run "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
+      codex)    headless_cmd=(codex exec --dangerously-bypass-approvals-and-sandbox "$hprompt") ;;
+      opencode) headless_cmd=(opencode run "$hprompt") ;;
       pi)
-        # -a: `-p` never prompts for project trust, but without --approve it IGNORES
-        # the worktree's project-local resources (defaultProjectTrust=ask is the default).
-        if [ -n "$hsession" ]; then
-          ( cd "$wt" && nohup pi -p -a --session-id "$hsession" ${MODEL:+--model "$MODEL"} --mode json "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
-        else
-          ( cd "$wt" && nohup pi -p -a ${MODEL:+--model "$MODEL"} --mode json "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
-        fi ;;
+        headless_cmd=(pi -p)
+        [ -n "$pi_approve_opt" ] && headless_cmd+=("$pi_approve_opt")
+        [ -n "$hsession" ] && headless_cmd+=("$pi_session_opt" "$hsession")
+        [ -n "$MODEL" ] && headless_cmd+=(--model "$MODEL")
+        headless_cmd+=(--mode json "$hprompt") ;;
       prime)
         # plain text mode (not --mode json): the salvage fallback tails the log, and
         # prime's JSONL event schema is not depended on anywhere yet. MODEL is only
         # passed when explicitly set — prime resolves its own provider default.
         mkdir -p "$hsession" 2>/dev/null || true
-        ( cd "$wt" && nohup prime-agent -p --session-dir "$hsession" ${MODEL:+--model "$MODEL"} "$hprompt" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
+        headless_cmd=(prime-agent -p --session-dir "$hsession")
+        [ -n "$MODEL" ] && headless_cmd+=(--model "$MODEL")
+        headless_cmd+=("$hprompt") ;;
     esac
+    spawn_detached "$wt" "$lg" "$errlg" "$lg.pid" "${headless_cmd[@]}"
     hpid="$(cat "$lg.pid" 2>/dev/null || true)"; rm -f "$lg.pid"
     [ -n "$hpid" ] || { echo "headless spawn failed (no pid) — see $lg / $errlg" >&2; exit 1; }
     # pin the pid's identity NOW: start-time + comm let collect prove the pid it
@@ -2132,6 +2167,8 @@ HEADLESS_RESUME_PROMPT="continue: finish the task file items, write the report"
 
 headless_resume() { # headless_resume <slice> <signature> <session> — sets WATCH_TOKEN
   local s="$1" sig="$2" sess="$3" w wagent wt wbranch wmodel lg errlg hpid hstart hcomm n
+  local -a resume_cmd
+  local pi_session_opt="" pi_approve_opt=""
   w="$(jq -c --arg s "$s" '[.workers[]? | select(.slice==$s)] | first' "$OV" 2>/dev/null || true)"
   wagent="$(printf '%s' "$w" | jq -r '.agent // "claude"')"
   wt="$(printf '%s' "$w" | jq -r '.worktree // empty')"
@@ -2146,11 +2183,15 @@ headless_resume() { # headless_resume <slice> <signature> <session> — sets WAT
   n="$(resumes_get "$s")"
   resumes_bump "$s"
   log "watch: $s headless '$sig' — resuming session $sess ($((n + 1))/$WATCH_MAX_RESUMES)"
+  if [ "$wagent" = pi ]; then
+    pi_session_opt="$(pi_cli_flag session)"
+    pi_approve_opt="$(pi_cli_flag approve)"
+  fi
   if [ "$DRY_RUN" -eq 1 ]; then
     case "$wagent" in
       claude) plan "cd '$wt' && nohup claude -p --resume '$sess' '$HEADLESS_RESUME_PROMPT' ${wmodel:+--model '$wmodel' }--dangerously-skip-permissions --output-format json > '$lg' 2> '$errlg' &" ;;
       codex)  plan "cd '$wt' && nohup codex exec --dangerously-bypass-approvals-and-sandbox resume --last '$HEADLESS_RESUME_PROMPT' > '$lg' 2> '$errlg' &   # cwd filter pins --last to this worktree" ;;
-      pi)     plan "cd '$wt' && nohup pi -p -a --session-id '$sess' ${wmodel:+--model '$wmodel' }--mode json '$HEADLESS_RESUME_PROMPT' > '$lg' 2> '$errlg' &   # --session-id resumes the exact recorded session" ;;
+      pi)     plan "cd '$wt' && nohup pi -p ${pi_approve_opt:+$pi_approve_opt }${pi_session_opt:+$pi_session_opt '$sess' }${wmodel:+--model '$wmodel' }--mode json '$HEADLESS_RESUME_PROMPT' > '$lg' 2> '$errlg' &" ;;
       prime)  plan "cd '$wt' && nohup prime-agent -p -c --session-dir '$sess' ${wmodel:+--model '$wmodel' }'$HEADLESS_RESUME_PROMPT' > '$lg' 2> '$errlg' &   # -c continues the only session in the per-slice dir" ;;
     esac
     plan "record new pid + start-time/comm in workers[] (state=working)"
@@ -2160,27 +2201,33 @@ headless_resume() { # headless_resume <slice> <signature> <session> — sets WAT
   case "$wagent" in
     claude)
       if [ -n "$wmodel" ]; then
-        ( cd "$wt" && nohup claude -p --resume "$sess" "$HEADLESS_RESUME_PROMPT" --model "$wmodel" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
+        resume_cmd=(claude -p --resume "$sess" "$HEADLESS_RESUME_PROMPT" --model "$wmodel" --dangerously-skip-permissions --output-format json)
       else
-        ( cd "$wt" && nohup claude -p --resume "$sess" "$HEADLESS_RESUME_PROMPT" --dangerously-skip-permissions --output-format json > "$lg" 2> "$errlg" & echo $! > "$lg.pid" )
+        resume_cmd=(claude -p --resume "$sess" "$HEADLESS_RESUME_PROMPT" --dangerously-skip-permissions --output-format json)
       fi ;;
     codex)
       # `codex exec resume` filters recorded sessions by cwd; the worktree is
       # unique per slice, so --last IS this worker's session.
-      ( cd "$wt" && nohup codex exec --dangerously-bypass-approvals-and-sandbox resume --last "$HEADLESS_RESUME_PROMPT" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
+      resume_cmd=(codex exec --dangerously-bypass-approvals-and-sandbox resume --last "$HEADLESS_RESUME_PROMPT") ;;
     pi)
-      # `--session-id <id>` is exact-id resume (and would create the id if it were
-      # missing) — the same uuid dispatch recorded in workers[].session.
-      ( cd "$wt" && nohup pi -p -a --session-id "$sess" ${wmodel:+--model "$wmodel"} --mode json "$HEADLESS_RESUME_PROMPT" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
+      [ -n "$pi_session_opt" ] || { watch_fail "$s" "worker_crash" "installed Pi exposes no exact-session flag"; WATCH_TOKEN="$s=failed/$sig:no-resume-flag"; return 0; }
+      resume_cmd=(pi -p)
+      [ -n "$pi_approve_opt" ] && resume_cmd+=("$pi_approve_opt")
+      resume_cmd+=("$pi_session_opt" "$sess")
+      [ -n "$wmodel" ] && resume_cmd+=(--model "$wmodel")
+      resume_cmd+=(--mode json "$HEADLESS_RESUME_PROMPT") ;;
     prime)
       # workers[].session holds the per-slice --session-dir; `-c` continues the
       # most recent (= only) session saved there.
-      ( cd "$wt" && nohup prime-agent -p -c --session-dir "$sess" ${wmodel:+--model "$wmodel"} "$HEADLESS_RESUME_PROMPT" > "$lg" 2> "$errlg" & echo $! > "$lg.pid" ) ;;
+      resume_cmd=(prime-agent -p -c --session-dir "$sess")
+      [ -n "$wmodel" ] && resume_cmd+=(--model "$wmodel")
+      resume_cmd+=("$HEADLESS_RESUME_PROMPT") ;;
     *)
       watch_fail "$s" "worker_crash" "headless '$sig' — agent $wagent has no resume story"
       WATCH_TOKEN="$s=failed/$sig:no-resume-story"
       return 0 ;;
   esac
+  spawn_detached "$wt" "$lg" "$errlg" "$lg.pid" "${resume_cmd[@]}"
   hpid="$(cat "$lg.pid" 2>/dev/null || true)"; rm -f "$lg.pid"
   if [ -z "$hpid" ]; then
     watch_fail "$s" "worker_crash" "headless '$sig' resume respawn produced no pid — see $lg / $errlg"
@@ -2397,6 +2444,31 @@ EOF
   log "down: done"
 }
 
+# ---------- herdr-free compatibility selftest ---------------------------------
+selftest() {
+  local td pid comm old_path
+  td="$(mktemp -d)"; old_path="$PATH"
+  trap "rm -rf '$td'" EXIT
+
+  mkdir -p "$td/old" "$td/new"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "  --session <path|id>"\n' > "$td/old/pi"
+  printf '#!/usr/bin/env bash\nprintf "%%s\\n" "  --approve" "  --session-id <id>"\n' > "$td/new/pi"
+  chmod +x "$td/old/pi" "$td/new/pi"
+  PATH="$td/old:$old_path"
+  [ -z "$(pi_cli_flag approve)" ] || { echo 'selftest FAIL: old Pi invented --approve' >&2; exit 1; }
+  [ "$(pi_cli_flag session)" = '--session' ] || { echo 'selftest FAIL: old Pi session flag' >&2; exit 1; }
+  PATH="$td/new:$old_path"
+  [ "$(pi_cli_flag approve)" = '--approve' ] || { echo 'selftest FAIL: new Pi approve flag' >&2; exit 1; }
+  [ "$(pi_cli_flag session)" = '--session-id' ] || { echo 'selftest FAIL: new Pi session flag' >&2; exit 1; }
+  PATH="$old_path"
+
+  spawn_detached "$td" "$td/out" "$td/err" "$td/pid" sleep 30
+  pid="$(cat "$td/pid")"; comm="$(ps -o comm= -p "$pid" | tr -d ' ')"
+  [ "$comm" = sleep ] || { echo "selftest FAIL: recorded pid $pid belongs to '$comm', not sleep" >&2; exit 1; }
+  kill "$pid" 2>/dev/null || true
+  echo 'm2herd-up selftest: PASS'
+}
+
 # ---------- dispatch table -----------------------------------------------------
 need jq
 case "$CMD" in
@@ -2406,5 +2478,6 @@ case "$CMD" in
   collect)  collect ;;
   watch)    watch ;;
   down)     down ;;
+  selftest) selftest ;;
   help|*)   awk 'NR >= 2 { if ($0 ~ /^set -euo pipefail/) exit; print }' "$0" ;;
 esac

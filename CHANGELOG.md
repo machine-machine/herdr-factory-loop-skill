@@ -4,6 +4,20 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.1] - 2026-09-14
+
+### Fixed
+- Detect Pi's installed project-trust and exact-session flags instead of always
+  passing `-a` and `--session-id`; this supports both older `--session` builds
+  and newer Pi releases that advertise `--approve`/`--session-id`.
+- Record the actual detached headless worker PID. Backgrounding the former
+  `cd && nohup ...` compound list could record a short-lived shell wrapper and
+  leave collection observing the wrong process. Detached workers also receive
+  `/dev/null` as stdin so Codex cannot inherit a launcher pipe that disappears
+  before startup completes.
+- Add a herdr-free `m2herd-up selftest` covering both Pi CLI generations and
+  proving the recorded PID belongs to the launched command.
+
 ## [2.8.0] - 2026-08-07
 
 Adds **Prime Agent** (Prime Intellect's open-source harness) to the worker selection.
