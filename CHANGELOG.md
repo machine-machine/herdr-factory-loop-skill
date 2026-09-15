@@ -4,6 +4,18 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.8.2] - 2026-09-15
+
+### Fixed
+- Compact the `SKILL.md` frontmatter `description` from 1,878 to 978 characters.
+  The value is single-quoted: the compacted text contains `: ` sequences
+  (`machine: spawn`, `Triggers: …`) that YAML would otherwise read as nested
+  mappings, so the plain-scalar form failed to parse.
+  It had grown past the host's 1,024-char skill-description cap (hosts emit a
+  validation warning and load ~2x the description tokens every session). Every
+  trigger phrase from the original is preserved verbatim — section names, the
+  chat-channel/SDD/meta-orchestration/m2herd triggers, and the m2herd doctrine line.
+
 ## [2.8.1] - 2026-09-14
 
 ### Fixed
