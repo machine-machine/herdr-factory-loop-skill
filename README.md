@@ -267,3 +267,31 @@ See [`CHANGELOG.md`](./CHANGELOG.md) for the full history.
 ## License
 
 MIT — see [`LICENSE`](./LICENSE).
+
+### Recover an interrupted Codex orchestrator
+
+Run `m2herd resume --yolo` in the original workspace's interactive terminal.
+It resumes an exact saved Codex session with approvals/sandbox bypassed and a
+recovery prompt that reconciles workers, reports, Git state and mailbox before
+continuing the existing task. It does not create panes or redispatch workers.
+Plain `m2herd resume` remains a read-only context report.
+
+```bash
+m2herd resume --yolo --dry-run                 # inspect selection without launching
+m2herd resume --yolo                          # continue in this terminal
+m2herd resume --yolo --session <session-uuid>  # explicitly choose a different saved session
+```
+
+On first use, select the newest interactive Codex session whose recorded cwd
+matches `--dir` (default: current directory); worker/subagent sessions are excluded.
+After a real launch, `.m2herd/orchestrator-session.json` pins that UUID so unrelated
+newer conversations cannot silently take its place. `--session` explicitly changes
+the binding after validating the session belongs to the same workspace.
+
+A workspace lock is held through the native process lifetime. Live Codex processes
+in that workspace, missing sessions, unavailable process inspection and unattended
+non-TTY launches fail explicitly. This recovery path currently supports Linux and
+Codex only. Managed tenant instances must use their identity-aware managed resume
+path; they cannot fall back to a native CLI account. No credentials or transcript
+contents are written to the recovery receipt. Run recovery from a shell, not as a
+tool command inside an already-running Codex orchestrator.

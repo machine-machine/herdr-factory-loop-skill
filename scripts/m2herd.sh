@@ -15,6 +15,7 @@
 #   m2herd.sh note    [--dir P] "text"        # append "- [<UTC ts>] text" to NOTES.md
 #   m2herd.sh refile  [--dir P] --area A      # create/refresh context/A/ (+header), move live NOTES.md content into it, update overview.json
 #   m2herd.sh resume  [--dir P]               # print RESUME.md + one line per area from overview.json
+#   m2herd.sh resume --yolo [--dir P] [--session UUID] [--dry-run] # continue saved Codex orchestrator in this terminal
 #   m2herd.sh sync    [--dir P] [--check]     # regenerate overview.json areas[] from the context/ tree; refresh RESUME.md skeleton
 #                                             #   --check: report drift (missing areas, orphan entries) and exit 3 instead of repairing
 #   m2herd.sh archive [--dir P] --area A      # distill context/A/context.md to header + <=10 summary lines, mark archived (deep/ untouched)
@@ -64,6 +65,23 @@ set -euo pipefail
 
 # ---------- arg parsing ------------------------------------------------------
 CMD="${1:-help}"; shift || true
+# Explicit native recovery is separate from the read-only resume report.
+# Resolve symlinks here because installed m2herd points back into this scripts directory.
+if [ "$CMD" = resume ]; then
+  for resume_arg in "$@"; do
+    if [ "$resume_arg" = --yolo ]; then
+      resume_self="$0"
+      while [ -L "$resume_self" ]; do
+        resume_link="$(readlink "$resume_self")"
+        case "$resume_link" in
+          /*) resume_self="$resume_link" ;;
+          *) resume_self="$(dirname "$resume_self")/$resume_link" ;;
+        esac
+      done
+      exec python3 "$(dirname "$resume_self")/m2herd-resume.py" "$@"
+    fi
+  done
+fi
 # `evolve` is a subcommand group: the word right after it (analyze/proposals/
 # show/apply/reject) is consumed here as EVOLVE_ACTION, same idiom as CMD itself.
 EVOLVE_ACTION=""
