@@ -855,6 +855,8 @@ m2herd.sh gist   [--dir P] [--push]       # one-paragraph project gist (goal, st
 m2herd.sh next   [--dir P]                # self-prompting primitive: mechanical priority walk (NO LLM calls), prints exactly one line starting "NEXT: "
 m2herd.sh config list|get|set [--dir P] … # read/write .m2herd/settings.json with defaults + validation (§16.6)
 m2herd.sh evolve <analyze|proposals|show|apply|reject> …   # the factory learns from its own runs (§17)
+m2herd.sh eval <draft|approve|status> --slice S [--cmd C]   # locked objective checks (§18)
+m2herd.sh loop <run|status|promote> …                       # scored best-of-N attempts (§18)
 m2herd.sh dashboard [--dir P] [--watch [--interval N]]     # read-only tier-1 TUI: a pure renderer over existing state — no new state, no fabric writes; --watch = flicker-free repaint loop (prefers the Go m2herd-tui when installed; M2HERD_NO_TUI=1 forces the bash renderer)
 m2herd.sh self-update [--check]           # ff-only pull of the engine repo; --check caches the behind-count for the dashboard header
 m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync → status → resume (+ next cases, config, dashboard smoke); asserts schema fields with jq
@@ -1120,6 +1122,34 @@ the `<!-- === M2HERD:LIVE === -->` marker. `m2herd resume` prints the last 5 as
 one sentence to every worker's pointer message when live lessons exist: *"Also read <path to
 LESSONS.md> (accepted factory lessons) before starting."* The task file itself is never
 mutated. Workers start every run pre-warned by everything the factory has already learned.
+
+### 18. eval/loop — objective optimization
+
+Use this when a slice is machine-checkable and worth repeated attempts. The judge is
+separate from the builder: candidate evals start in `.m2herd/evals/draft/<slice>/`, and
+`m2herd eval approve --slice <slice>` freezes the current `eval.json` into
+`.m2herd/evals/approved/<slice>/` with an `APPROVED.sha256` checksum and read-only file
+mode. Every loop run verifies that checksum before a worker command can run.
+
+```bash
+m2herd eval draft --slice checkout --cmd 'npm test -- --json | node score.js'
+m2herd eval approve --slice checkout
+m2herd loop run --slice checkout --rounds 5 --attempt-cmd 'codex exec "$(cat .m2herd/dispatch/checkout.task.md)"'
+m2herd loop status --run <loop-id>
+m2herd loop promote --run <loop-id>
+```
+
+`loop run` creates `.m2herd/loops/<loop-id>/`, then runs each round in a detached git
+worktree from `HEAD`. The attempt command may edit that worktree freely. The approved eval
+command runs afterward in the same worktree and should print JSON with at least a numeric
+`score`; optional fields include `passed`, `failed`, `regressions`, `hard_failed`, and
+`notes`. If the eval emits no JSON score, m2herd falls back to exit-code scoring. Each round
+stores `attempt.log`, `eval.stdout`, `eval.stderr`, `score.json`, and `patch.diff`; the best
+non-hard-failed, non-empty patch is recorded in `run.json`. `loop promote` refuses a dirty
+current checkout, then applies only that best patch.
+
+This is the Karpathy-style loop boundary: builders can optimize code in isolated worktrees,
+but they do not own the approved eval, scorer checksum, or promotion decision.
 
 ---
 

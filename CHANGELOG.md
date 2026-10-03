@@ -4,6 +4,14 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Added
+- Add the objective loop layer: `m2herd eval draft|approve|status` freezes
+  checks into `.m2herd/evals/approved/<slice>/` with a checksum, and
+  `m2herd loop run|status|promote` runs isolated scored attempts, records
+  per-round artifacts, and promotes only the best patch into a clean checkout.
+
 ## [2.8.2] - 2026-09-15
 
 ### Fixed

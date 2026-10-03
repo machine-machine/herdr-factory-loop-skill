@@ -68,6 +68,8 @@ m2herd config list|get|set       # .m2herd/settings.json — who does the work (
 m2herd room                      # live TUI over the fabric in THIS terminal (best available viewer)
 m2herd-up room                   # (re)start the herdr machineroom pane with a fresh viewer — always latest data (`,` opens the settings editor)
 m2herd evolve analyze|proposals|show|apply|reject   # turn failed runs into accepted factory lessons
+m2herd eval draft|approve|status # freeze objective checks before builders run
+m2herd loop run|status|promote   # best-of-N scored attempts against approved evals
 ```
 
 `m2herd boot` is the recommended entry point (init + sync + resume in one
@@ -112,6 +114,7 @@ This skill teaches an agent how to:
 | 15 | Context budgeting & decomposer (Hermes) | keep the orchestrator within a token budget (default GLM-5.2/384k); decompose into budget-sized slice manifests; hooks offload context on demand |
 | 16 | m2herd — the Fable main-orchestrator context fabric | Claude Code (Fable) as the MAIN orchestrator: a per-repo, gitignored `.m2herd/` holds the context while the orchestrator holds pointers — note/refile/resume/sync/archive/gist via `m2herd`, a 1-orchestrator + 1-machineroom-pane workspace via `m2herd-up`, three Claude Code hooks as the heartbeat |
 | 17 | evolve — the factory learns | Run trace bundles (`.m2herd/runs/`) + `m2herd evolve` (analyze/proposals/show/apply/reject): failed runs become reviewable proposals, accepted lessons land in `LESSONS.md` and auto-annotate every later dispatch |
+| 18 | eval/loop — objective optimization | Approved evals (`.m2herd/evals/approved/`) are checksummed before use; `m2herd loop run` executes isolated worktree attempts, scores each round, stores artifacts, and `loop promote` applies only the best patch into a clean checkout |
 
 See [`skill/SKILL.md`](./skill/SKILL.md) for the full reference and
 [`skill/reference.md`](./skill/reference.md) for verbatim CLI/socket docs.
@@ -129,6 +132,8 @@ Four generations of orchestration live in this repo side by side. Pick by orches
   can follow by hand, no standing loop.
 - **§13 fleet-control**: multi-mission meta-orchestration — one orchestrator per mission,
   each self-driving its own herd.
+- **§18 eval/loop**: the Karpathy-style objective loop — use when a slice has a
+  machine-checkable score and the builder must optimize against a judge it cannot edit.
 
 [`CONTRACT-m2herd.md`](./CONTRACT-m2herd.md) is the historical build contract the m2herd herd
 was built against (v2.0 era + amendments) — where it disagrees with `skill/SKILL.md` ≥ 2.6.0,
@@ -224,7 +229,7 @@ herdr-factory-loop-skill/
     ├── fleet-loop.sh        ← meta-orchestrator loop over a fleet-control/ workspace (§13)
     ├── context-budget.sh    ← budget detect/status + slice-manifest decomposer (§15)
     ├── install-hermes-context.sh ← wires the Hermes context hooks into ~/.hermes/ (§15)
-    ├── m2herd.sh            ← .m2herd/ engine: boot/init/status/note/refile/resume/sync/archive/gist/next/config/evolve/dashboard/self-update/selftest (§16–§17)
+    ├── m2herd.sh            ← .m2herd/ engine: boot/init/status/note/refile/resume/sync/archive/gist/next/config/evolve/eval/loop/dashboard/self-update/selftest (§16–§18)
     ├── m2herd-up.sh         ← m2herd workspace bootstrap + worker dispatch/collect/down (§16)
     └── lint.sh              ← sanity checks on SKILL.md frontmatter & cross-refs
 ```
