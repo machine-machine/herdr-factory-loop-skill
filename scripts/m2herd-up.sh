@@ -430,6 +430,33 @@ resolve_self() {
   return 0
 }
 is_self() { [ -n "$SELF" ] && [ "$1" = "$SELF" ]; }
+# Close workspaces that `herdr worktree create` opened as a side effect. Only ever
+# called with ids that did NOT exist before this dispatch's create call; still never
+# closes the caller's own workspace or one that holds $SELF. Keeps the git worktree.
+close_stray_ws() { # close_stray_ws <ws_id>...
+  local w
+  for w in "$@"; do
+    [ -n "$w" ] || continue
+    [ "$w" = "${HERDR_WORKSPACE_ID:-}" ] && { log "! not closing workspace $w: it is \$HERDR_WORKSPACE_ID"; continue; }
+    if [ -n "$SELF" ] && herdr pane list 2>/dev/null | jq -e --arg w "$w" --arg s "$SELF" \
+         'any(.result.panes[]; .workspace_id==$w and .pane_id==$s)' >/dev/null 2>&1; then
+      log "! not closing workspace $w: it holds \$SELF ($SELF)"; continue
+    fi
+    # Already gone (e.g. auto-closed by a pane move) is fine.
+    herdr workspace list 2>/dev/null | jq -e --arg w "$w" 'any(.result.workspaces[]?; .workspace_id==$w)' >/dev/null 2>&1 || continue
+    if herdr workspace close "$w" >/dev/null 2>&1; then log "closed stray workspace $w (worktree kept on disk)"
+    else log "! could not close stray workspace $w — close it by hand"; fi
+  done
+}
+# Move the worktree's root pane (born in its own workspace) next to <target> in <tab>.
+# Prints the moved pane's NEW id (a move re-ids the pane); empty on failure.
+move_root_pane() { # move_root_pane <root_pane> <tab> <target_pane> <right|down>
+  local out
+  [ -n "$1" ] && [ -n "$2" ] && [ -n "$3" ] || return 1
+  is_self "$1" && return 1
+  out="$(herdr pane move "$1" --tab "$2" --target-pane "$3" --split "$4" --ratio 0.5 --no-focus 2>/dev/null)" || return 1
+  printf '%s' "$out" | jq -r '.result.move_result.pane.pane_id // empty' 2>/dev/null || true
+}
 # Fail-safe self test for DESTRUCTIVE ops (pane close): unknown $SELF counts as
 # "could be me" — returns 0 (refuse) and logs why.
 maybe_self() {
@@ -504,6 +531,10 @@ resolve_repo_ws() { # -> workspace_id or empty
 pane_tab_id() { # pane_tab_id <pane_id> -> tab_id
   herdr pane list 2>/dev/null | jq -r --arg p "$1" \
     '[.result.panes[] | select(.pane_id==$p)] | first | .tab_id // empty' 2>/dev/null || true
+}
+pane_ws_id() { # pane_ws_id <pane_id> -> workspace_id
+  herdr pane list 2>/dev/null | jq -r --arg p "$1" \
+    '[.result.panes[] | select(.pane_id==$p)] | first | .workspace_id // empty' 2>/dev/null || true
 }
 
 # Worker panes living in <tab> — every pane in the tab that is neither the
@@ -777,6 +808,10 @@ submit_pointer() { # submit_pointer <pane> <text>
   # logged "pointer submitted" while the worker sat at an empty prompt — three separate
   # sessions lost a wave to this before anyone read a pane. Try the verbs in order, and
   # say so loudly when none of them works instead of failing silently.
+  if [ "$AGENT" != prime ] && ! agent_registered "$pane"; then
+    log "! refusing pointer injection: no agent registered in pane $pane (text would land in the shell)"
+    return 1
+  fi
   if herdr agent prompt "$pane" "$text" >/dev/null 2>&1 \
      || herdr agent send "$pane" "$text" >/dev/null 2>&1 \
      || herdr pane send-text "$pane" "$text" >/dev/null 2>&1; then :; else
@@ -785,6 +820,65 @@ submit_pointer() { # submit_pointer <pane> <text>
   fi
   sleep "$SUBMIT_SETTLE"
   herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
+}
+
+# Wait for the worker TUI to come up in its pane BEFORE any pointer or Enter is sent.
+# A fresh worktree is a folder the agent has never seen, so Claude Code opens with its
+# workspace-trust dialog — "No, exit" preselected. The old fixed `sleep 2` then let
+# submit_pointer's Enter pick "No, exit", the agent quit, and the pointer retry typed
+# the task line into the bare shell ("bash: syntax error near unexpected token").
+# The trust prompt is answered ONLY for worktrees this engine just created under
+# ~/.herdr/worktrees (same content as the repo the orchestrator already works in);
+# anything else is left for a human. Returns 1 when no agent is up after the timeout.
+# herdr 0.9 renamed `agent wait --status` to `--until` (repeatable). The old flag now
+# exits 2 ("unknown option") at once, so every pane collect reported a timeout and
+# marked a finished worker failed. Try the new flag, fall back to the old one only on
+# a usage error. `done` counts as finished: a worker that ended its turn reports it.
+agent_wait_finished() { # agent_wait_finished <pane> <timeout_ms>
+  local rc=0
+  herdr agent wait "$1" --until idle --until "done" --timeout "$2" >/dev/null 2>&1 || rc=$?
+  [ "$rc" -eq 2 ] && { rc=0; herdr agent wait "$1" --status idle --timeout "$2" >/dev/null 2>&1 || rc=$?; }
+  return "$rc"
+}
+agent_registered() { # agent_registered <pane> -> 0 when herdr tracks an agent in it
+  herdr agent get "$1" 2>/dev/null | jq -e '.result.agent.agent_status // empty' >/dev/null 2>&1
+}
+await_agent_ready() { # await_agent_ready <pane> <worktree>
+  local pane="$1" wt="$2" i norm trusted=0 limit="${M2HERD_BOOT_TIMEOUT:-30}"
+  if [ "$DRY_RUN" -eq 1 ]; then
+    plan "wait ≤${limit}s for the agent TUI in '$pane' (answer the trust prompt for engine-created worktrees); no agent → state spawned-no-agent, no pointer sent"
+    return 0
+  fi
+  for ((i = 0; i < limit; i++)); do
+    norm="$(pane_norm_text "$pane" 40)"
+    case "$norm" in
+      *quicksafetycheck*trust*|*doyoutrustthe*|*trustthisfolder*)
+        if [ "$trusted" -eq 0 ]; then
+          case "$wt" in
+            "$HOME"/.herdr/worktrees/*)
+              log "dispatch: $AGENT asks to trust the new worktree $wt — accepting (engine-created worktree)"
+              herdr pane send-keys "$pane" Down >/dev/null 2>&1 || true
+              sleep 0.3
+              herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
+              trusted=1 ;;
+            *)
+              log "! dispatch: $AGENT shows a trust prompt for $wt (not an engine worktree) — answer it in pane $pane"
+              return 1 ;;
+          esac
+        fi
+        sleep 1; continue ;;
+    esac
+    if agent_registered "$pane"; then
+      [ "$i" -gt 0 ] && sleep 1   # registered ≠ input box ready; one beat more
+      return 0
+    fi
+    # prime-agent has no herdr integration: nothing ever registers. Fall back to a
+    # plain boot wait for it rather than failing every prime dispatch.
+    [ "$AGENT" = prime ] && [ "$i" -ge 2 ] && return 0
+    sleep 1
+  done
+  log "! dispatch: no $AGENT agent came up in pane $pane within ${limit}s — not sending the pointer (it would land in the shell)"
+  return 1
 }
 
 # ---------- pane inspection helpers (dispatch verify + watch) ------------------
@@ -1099,15 +1193,43 @@ dispatch_one() { # dispatch_one <slice>
   fi
 
   # 1. isolated worktree off BASE
-  local wt
+  #    `herdr worktree create` (0.9.x) ALWAYS opens a fresh workspace (tab + root
+  #    pane) for the worktree, and ALSO opens the source repo as a workspace when no
+  #    workspace has it open yet. Left alone, every slice leaves a stray "m2herd-<S>"
+  #    workspace (plus possibly a stray repo workspace) behind. We capture both and
+  #    dispose of them below: the root pane is MOVED into the orchestrator tab (the
+  #    move auto-closes the emptied workspace) or the workspace is closed (closing a
+  #    workspace keeps the git worktree on disk).
+  local wt wt_ws="" wt_root="" src_ws_new=""
   if [ "$DRY_RUN" -eq 1 ]; then
-    plan "herdr worktree create --cwd '$REPO' --branch '$branch' --base '$BASE' --label 'm2herd-$SLICE' --json"
+    plan "herdr worktree create --cwd '$REPO' --branch '$branch' --base '$BASE' --label 'm2herd-$SLICE' --no-focus --json   # capture .result.workspace + .result.root_pane"
     wt="$HOME/.herdr/worktrees/$(basename "$REPO")/wip-m2herd-$SLICE"
     log "(worktree path placeholder: $wt)"
   else
-    wt="$(herdr worktree create --cwd "$REPO" --branch "$branch" --base "$BASE" --label "m2herd-$SLICE" --json 2>/dev/null | jq -r '.result.worktree.path // empty')"
+    local wt_json ws_before
+    ws_before="$(herdr workspace list 2>/dev/null | jq -r '[.result.workspaces[]?.workspace_id] | join(" ")' 2>/dev/null || true)"
+    wt_json="$(herdr worktree create --cwd "$REPO" --branch "$branch" --base "$BASE" --label "m2herd-$SLICE" --no-focus --json 2>/dev/null || true)"
+    wt="$(printf '%s' "$wt_json" | jq -r '.result.worktree.path // empty' 2>/dev/null || true)"
     [ -n "$wt" ] || { echo "worktree create failed for $branch" >&2; exit 1; }
-    log "worktree: $wt ($branch off $BASE)"
+    wt_ws="$(printf '%s' "$wt_json" | jq -r '.result.workspace.workspace_id // empty' 2>/dev/null || true)"
+    wt_root="$(printf '%s' "$wt_json" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null || true)"
+    # A NEW non-worktree workspace for this repo that was not there before the call
+    # is the source-repo workspace herdr opened as a side effect.
+    src_ws_new="$(herdr workspace list 2>/dev/null | jq -r --arg before " $ws_before " --arg wt "$wt_ws" --arg r "$REPO" \
+      '[.result.workspaces[]? | .workspace_id as $id | select($id != $wt
+          and (($before | contains(" " + $id + " ")) | not)
+          and ((.worktree.is_linked_worktree // false) | not)
+          and ((.worktree.repo_root // "") == $r))] | .[].workspace_id' 2>/dev/null | tr '\n' ' ' || true)"
+    log "worktree: $wt ($branch off $BASE)${wt_ws:+ — herdr opened workspace $wt_ws (root pane ${wt_root:-?})}${src_ws_new:+; side-effect repo workspace(s) $src_ws_new}"
+  fi
+  # Headless has nothing to show: drop the workspaces the create call opened now.
+  if [ "$HEADLESS" -eq 1 ]; then
+    if [ "$DRY_RUN" -eq 1 ]; then
+      plan "herdr workspace close '<worktree workspace>' (+ any repo workspace the create opened)   # headless: no pane needed; worktree stays on disk"
+    else
+      # shellcheck disable=SC2086  # src_ws_new is a space-separated id list
+      close_stray_ws "$wt_ws" $src_ws_new
+    fi
   fi
 
   # Confinement (learned the hard way: the first live headless worker followed the
@@ -1224,9 +1346,11 @@ dispatch_one() { # dispatch_one <slice>
   #     owns the LEFT 50% of its tab (NEVER touched); every worker lives in the
   #     RIGHT 50% and subdivides it: 1 worker → right 50%; 2 → top-right 25% +
   #     bottom-right 25%; each further worker halves the LAST worker pane. We drive
-  #     this with `herdr pane split` — NOT `agent start --split` (stray-pane bug).
+  #     this by MOVING the worktree's root pane (`herdr pane move --tab --target-pane
+  #     --split`), falling back to `herdr pane split` — NOT `agent start --split`
+  #     (stray-pane bug). Either way no per-worker workspace is left behind.
   inside_herdr || warn_not_in_herdr " …or use --headless"
-  local wname="$AGENT-m2herd-$SLICE" pane runcmd="$bin${flag:+ $flag}"
+  local agent_up=1 wname="$AGENT-m2herd-$SLICE" pane runcmd="$bin${flag:+ $flag}"
   local orch_pane orch_tab last_worker split_pane split_dir
   orch_pane="$(resolve_orch_pane)"
   orch_tab=""
@@ -1266,9 +1390,21 @@ dispatch_one() { # dispatch_one <slice>
       anchor="$(herdr pane list 2>/dev/null | jq -r --arg w "$ws" \
         '[.result.panes[] | select(.workspace_id==$w)] | first | .pane_id // empty' 2>/dev/null || true)"
       if [ -n "$anchor" ] && ! is_self "$anchor"; then
-        log "! orchestrator pane unresolved (pane='${orch_pane:-}' tab='${orch_tab:-}') — splitting anchor pane $anchor in workspace $ws"
-        herdr pane split "$anchor" --direction right --ratio 0.5 --cwd "$wt" --no-focus >/dev/null 2>&1 || true
-        pane="$(resolve_pane_by_cwd_panes "$wt")"
+        log "! orchestrator pane unresolved (pane='${orch_pane:-}' tab='${orch_tab:-}') — placing worker beside anchor pane $anchor in workspace $ws"
+        # Reuse the worktree's root pane (move auto-closes its workspace); fall back
+        # to a fresh split and close the worktree workspace so it does not linger.
+        local moved="" anchor_tab; anchor_tab="$(pane_tab_id "$anchor")"
+        if [ "$wt_ws" != "$ws" ] && moved="$(move_root_pane "$wt_root" "$anchor_tab" "$anchor" right)"; then
+          log "worktree root pane $wt_root moved beside anchor $anchor (tab $anchor_tab)${moved:+ as $moved}"
+        else
+          moved=""
+          herdr pane split "$anchor" --direction right --ratio 0.5 --cwd "$wt" --no-focus >/dev/null 2>&1 || true
+          [ "$wt_ws" != "$ws" ] && close_stray_ws "$wt_ws"
+        fi
+        # The fallback home IS the repo workspace: keep a side-effect repo workspace
+        # only when it is the one we placed into; close any other.
+        local sw; for sw in $src_ws_new; do [ "$sw" = "$ws" ] || close_stray_ws "$sw"; done
+        pane="${moved:-$(resolve_pane_by_cwd_panes "$wt")}"
         [ -n "$pane" ] || { echo "new worker pane never appeared in pane list (cwd $wt)" >&2; exit 1; }
         is_self "$pane" && { echo "resolved worker pane is \$SELF ($pane) — refusing" >&2; exit 1; }
         sleep 1   # let the fresh pane's shell come up before we launch the worker
@@ -1277,6 +1413,9 @@ dispatch_one() { # dispatch_one <slice>
       else
         log "! orchestrator pane unresolved and workspace $ws has no anchor pane — last resort 'agent start --no-focus'"
         herdr agent start "$wname" --workspace "$ws" --cwd "$wt" --no-focus -- "$(command -v "$bin")" $flag >/dev/null 2>&1 || true
+        # The worktree's own (agentless) root pane is not used here: drop its workspace.
+        [ "$wt_ws" != "$ws" ] && close_stray_ws "$wt_ws"
+        local sw2; for sw2 in $src_ws_new; do [ "$sw2" = "$ws" ] || close_stray_ws "$sw2"; done
         pane="$(resolve_pane_by_cwd "$wt" "$wname")"
         [ -n "$pane" ] || { echo "worker pane never appeared in agent list (cwd $wt)" >&2; exit 1; }
         is_self "$pane" && { echo "resolved worker pane is \$SELF ($pane) — refusing" >&2; exit 1; }
@@ -1290,7 +1429,7 @@ dispatch_one() { # dispatch_one <slice>
         fi
         log "worker spawned (fallback): pane $pane ($wname) in workspace $ws"
       fi
-      sleep 2   # let the TUI boot before the pointer lands
+      await_agent_ready "$pane" "$wt" || agent_up=0
     fi
   else
     # Split target: the LAST existing worker (split DOWN, halving the right column)
@@ -1307,18 +1446,32 @@ dispatch_one() { # dispatch_one <slice>
     fi
     local split_note="${last_worker:+last worker $last_worker}"; split_note="${split_note:-no workers yet}"
     if [ "$DRY_RUN" -eq 1 ]; then
-      plan "herdr pane split '$split_pane' --direction $split_dir --ratio 0.5 --cwd '$wt' --no-focus   # orch=$orch_pane tab=$orch_tab, $split_note"
-      plan "resolve NEW worker pane by cwd '$wt' from 'herdr pane list' (retry; list can lag)"
+      plan "herdr pane move '<worktree root pane>' --tab '$orch_tab' --target-pane '$split_pane' --split $split_dir --ratio 0.5 --no-focus   # orch=$orch_pane, $split_note; auto-closes the worktree workspace"
+      plan "  (move fails -> herdr pane split '$split_pane' --direction $split_dir --ratio 0.5 --cwd '$wt' --no-focus, then herdr workspace close '<worktree workspace>')"
+      plan "herdr workspace close '<repo workspace the create opened, if any>'"
+      plan "resolve NEW worker pane from the move result, else by cwd '$wt' from 'herdr pane list' (retry; list can lag)"
       plan "sleep 1   # let the new pane's shell come up"
       plan "herdr pane run '<new-pane>' '$runcmd'   # submits command + Enter"
       plan "re-resolve worker agent by cwd from 'herdr agent list' before record"
       pane="PANE-DRYRUN"
     else
-      herdr pane split "$split_pane" --direction "$split_dir" --ratio 0.5 --cwd "$wt" --no-focus >/dev/null 2>&1 || true
-      pane="$(resolve_pane_by_cwd_panes "$wt")"
+      # Reuse the worktree's own root pane: MOVE it into the orchestrator tab at the
+      # split target (one pane, and herdr auto-closes the emptied worktree workspace).
+      # Fall back to a fresh split + closing the worktree workspace.
+      local moved="" how
+      if [ "$wt_ws" != "$(pane_ws_id "$orch_pane")" ] && moved="$(move_root_pane "$wt_root" "$orch_tab" "$split_pane" "$split_dir")"; then
+        how="moved worktree root pane $wt_root"
+      else
+        moved=""; how="split"
+        herdr pane split "$split_pane" --direction "$split_dir" --ratio 0.5 --cwd "$wt" --no-focus >/dev/null 2>&1 || true
+        close_stray_ws "$wt_ws"
+      fi
+      # shellcheck disable=SC2086  # src_ws_new is a space-separated id list
+      close_stray_ws $src_ws_new
+      pane="${moved:-$(resolve_pane_by_cwd_panes "$wt")}"
       [ -n "$pane" ] || { echo "new worker pane never appeared in pane list (cwd $wt) — the split may have created an orphan agentless pane in tab $orch_tab; close it by hand" >&2; exit 1; }
       is_self "$pane" && { echo "resolved worker pane is \$SELF ($pane) — refusing" >&2; exit 1; }
-      log "worker pane split beside orchestrator: $pane (split $split_pane --direction $split_dir @0.5)"
+      log "worker pane placed beside orchestrator: $pane ($how; target $split_pane --split $split_dir @0.5, tab $orch_tab)"
       sleep 1   # let the fresh pane's shell come up before we launch the worker
       herdr pane run "$pane" "$runcmd" >/dev/null 2>&1 || true
       # re-resolve the agent by cwd (agent registration can lag the pane); keep the
@@ -1327,7 +1480,7 @@ dispatch_one() { # dispatch_one <slice>
       [ -n "$apane" ] && pane="$apane"
       is_self "$pane" && { echo "resolved worker pane is \$SELF ($pane) — refusing" >&2; exit 1; }
       log "worker started in pane $pane (cwd $wt)"
-      sleep 2   # let the TUI boot before the pointer lands
+      await_agent_ready "$pane" "$wt" || agent_up=0
     fi
   fi
 
@@ -1337,6 +1490,12 @@ dispatch_one() { # dispatch_one <slice>
   wtask2="$(copy_task_into_wt "$wt")"
   pointer="$(confinement_line "$wt" "$branch") Read $wtask2 and follow its instructions exactly.$(lessons_pointer_suffix)"
   local dispatch_state="spawned"
+  if [ "${agent_up:-1}" -eq 0 ]; then
+    record_worker "$SLICE" "$pane" "$wt" "$branch" "spawned-no-agent"
+    trace_dispatch_write "$SLICE" "pane" "" "$branch" "$wt" || true
+    log "! dispatch: $SLICE recorded as state=spawned-no-agent — pane $pane has no running $AGENT; nothing was typed into it."
+    return 1
+  fi
   submit_pointer "$pane" "$pointer" || true
   # The recorded state must match what actually happened. Recording "spawned" for a
   # worker that never received its pointer is how three sessions came back to a fabric
@@ -1739,7 +1898,7 @@ collect() {
   if [ "$DRY_RUN" -eq 1 ]; then
     pane="$(jq -r --arg s "$SLICE" '[.workers[]? | select(.slice==$s)] | first | .pane_id // empty' "$OV" 2>/dev/null || true)"
     pane="${pane:-PANE-DRYRUN}"
-    plan "herdr agent wait '$pane' --status idle --timeout $WAIT_TIMEOUT"
+    plan "herdr agent wait '$pane' --until idle --until done --timeout $WAIT_TIMEOUT   # (--status idle on pre-0.9 herdr)"
     plan "herdr agent read '$pane' --source recent-unwrapped --lines 300  # → $out (unless worker already wrote it)"
     if [ "$NO_VERIFY" -eq 1 ]; then
       plan "verification SKIPPED (--no-verify)"
@@ -1863,7 +2022,7 @@ collect() {
   fi
 
   log "collect: waiting for $SLICE (pane $pane) to go idle (timeout ${WAIT_TIMEOUT}ms)"
-  if ! herdr agent wait "$pane" --status idle --timeout "$WAIT_TIMEOUT" >/dev/null 2>&1; then
+  if ! agent_wait_finished "$pane" "$WAIT_TIMEOUT"; then
     echo "worker $SLICE (pane $pane) did not reach idle within ${WAIT_TIMEOUT}ms" >&2
     set_worker_state "$SLICE" "failed"
     trace_collect_write "$SLICE" "failed" "" "" || true

@@ -117,8 +117,8 @@ Use `pane read` for *monitoring* (what is the agent doing?), the file protocol f
 ### 5. Monitor & wait
 Block until an agent changes state (the backbone of orchestration):
 ```bash
-herdr agent wait <target> --status idle    --timeout 600000   # ms; wait for it to finish
-herdr agent wait <target> --status blocked --timeout 600000   # wait until it needs you
+herdr agent wait <target> --until idle    --timeout 600000   # ms; wait for it to finish
+herdr agent wait <target> --until blocked --timeout 600000   # wait until it needs you
 herdr wait output <pane_id> --match "BUILD OK" --regex --timeout 120000
 ```
 Read what an agent produced:
@@ -151,7 +151,7 @@ for t in task_a task_b task_c; do
 done
 # converge: poll each to idle, then collect
 while read kv; do t=${kv%=*}; p=${kv#*=}
-  herdr agent wait $p --status idle --timeout 1800000
+  herdr agent wait $p --until idle --timeout 1800000
   herdr pane read $p --source recent-unwrapped --lines 300 > /tmp/$t.out
 done < /tmp/fleet.map
 ```
@@ -249,7 +249,7 @@ Or poll per-worker (simpler, fine for ≤10 workers):
 while read line; do
   t=${line%%=*}; rest=${line#*=}; p=${rest%%=*}; wt=${rest#*=}
   echo ">> $t: waiting…"
-  if ! herdr agent wait "$p" --status idle --timeout 1800000; then
+  if ! herdr agent wait "$p" --until idle --timeout 1800000; then
     echo "!! $t: timed out / errored"; continue
   fi
   if [ "$(herdr agent get "$p" | jq -r '.result.pane.agent_status')" = "blocked" ]; then
@@ -1176,8 +1176,8 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 | Spawn | `herdr agent start <name> --cwd P --no-focus -- "$(command -v <bin>)" <flags>` |
 | Dispatch | `herdr agent send <t> "…"` → `sleep 1` → `herdr pane send-keys <p> Enter` |
 | Deliverables | file protocol: prompt file → one-line pointer → `wait output --match <sentinel>` → read answer file (§4) |
-| Wait done | `herdr agent wait <t> --status idle --timeout MS` |
-| Wait needs-me | `herdr agent wait <t> --status blocked --timeout MS` |
+| Wait done | `herdr agent wait <t> --until idle --timeout MS` |
+| Wait needs-me | `herdr agent wait <t> --until blocked --timeout MS` |
 | Read output | `herdr agent read <t> --source recent --lines N` |
 | Unblock | read visible → `herdr pane send-keys <p> Enter` |
 | Worktree | `herdr worktree create --cwd P --branch B --base main` |
