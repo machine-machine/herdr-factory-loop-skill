@@ -130,7 +130,7 @@ herdr agent read   <target> [--source visible|recent|recent-unwrapped] [--lines 
 herdr agent send   <target> <text>             # literal text (no Enter); settle ~1s before send-keys Enter
 herdr agent rename <target> <name>|--clear
 herdr agent focus  <target>
-herdr agent wait   <target> --status idle|working|blocked|unknown [--timeout MS]
+herdr agent wait   <target> --until idle|working|blocked|done|unknown (repeatable; pre-0.9: --status) [--timeout MS]
 herdr agent attach <target> [--takeover]       # INTERACTIVE
 herdr agent start  <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>
 herdr agent explain <target> [--json|--verbose]

@@ -4,6 +4,42 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [Unreleased]
+
+### Fixed
+- m2herd dispatch no longer leaves one herdr workspace per worker. herdr 0.9's
+  `worktree create` always opens a workspace (tab + root pane) for the new
+  worktree, and also opens the source repo as a workspace when none has it open.
+  Dispatch now passes `--no-focus`, captures both, and:
+  - pane runner: MOVES the worktree's root pane into the orchestrator tab
+    (`herdr pane move --tab --target-pane --split right|down`), which auto-closes
+    the emptied workspace; workers stay sub-panes of the orchestrator tab
+    (1st → right 50%, then each splits DOWN under the last worker). If the move
+    fails it falls back to the old `pane split` and closes the worktree workspace.
+  - headless runner: closes the worktree workspace right after creation.
+  - orchestrator-unresolved fallback: moves the root pane beside the repo
+    workspace's anchor pane (or splits + closes), and closes the worktree
+    workspace after the last-resort `agent start` too.
+  - a repo workspace that the create call opened as a side effect is closed
+    (except in the fallback, where it is the placement target).
+  Closing a workspace keeps the git worktree on disk; workspaces that existed
+  before the create call, `$HERDR_WORKSPACE_ID`, and any workspace holding
+  `$SELF` are never closed.
+- Pane workers no longer quit at Claude Code's workspace-trust dialog. A fresh
+  worktree is an unseen folder, so Claude opens with "No, exit" preselected; the
+  fixed `sleep 2` let the pointer's Enter pick it, the agent exited, and the retry
+  typed the task line into the bare shell (`bash: syntax error near unexpected
+  token`). Dispatch now waits (≤`M2HERD_BOOT_TIMEOUT`, default 30 s) for the agent
+  to register in its pane, answers the trust prompt only for worktrees it created
+  under `~/.herdr/worktrees`, and records `state=spawned-no-agent` without typing
+  anything when no agent comes up. `submit_pointer` refuses to inject into a pane
+  with no registered agent (except prime, which has no herdr integration).
+- Pane collect works on herdr 0.9: `agent wait --status` was renamed to
+  `--until` (the old flag exits 2 at once, so every pane collect reported a
+  timeout and marked a finished worker failed). Collect now waits
+  `--until idle --until done`, falling back to `--status idle` on older herdr.
+  SKILL.md / reference.md examples updated.
+
 ## [2.8.2] - 2026-09-15
 
 ### Fixed
