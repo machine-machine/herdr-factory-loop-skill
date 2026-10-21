@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""herd-board — the ONE status panel in the right third of the orchestrator tab.
+
+Usage: herd-board [--anchor <pane>] [<herd-dir> ...]
+       herd-board --open [--anchor <pane>]     (open the panel next to the anchor unless it is live)
+
+Shows, one line each (icon, name, n/m, short text, age):
+  - herd workers of every herd dir given or listed in ~/.cache/herd-board/<anchor>.herds
+    (dir holds herd.map "slice=pane", optional queue.txt, <slice>.status.json, <slice>.out.md);
+    a worker whose pane is closed after its report is finished and drops off the board
+  - the orchestrator's own subagents, registered by hooks/herd-board-subagents.py in
+    ~/.cache/herd-board/<anchor>.agents/ (text = the subagent's last action)
+The panel height is shared evenly: one worker gets its progress bar, sentence and step feed, ten get a line each.
+Footer: open PRs of finished workers ("ready to merge", with the orchestrator's sign-off state) and today's merges.
+Closes itself after IDLE_CLOSE_MIN with nothing to show. Never sends keys. Repaints every 5 s.
+
+Worker status contract (<slice>.status.json, written by the worker, English or German keys):
+  {"sentence"|"satz": "...", "step"|"schritt": 3, "of"|"von": 6, "missing"|"fehlt": "...",
+   "short"|"kurz": "3-6 words", "pr": "PR #12" | "api #12 + ui #4" | "https://github.com/o/r/pull/12"}
+Orchestrator sign-off (<slice>.signoff or <slice>.freigabe): lines "<repo> #<n> <head-sha>" — valid only while the
+PR head still equals that sha.
+
+Environment:
+  HERD_BOARD_LANG   en (default) | de
+  HERD_BOARD_ORG    GitHub owner for short PR refs and the "merged today" line (unset: no merged-today line)
+  HERD_BOARD_REPOS  short names used in PR refs, e.g. "api=my-api,ui=my-ui" (unset: "#n" = the worker's own repo)
+  NO_COLOR          plain text
+"""
+import calendar, glob, json, os, re, shlex, shutil, subprocess, sys, textwrap, time
+
+CACHE = os.path.expanduser("~/.cache/herd-board")
+IDLE_CLOSE_MIN = 5      # nothing to show for this long -> the panel closes itself
+AGENT_DONE_KEEP_MIN = 2  # a finished subagent stays visible this long
+ORG = os.environ.get("HERD_BOARD_ORG", "")
+REPOS = dict(p.split("=", 1) for p in os.environ.get("HERD_BOARD_REPOS", "").split(",") if "=" in p)
+SHORT = {v: k for k, v in REPOS.items()}
+
+LANG = "de" if os.environ.get("HERD_BOARD_LANG", "").lower().startswith("de") else "en"
+STRINGS = {
+    "en": {"title": "Herd", "free": "GB free", "load": "load", "done": "done", "check": "check", "working": "working",
+           "still": "still", "needs_answer": "needs an answer", "paused": "paused (memory), resumes as no. {pos}",
+           "waiting": "waiting, starts as no. {pos}", "ended": "ended without a report", "missing": "missing:",
+           "blocked": "blocked", "since": "since", "ready": "Ready to merge", "signed": "signed off, waiting for merge",
+           "in_review": "in review", "no_review": "no review yet", "merged": "Merged today ", "more": "more",
+           "idle": "nothing running",
+           "read": "reads {f}", "edit": "edits {f}", "write": "writes {f}", "grep": "searches “{p}”",
+           "glob": "looks for files {p}", "send": "reports to the orchestrator", "monitor": "waits for a result",
+           "tests": "runs the tests", "build": "checks and builds the UI", "shots": "takes screenshots",
+           "devsrv": "UI preview is running", "srv": "test server is running", "deps": "installs packages",
+           "push": "uploads"},
+    "de": {"title": "Herde", "free": "GB frei", "load": "Last", "done": "fertig", "check": "prüfen", "working": "arbeitet",
+           "still": "still", "needs_answer": "braucht Antwort", "paused": "pausiert (Speicher), geht als {pos}. weiter",
+           "waiting": "wartet, startet als {pos}.", "ended": "beendet ohne Bericht", "missing": "fehlt:",
+           "blocked": "blockiert", "since": "seit", "ready": "Merge-bereit", "signed": "geprüft, wartet auf Merge-Wort",
+           "in_review": "in Prüfung", "no_review": "noch ohne Review", "merged": "Heute gemergt ", "more": "weitere",
+           "idle": "nichts läuft",
+           "read": "liest {f}", "edit": "ändert {f}", "write": "schreibt {f}", "grep": "sucht „{p}“",
+           "glob": "sucht Dateien {p}", "send": "meldet sich beim Orchestrator", "monitor": "wartet auf ein Ergebnis",
+           "tests": "lässt die Tests laufen", "build": "prüft und baut die Oberfläche", "shots": "macht Bildschirmfotos",
+           "devsrv": "Vorschau der Oberfläche läuft", "srv": "Test-Server läuft", "deps": "installiert Pakete",
+           "push": "lädt hoch"},
+}
+
+
+def t(key, **kw):
+    return STRINGS[LANG][key].format(**kw)
+
+
+def field(st, en, de):
+    """A status.json field under its English or German key."""
+    return st.get(en, st.get(de))
+
+# Only the 16 theme colours (follow the terminal's palette), one meaning each, never meaning by colour alone (the icons
+# stay): red = needs me, yellow = waiting/attention, green = done/ok, cyan = herd worker running, blue = numbers and
+# progress, magenta = my subagents and references (PR #, commit). Dim = secondary. NO_COLOR (no-color.org) turns it off.
+_C = not os.environ.get("NO_COLOR")
+DIM, BOLD, ITAL, GREEN, RED, CYAN, YEL, BLUE, MAG, RST = (
+    ("\033[2m", "\033[1m", "\033[3m", "\033[32m", "\033[31m", "\033[36m", "\033[33m", "\033[34m", "\033[35m", "\033[0m")
+    if _C else ("",) * 10)
+# words and references that carry their own colour wherever they appear
+TOKENS = [
+    (re.compile(r"(?<![\w#])(?:PR\s)?#\d+\b|\b[a-z][\w-]{1,20}\s#\d+\b"), MAG),
+    (re.compile(r"\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,12}\b"), YEL),
+    (re.compile(r"\b(?:done|merged|green|passed|ok|fertig|gemergt|grün|bestanden)\b", re.I), GREEN),
+    (re.compile(r"\b(?:blocked|failed|errors?|red|aborted|blockiert|Fehler\w*|rot|fehlgeschlagen|abgebrochen)\b",
+                re.I), RED),
+    (re.compile(r"\b\d+(?:[.,]\d+)?\s?(?:%|GB|MB|ha|min|h|Min|Std|tests?|Tests?)\b|\b\d+/\d+\b"), BLUE),
+]
+
+
+def paint(text, base=""):
+    """`text` in `base` with the TOKENS coloured; after each token the base style comes back."""
+    if not _C or not text:
+        return text
+    spans = []
+    for rx, col in TOKENS:
+        for m in rx.finditer(text):
+            if not any(a < m.end() and m.start() < b for a, b, _ in spans):
+                spans.append((m.start(), m.end(), col))
+    out, pos = base, 0
+    for a, b, col in sorted(spans):
+        out += text[pos:a] + RST + col + text[a:b] + RST + base
+        pos = b
+    return out + text[pos:] + (RST if base else "")
+STILL_MIN = 10          # no transcript write and no process for this long -> "still"
+
+# what a process in the worktree means, in plain words (first match wins); tests and builds get the ⧗ icon
+PROCS = [
+    (r"pytest|vitest|jest|go test|cargo test", t("tests")),
+    (r"next build|npm run build|tsc --noEmit|next lint|npm run lint", t("build")),
+    (r"playwright|chrom", t("shots")),
+    (r"next dev|next-server|vite", t("devsrv")),
+    (r"uvicorn|gunicorn", t("srv")),
+    (r"npm ci|npm install|uv sync|uv pip|pip install", t("deps")),
+    (r"git push|gh pr", t("push")),
+]
+LONG_RUNS = {t("tests"), t("build")}
+
+
+def herdr_agents():
+    try:
+        r = subprocess.run(["herdr", "agent", "list"], capture_output=True, text=True, timeout=10)
+        return {a["pane_id"]: a for a in json.loads(r.stdout)["result"]["agents"]}
+    except Exception:
+        return {}
+
+
+def procs_in(slice_name):
+    """Plain-word activities of processes whose cwd lies in any worktree of this slice."""
+    roots = glob.glob(os.path.expanduser(f"~/.herdr/worktrees/*/{slice_name}"))
+    found = []
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+            if not any(cwd == r or cwd.startswith(r + "/") for r in roots):
+                continue
+            args = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace")
+            start = os.stat(f"/proc/{pid}").st_mtime
+        except OSError:
+            continue
+        if "claude" in args.split(" ")[0] or re.search(r"mcp|hermes", args):
+            continue  # Claude itself and its tool servers (playwright-mcp) are not activities
+        for rank, (pat, words) in enumerate(PROCS):
+            if re.search(pat, args):
+                found.append((rank, words, start))
+                break
+    best = {}
+    for rank, words, start in found:  # oldest process per activity, most telling activity first
+        r0, s0 = best.get(words, (rank, start))
+        best[words] = (rank, min(start, s0))
+    return [(w, st) for w, (r, st) in sorted(best.items(), key=lambda kv: kv[1][0])]
+
+
+def transcript_age(cwd):
+    d = os.path.expanduser("~/.claude/projects/" + re.sub(r"[/.]", "-", cwd))
+    files = glob.glob(os.path.join(d, "*.jsonl"))
+    return (time.time() - max(os.path.getmtime(f) for f in files)) / 60 if files else None
+
+
+def read_list(path):
+    try:
+        return [l.strip() for l in open(path) if l.strip()]
+    except OSError:
+        return []
+
+
+def kurz(st):
+    """3-6 words: the worker's own short line, else the first clause of its sentence."""
+    k = field(st, "short", "kurz") or re.split(r"[:;,–—(]", field(st, "sentence", "satz") or "")[0]
+    return " ".join(k.split())
+
+
+def tool_words(c):
+    """One tool call in a few plain words."""
+    inp, name = c.get("input") or {}, c.get("name", "")
+    f = os.path.basename(inp.get("file_path", "") or inp.get("path", ""))
+    p = inp.get("pattern", "")[:30]
+    if inp.get("description"):
+        return ("🤖 " if name in ("Agent", "Task") else "") + inp["description"]
+    return {"Read": t("read", f=f), "Edit": t("edit", f=f), "Write": t("write", f=f), "Grep": t("grep", p=p),
+            "Glob": t("glob", p=p), "SendMessage": t("send"),
+            "Bash": "",  # a raw command line says nothing at a glance; only described ones are shown
+            "Monitor": t("monitor")}.get(name, name)
+
+
+def recent_actions(jsonl, k):
+    """The last k steps of a transcript, oldest first: (minutes ago, text). Text replies start with ›."""
+    if not jsonl or k <= 0:
+        return []
+    try:
+        with open(jsonl, "rb") as f:
+            f.seek(max(0, os.path.getsize(jsonl) - 4194304))  # tool results (screenshots) are large
+            lines = f.read().decode(errors="replace").splitlines()
+    except OSError:
+        return []
+    out = []
+    for line in reversed(lines):
+        try:
+            d = json.loads(line)
+        except ValueError:
+            continue
+        msg = d.get("message") or {}
+        if d.get("type") != "assistant" or not isinstance(msg.get("content"), list):
+            continue
+        try:
+            ago = (time.time() - calendar.timegm(time.strptime(d["timestamp"][:19], "%Y-%m-%dT%H:%M:%S"))) / 60
+        except (KeyError, ValueError):
+            ago = 0
+        for c in reversed(msg["content"]):
+            if c.get("type") == "tool_use" and c.get("name") not in ("TodoWrite", "ToolSearch") and tool_words(c):
+                out.append((ago, tool_words(c)))
+            elif c.get("type") == "text" and c.get("text", "").strip():
+                out.append((ago, "› " + " ".join(c["text"].split())))
+            if len(out) >= k:
+                return out[::-1]
+    return out[::-1]
+
+
+def last_action(jsonl):
+    acts = recent_actions(jsonl, 1)
+    return acts[0][1] if acts else ""
+
+
+def newest_jsonl(cwd):
+    files = glob.glob(os.path.join(os.path.expanduser("~/.claude/projects/" + re.sub(r"[/.]", "-", cwd)), "*.jsonl"))
+    return max(files, key=os.path.getmtime) if files else None
+
+
+def agent_rows(anchor):
+    rows = []
+    for reg in glob.glob(os.path.join(CACHE, f"{anchor.replace(':', '_')}.agents", "*")):
+        try:
+            label, jsonl = open(reg).read().split("\n", 1)
+            jsonl = jsonl.strip()
+            meta = json.load(open(jsonl[:-6] + ".meta.json")) if os.path.exists(jsonl[:-6] + ".meta.json") else {}
+            age = (time.time() - os.path.getmtime(jsonl)) / 60
+        except (OSError, ValueError):
+            continue
+        tail = f"{int(age)}m" if age >= 1 else ""
+        detail = {"jsonl": jsonl}
+        if meta.get("finished"):
+            if age > AGENT_DONE_KEEP_MIN:
+                os.unlink(reg)
+                continue
+            rows.append((1, label, "✓", GREEN, "", t("done"), "", detail))
+        elif age >= STILL_MIN:
+            rows.append((0, label, "⚠", RED, "", f"{t('still')} {tail}", "", detail))
+        else:
+            rows.append((2, label, "◆", MAG, "", last_action(jsonl) or t("working"), tail, detail))
+    return rows
+
+
+PR_STATE = {}           # (repo, n) -> (state, head sha, checked_at); GitHub is asked at most every PR_CHECK_S per PR
+PR_CHECK_S = 45
+
+
+def pr_state(repo, n, cwd=None):
+    """(state, head sha) of a PR, cached PR_CHECK_S seconds. `repo` is "owner/name", a bare name under
+    HERD_BOARD_ORG, or empty — then gh resolves the repo from the git remote of `cwd` (the worker's worktree)."""
+    slug = repo if "/" in repo else f"{ORG}/{repo}" if repo and ORG else ""
+    key = (slug or cwd or repo, n)
+    st, head, at = PR_STATE.get(key, (None, None, 0))
+    if time.time() - at < PR_CHECK_S:
+        return st, head
+    if slug or cwd:
+        try:
+            r = subprocess.run(["gh", "pr", "view", str(n), *(["-R", slug] if slug else []), "--json",
+                                "state,headRefOid", "-q", '.state + " " + .headRefOid'],
+                               capture_output=True, text=True, timeout=8, cwd=None if slug else cwd)
+            st, head = (r.stdout.split() + [None, None])[:2] if r.stdout.strip() else (st, head)
+        except Exception:
+            pass
+    PR_STATE[key] = (st, head, time.time())
+    return st, head
+
+
+MERGED = {"at": 0, "day": "", "prs": {}}   # repo short -> sorted PR numbers merged today (org-wide), cached
+MERGED_CHECK_S = 120
+
+
+def merged_today():
+    """PRs of HERD_BOARD_ORG merged today, grouped by repo: {"api": [176, 177, …], "ui": [72, 73]}."""
+    if not ORG:
+        return {}
+    day = time.strftime("%Y-%m-%d")
+    if MERGED["day"] == day and time.time() - MERGED["at"] < MERGED_CHECK_S:
+        return MERGED["prs"]
+    try:
+        r = subprocess.run(["gh", "api", "-X", "GET", "search/issues", "-f",
+                            f"q=org:{ORG} is:pr is:merged merged:>={day}", "-f", "per_page=100", "--jq",
+                            '.items[] | "\\(.repository_url | split("/") | last) \\(.number)"'],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            prs = {}
+            for line in r.stdout.split("\n"):
+                if line.strip():
+                    repo, n = line.split()
+                    prs.setdefault(SHORT.get(repo, repo), []).append(int(n))
+            MERGED.update(prs={k: sorted(v) for k, v in prs.items()}, day=day)
+    except Exception:
+        pass
+    MERGED["at"] = time.time()
+    return MERGED["prs"]
+
+
+def signoffs(herd, s):
+    """The orchestrator's sign-offs `<slice>.signoff` (or `.freigabe`): lines "<repo> #<n> <sha>" — the exact PR
+    head it accepted after review or re-check. Written by the orchestrator, never by the worker."""
+    out = {}
+    for ext in ("signoff", "freigabe"):
+        for l in read_list(os.path.join(herd, f"{s}.{ext}")):
+            m = re.match(r"(\S+)\s+#(\d+)\s+([0-9a-f]{7,40})", l)
+            if m:
+                out[(m[1].lower(), int(m[2]))] = m[3]
+    return out
+
+
+def ready_prs(herds, agents):
+    """Open PRs of workers that are done (report written, not working any more): (short repo, n, slice, review)."""
+    out = []
+    for herd in herds:
+        for s, pane in (l.split("=", 1) for l in read_list(os.path.join(herd, "herd.map")) if "=" in l):
+            rep = os.path.join(herd, f"{s}.out.md")
+            a = agents.get(pane)
+            if not os.path.exists(rep) or (a and a["agent_status"] == "working"):
+                continue
+            try:
+                pr = str(json.load(open(os.path.join(herd, f"{s}.status.json"))).get("pr") or "")
+            except (OSError, ValueError):
+                continue
+            wts = glob.glob(os.path.expanduser(f"~/.herdr/worktrees/*/{s}"))
+            wt = a["cwd"] if a else (wts[0] if wts else None)
+            home = os.path.basename(os.path.dirname(wt)) if wt else ""
+            refs = []  # (repo for gh — "" = the worker's own repo, name shown on the board, n)
+            for m in re.finditer(r"(?:\b([a-z][\w-]*)\s+)?(?:PR\s*)?#(\d+)", pr, re.I):
+                short = (m[1] or "").lower()
+                repo = REPOS.get(short) or (short if short in SHORT else "")
+                refs.append((repo, SHORT.get(repo, repo) or SHORT.get(home, home), int(m[2])))
+            for m in re.finditer(r"github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)", pr):
+                name = m[1].split("/")[1]
+                refs.append((m[1], SHORT.get(name, name), int(m[2])))
+            rv = os.path.join(herd, f"{s}.review.md")
+            ok = signoffs(herd, s)
+            for repo, shown, n in dict.fromkeys(refs):
+                state, head = pr_state(repo, n, wt)
+                if state not in (None, "OPEN"):
+                    continue
+                signed = ok.get((shown.lower(), n)) or ok.get((repo.lower(), n)) or ok.get(("pr", n))
+                # sign-off on exactly this head beats any file-time guess; a newer push voids it
+                review = "ok" if signed and head and head.startswith(signed) else \
+                    "alt" if signed or os.path.exists(rv) else ""
+                out.append((shown, n, s, review))
+    return out
+
+
+def herd_rows(herd, agents):
+    pairs = [l.split("=", 1) for l in read_list(os.path.join(herd, "herd.map")) if "=" in l]
+    queue = read_list(os.path.join(herd, "queue.txt"))
+    rows = []
+    for s, pane in pairs:
+        a = agents.get(pane)
+        if not a and s not in queue and os.path.exists(os.path.join(herd, f"{s}.out.md")):
+            continue  # report written and window closed: finished, nothing left to look at
+        st_file = os.path.join(herd, f"{s}.status.json")
+        try:
+            st = json.load(open(st_file))
+        except (OSError, ValueError):
+            st = {}
+        report = os.path.exists(os.path.join(herd, f"{s}.out.md"))
+        acts = procs_in(s)
+        t_age = transcript_age(a["cwd"]) if a else None
+        age = f"{int(t_age)}m" if t_age is not None and t_age >= 1 else ""
+        n, m = field(st, "step", "schritt"), field(st, "of", "von")
+        prog = f"{n}/{m}" if isinstance(n, int) and isinstance(m, int) else ""
+        text = kurz(st)
+        # (sort key, icon, colour, text) — what needs me first, then running, then waiting
+        if report and (not a or a["agent_status"] in ("idle", "done")) and not acts:
+            row = (1, "✓", GREEN, st.get("pr") or t("done"), t("check"))
+        elif a and a["agent_status"] == "blocked":
+            row = (0, "?", YEL, t("needs_answer"), "")
+        elif s in queue:
+            pos = queue.index(s) + 1
+            row = (4 + pos / 100, "◌", DIM, t("paused", pos=pos) if st else t("waiting", pos=pos), "")
+        elif not a:
+            row = (0, "✕", RED, t("ended"), "")
+        elif not acts and a["agent_status"] != "working" and t_age is not None and t_age >= STILL_MIN:
+            row = (0, "⚠", RED, f"{t('still')} {age}", "")
+        else:
+            busy = acts[0][0] if acts else ""
+            icon = "⧗" if busy in LONG_RUNS else "●"
+            row = (2, icon, CYAN, text or busy or t("working"), age)
+        detail = {"satz": field(st, "sentence", "satz") or "", "fehlt": field(st, "missing", "fehlt") or "", "n": n, "m": m, "acts": acts,
+                  "jsonl": newest_jsonl(a["cwd"]) if a else None}
+        rows.append((row[0], s, row[1], row[2], prog, row[3], row[4], detail))
+    return rows
+
+
+def bar(n, m, width=10, col=""):
+    k = round(width * n / m) if m else 0
+    return f"{col}{'█' * k}{RST}{DIM}{'░' * (width - k)}{RST} {BLUE}{n}/{m}{RST}"
+
+
+def bar_len(width=10, n=0, m=0):
+    return width + 1 + len(f"{n}/{m}")
+
+
+def wrap(text, width, maxlines):
+    """Whole words over at most `maxlines` lines, never an ellipsis. Too long: keep the longest run of whole clauses
+    that fits (cut after , ; . : or a dash); only without any clause break is it cut after the last whole word."""
+    w = lambda t: textwrap.wrap(t, max(8, width), break_on_hyphens=False, break_long_words=False)
+    text = " ".join(str(text).split())
+    lines = w(text)
+    if maxlines <= 0 or len(lines) <= maxlines:
+        return lines[:max(0, maxlines)]
+    cuts = [m.start() for m in re.finditer(r"[,;.:](?=\s)|\s[–—]\s", text)]
+    for c in reversed(cuts):
+        part = w(text[:c].rstrip(" ,;:–—"))
+        if part and len(part) <= maxlines:
+            return part
+    return lines[:maxlines]
+
+
+def first_sentence(text):
+    """A worker's reply shortened to its first sentence (or clause before a colon) — the feed shows the gist, not the prose."""
+    m = re.match(r"(.+?[.!?:])(\s|$)", text)
+    return (m.group(1) if m else text).rstrip(":")
+
+
+def detail_lines(row, budget, w):
+    """Up to `budget` extra lines for one worker, most telling first; the step feed fills the rest. Long lines wrap."""
+    _, _, _, col, _, head_text, _, d = row
+    tw = w - 2
+    lines = []
+    label = t("missing")
+    fehlt = (label + " " + re.sub(r"^(?:blocked|blockiert):\s*", t("blocked") + ", ", d["fehlt"])) if d.get("fehlt") else ""
+    # what is still missing is all yellow (label bold), so it never reads like the goal above it
+    fehlt_paint = lambda l: (f"{BOLD}{YEL}{label}{RST}" + paint(l[len(label):], YEL)) if l.startswith(label + " ") \
+        else paint(l, YEL)
+    if isinstance(d.get("n"), int) and isinstance(d.get("m"), int) and d["m"]:
+        # bar and "missing" share a line; the rest of it wraps below
+        bl = bar_len(n=d["n"], m=d["m"])
+        b = bar(d["n"], d["m"], col=col)
+        part = wrap("\x00" * bl + " " + fehlt, tw, 3) if fehlt else []  # placeholder word holds the bar's place
+        lines += [b + " " + fehlt_paint(part[0][bl:].lstrip())] + [fehlt_paint(p) for p in part[1:]] if part else [b]
+    elif fehlt:
+        lines += [fehlt_paint(l) for l in wrap(fehlt, tw, 3)]
+    satz = " ".join(d.get("satz", "").split())
+    head = " ".join(head_text.split())
+    if head and satz.startswith(head):
+        satz = satz[len(head):].lstrip(" ,;:–—")  # the header already says the first clause
+    if satz:
+        lines += [paint(l) for l in wrap(satz, tw, 5 if budget >= 14 else 3)]
+    for words, start in d.get("acts", []):
+        part = wrap(f"⧗ {words} {t('since')} {int((time.time() - start) / 60)}m", tw, 2)
+        lines += [f"{CYAN}⧗{RST}" + paint(part[0][1:])] + [paint(p) for p in part[1:]]
+    lines = lines[:budget]
+    room = budget - len(lines)
+    if room > 0:
+        # newest first until the room is full; the age only where it changes, wrapped lines indented under the text
+        picked, used = [], 0
+        for ago, text in reversed(recent_actions(d.get("jsonl"), room + 1)):
+            if text == head_text:
+                continue
+            # at most two lines per step and never a cut-off phrase: a reply shrinks to its first sentence,
+            # then to its first clause, and is left out if even that is too long
+            if text.startswith("› "):
+                full = [first_sentence(text[2:]), re.split(r"[,;–—(]", text[2:])[0]]
+                part = next((p for p in (wrap("› " + t, tw - 5, 3) for t in full) if len(p) <= 2), [])
+                if not part:
+                    continue
+            else:
+                part = wrap(text, tw - 5, 2)
+            if not part or used + len(part) > room:
+                break
+            picked.insert(0, (f"{int(ago)}m" if ago >= 1 else "<1m", part))
+            used += len(part)
+        last = None
+        for age, part in picked:
+            gut = f"{age:>4} " if age != last else "     "
+            # replies (›) in normal italic text, tool steps dimmed; the age gutter always dim
+            reply = part[0].startswith("› ")
+            for i, p in enumerate(part):
+                g = f"{DIM}{gut if i == 0 else '     '}{RST}"
+                if reply:
+                    lines.append(g + (f"{MAG}›{RST}" + paint(p[1:], ITAL) if i == 0 else paint(p, ITAL)))
+                else:
+                    lines.append(g + paint(p, DIM))
+            last = age
+    return [f"  {l}" for l in lines]
+
+
+def herd_dirs(anchor, given):
+    listed = read_list(os.path.join(CACHE, f"{anchor.replace(':', '_')}.herds")) if anchor else []
+    return list(dict.fromkeys(given + listed))
+
+
+def render(anchor, given):
+    w = max(20, shutil.get_terminal_size((66, 40)).columns - 1)
+    agents = herdr_agents()
+    rows = [r for h in herd_dirs(anchor, given) for r in herd_rows(h, agents)]
+    rows += agent_rows(anchor) if anchor else []
+    l1 = float(open("/proc/loadavg").read().split()[0])
+    mem = next(int(x.split()[1]) / 1048576 for x in open("/proc/meminfo") if x.startswith("MemAvailable"))
+    cores = os.cpu_count() or 1
+    warn = mem < 2.5 or l1 > 2 * cores
+    mcol = GREEN if mem >= 5 else YEL
+    head = f"{BOLD}{CYAN}{t('title')}{RST} {DIM}{time.strftime('%H:%M')}{RST}  " + \
+        (f"{RED}⚠ {t('load')} {l1:.0f} · {mem:.1f} {t('free')}{RST}" if warn else f"{mcol}{mem:.0f} {t('free')}{RST}")
+    height = shutil.get_terminal_size((66, 40)).lines - 1
+    rows = sorted(rows, key=lambda r: r[:2])
+    # footer: open PRs of finished workers, waiting for the merge word — one line each, at most 6
+    ready = ready_prs(herd_dirs(anchor, given), agents)[:6]
+    foot = []
+    if ready:
+        foot = ["", f"{BOLD}{GREEN}{t('ready')}{RST}"]
+        for repo, n, s, review in ready:
+            rv = f"{GREEN}{t('signed')}{RST}" if review == "ok" else \
+                f"{YEL}{t('in_review')}{RST}" if review == "alt" else f"{DIM}{t('no_review')}{RST}"
+            foot.append(f"  {MAG}{(repo + ' ') if repo else ''}#{n}{RST} {BOLD}{s}{RST} {rv}")
+    # below it: everything merged today, all repos in one list, numbers in green (wrapped at whole numbers)
+    merged = merged_today()
+    if merged:
+        # one compact line: the numbers start right after the label, wrapped lines continue under them
+        nums = " ".join(str(n) for n in sorted(n for v in merged.values() for n in v))  # no "#": saves a line
+        label = t("merged")
+        parts = textwrap.wrap(nums, max(10, w - len(label)))
+        foot += [""] + [(f"{BOLD}{GREEN}{label}{RST}" if i == 0 else " " * len(label)) + f"{GREEN}{p}{RST}"
+                        for i, p in enumerate(parts)]
+    # adaptive: the panel's height is shared evenly — one worker gets a full picture plus its step feed,
+    # ten workers get one line each; a blank separator only when every worker has room to spare
+    free = height - 1 - len(foot)
+    sep = 1 if rows and free // len(rows) >= 4 else 0
+    shown = rows[:free] if len(rows) > free else rows
+    if len(shown) < len(rows):
+        shown = rows[:free - 1]
+    per, extra = (divmod(free - sep * (len(shown) - 1), len(shown)) if shown else (0, 0))
+    out = [head]
+    for i, row in enumerate(shown):
+        _, s, icon, col, prog, text, tail, detail = row
+        budget = per + (1 if i < extra else 0) - 1
+        has_bar = budget > 0 and isinstance(detail.get("n"), int) and detail.get("m")
+        prog = "" if has_bar else prog  # the bar line carries n/m when there is room for it
+        name = s[:max(8, w - 8)]  # full name; only an absurdly long label is clipped
+        # line 1 is the worker's heading: icon and the one-word name in its state colour (name bold), the goal in
+        # plain text after it — name and goal never share a colour, and "missing" below is yellow
+        goal = ""
+        left = f"{col}{icon}{RST} {BOLD}{col}{name}{RST} " + (f"{BLUE}{prog}{RST} " if prog else "")
+        room = w - len(name) - 3 - (len(prog) + 1 if prog else 0) - (len(tail) + 1 if tail else 0)
+        if sep and i:
+            out.append("")
+        words = text.split()
+        # the state text follows the name when it has room, otherwise it starts on its own line
+        first = (wrap(text, room, 1) or [""])[0] if room >= 14 and text else ""
+        first = first if len(first) <= room else ""
+        rest = " ".join(words[len(first.split()):])
+        out.append(left + paint(first, goal) + (f" {DIM}{tail}{RST}" if tail else ""))
+        cont = wrap(rest, w - 2, 2 if budget > 6 else 1 if budget > 2 else 0) if rest else []
+        out += [f"  {paint(l, goal)}" for l in cont]
+        out += detail_lines(row, budget - len(cont), w)
+    if len(shown) < len(rows):
+        out.append(f"{DIM}+{len(rows) - len(shown)} {t('more')}{RST}")
+    if not rows:
+        out.append(f"{DIM}{t('idle')}{RST}")
+    if foot:
+        # the footer always shows in full: when the body runs long, the body gives way, not the footer
+        out = out[:max(1, height - len(foot))]
+        out += [""] * max(0, height - len(out) - len(foot)) + foot  # pinned to the bottom of the panel
+    return out, bool(rows) or bool(foot)
+
+
+def live_file(anchor):
+    return os.path.join(CACHE, "live", anchor.replace(":", "_"))
+
+
+def is_live(anchor):
+    """pid of a running board for this anchor, else None."""
+    try:
+        pid = open(live_file(anchor)).read().split()[0]
+        if b"herd-board" in open(f"/proc/{pid}/cmdline", "rb").read():
+            return pid
+    except (OSError, IndexError):
+        pass
+    return None
+
+
+def tab_panes(pane):
+    """Pane ids of the tab that holds ``pane``, with their rects (via herdr's neighbor layout)."""
+    try:
+        r = subprocess.run(["herdr", "pane", "neighbor", "--pane", pane, "--direction", "left"],
+                           capture_output=True, text=True, timeout=10)
+        return {p["pane_id"]: p["rect"] for p in json.loads(r.stdout)["result"]["neighbor"]["layout"]["panes"]}
+    except Exception:
+        return {}
+
+
+def board_in_tab(anchor):
+    """pid of any running herd-board whose pane sits in the anchor's tab — started with or without
+    --anchor (a hand restart without it once left two boards side by side)."""
+    panes = set(tab_panes(anchor))
+    for pid in filter(str.isdigit, os.listdir("/proc")):
+        try:
+            if b"herd-board" not in open(f"/proc/{pid}/cmdline", "rb").read() or int(pid) == os.getpid():
+                continue
+            env = dict(l.split(b"=", 1) for l in open(f"/proc/{pid}/environ", "rb").read().split(b"\0") if b"=" in l)
+            if env.get(b"HERDR_PANE_ID", b"").decode() in panes:
+                return pid
+        except (OSError, ValueError):
+            pass
+    return None
+
+
+def open_panel(anchor, given):
+    """Split the anchor's right third (anchor keeps 2/3) and run the board there."""
+    if is_live(anchor) or board_in_tab(anchor):
+        return
+    def herdr(*a):
+        r = subprocess.run(["herdr", *a], capture_output=True, text=True, timeout=20)
+        try:
+            return json.loads(r.stdout)
+        except ValueError:
+            return {}
+    res = herdr("pane", "split", "--pane", anchor, "--direction", "right", "--ratio", "0.6667",
+                "--cwd", os.getcwd(), "--no-focus")
+    new = res.get("result", {}).get("pane", {}).get("pane_id")
+    if new:
+        herdr("pane", "rename", new, t("title"))
+        herdr("pane", "run", new, "clear; herd-board --anchor " + shlex.quote(anchor) +
+              "".join(" " + shlex.quote(g) for g in given))
+
+
+def main():
+    args = sys.argv[1:]
+    anchor = os.environ.get("AGENT_PANE_ANCHOR", "")
+    if "--anchor" in args:
+        i = args.index("--anchor")
+        anchor = args[i + 1]
+        del args[i:i + 2]
+    if args[:1] == ["--open"]:
+        if anchor:
+            open_panel(anchor, args[1:])
+        return
+    given = [os.path.abspath(a) for a in args]
+    me = os.environ.get("HERDR_PANE_ID")
+    if not anchor and me:
+        # started by hand without --anchor: the anchor is the pane at the tab's top left (the orchestrator),
+        # so the board registers as live, shows the subagents, and the hook opens no second one
+        rects = tab_panes(me)
+        left = [p for p, r in rects.items() if p != me and r.get("x") == 0 and r.get("y") == 0]
+        anchor = left[0] if left else ""
+    if anchor:
+        os.makedirs(os.path.dirname(live_file(anchor)), exist_ok=True)
+        open(live_file(anchor), "w").write(f"{os.getpid()} {me or ''}\n")
+    sys.stdout.write("\033[?25l")  # hide cursor
+    quiet_since = time.time()
+    try:
+        while True:
+            out, busy = render(anchor, given)
+            rows = shutil.get_terminal_size((66, 40)).lines
+            sys.stdout.write("\033[H" + "\n".join(l + "\033[K" for l in out[:rows - 1]) + "\033[J")
+            sys.stdout.flush()
+            if busy:
+                quiet_since = time.time()
+            elif me and time.time() - quiet_since > IDLE_CLOSE_MIN * 60:
+                if anchor and os.path.exists(live_file(anchor)):
+                    os.unlink(live_file(anchor))
+                subprocess.run(["herdr", "pane", "close", me], capture_output=True)
+                return
+            time.sleep(5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        sys.stdout.write("\033[?25h\n")
+
+
+if __name__ == "__main__":
+    main()

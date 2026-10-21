@@ -83,6 +83,13 @@ m2herd-up collect --slice S      # wait, harvest report, update overview.json
 m2herd-up down --slice S|--all   # tear down pane + worktree (+merged branch); retry = down, then dispatch again
 ```
 
+The herd view (§16.7) — what a human watching the orchestrator tab sees:
+
+```
+herd-spawn <herd-dir> <slice> <worktree>   # worker TUI into tab "herde", registered with the board
+herd-board                                 # right third of the orchestrator tab: workers, subagents, ready-to-merge PRs
+```
+
 ## What is herdr?
 
 herdr is a local CLI + headless server talking over a Unix-domain socket.
@@ -110,7 +117,7 @@ This skill teaches an agent how to:
 | 13 | Meta-orchestration (`fleet-loop.sh`) | Be the orchestrator of orchestrators: launch + oversee one orchestrator per mission (each driving its own herd), `/goal`-armed to self-drive — `fleet-control/` |
 | 14 | Dispatch nudge (hooks) | Claude Code `UserPromptSubmit` + Hermes `pre_llm_call` hooks that re-check "should this herd?" every turn, by default — proposes a plan, never auto-spawns |
 | 15 | Context budgeting & decomposer (Hermes) | keep the orchestrator within a token budget (default GLM-5.2/384k); decompose into budget-sized slice manifests; hooks offload context on demand |
-| 16 | m2herd — the Fable main-orchestrator context fabric | Claude Code (Fable) as the MAIN orchestrator: a per-repo, gitignored `.m2herd/` holds the context while the orchestrator holds pointers — note/refile/resume/sync/archive/gist via `m2herd`, a 1-orchestrator + 1-machineroom-pane workspace via `m2herd-up`, three Claude Code hooks as the heartbeat |
+| 16 | m2herd — the Fable main-orchestrator context fabric | Claude Code (Fable) as the MAIN orchestrator: a per-repo, gitignored `.m2herd/` holds the context while the orchestrator holds pointers — note/refile/resume/sync/archive/gist via `m2herd`, a 1-orchestrator + 1-machineroom-pane workspace via `m2herd-up`, three Claude Code hooks as the heartbeat; the herd view (`herd-board` beside the orchestrator, worker TUIs in a `herde` tab, subagents on the board via a PreToolUse hook) |
 | 17 | evolve — the factory learns | Run trace bundles (`.m2herd/runs/`) + `m2herd evolve` (analyze/proposals/show/apply/reject): failed runs become reviewable proposals, accepted lessons land in `LESSONS.md` and auto-annotate every later dispatch |
 
 See [`skill/SKILL.md`](./skill/SKILL.md) for the full reference and
@@ -208,12 +215,14 @@ herdr-factory-loop-skill/
 │   ├── m2herd-session.sh        ← Claude Code SessionStart: inject .m2herd/ digest (§16)
 │   ├── m2herd-precompact.sh     ← Claude Code PreCompact: refile notes before compaction (§16)
 │   ├── m2herd-budget.js         ← Claude Code PostToolUse: budget advisory → offload to .m2herd/ (§16)
+│   ├── herd-board-subagents.py  ← Claude Code PreToolUse (Agent|Task): subagents onto the herd-board (§16.7)
 │   └── smoke.sh                 ← hook contract smokes: sample/empty/garbage stdin → exit 0 + valid JSON
 ├── tui/                         ← m2herd-tui source (Go, bubbletea): dashboard + `,` settings editor
 ├── prebuilt/                    ← committed m2herd-tui binaries (darwin-arm64, linux-amd64, linux-arm64)
 ├── templates/
 │   ├── herd-control/            ← ICM orchestrator workspace scaffold (§12)
 │   ├── fleet-control/           ← meta-orchestrator workspace scaffold (§13)
+│   ├── herd/COMMON.md           ← worker rules + the status.json contract herd-board reads (§16.7)
 │   └── m2herd/                  ← .m2herd/ seeds: overview.json, RESUME.md, NOTES.md, settings.json,
 │       ├── evolver/             ←   evolver seeds: LESSONS.md (marker convention) + README (§17)
 │       └── runs/                ←   trace-bundle store README (§17)
@@ -226,6 +235,8 @@ herdr-factory-loop-skill/
     ├── install-hermes-context.sh ← wires the Hermes context hooks into ~/.hermes/ (§15)
     ├── m2herd.sh            ← .m2herd/ engine: boot/init/status/note/refile/resume/sync/archive/gist/next/config/evolve/dashboard/self-update/selftest (§16–§17)
     ├── m2herd-up.sh         ← m2herd workspace bootstrap + worker dispatch/collect/down (§16)
+    ├── herd-board           ← the herd view panel: workers + subagents + ready-to-merge PRs (§16.7)
+    ├── herd-spawn.sh        ← start a worker TUI in the "herde" tab and register it with the board (§16.7)
     └── lint.sh              ← sanity checks on SKILL.md frontmatter & cross-refs
 ```
 

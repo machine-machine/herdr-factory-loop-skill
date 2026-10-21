@@ -4,7 +4,41 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
-## [Unreleased]
+## [2.9.0] - 2026-10-21
+
+### Added
+- **The herd view (SKILL.md §16.7)** — what a human watching the orchestrator's tab sees,
+  grown over two weeks of daily herds on a production fleet:
+  - `scripts/herd-board`: ONE panel in the right third of the orchestrator tab for herd
+    workers AND the orchestrator's own subagents. Needs-me first, then running, then
+    queued; the pane height is shared evenly (one worker → progress bar, sentence, live
+    processes in plain words and its step feed; ten workers → one line each); never cuts a
+    line with an ellipsis. Footer: *Ready to merge* (open PRs of finished workers, with
+    the orchestrator's sign-off pinned to the PR head sha) and *Merged today*. 16 theme
+    colours with one meaning each, `NO_COLOR` respected. `HERD_BOARD_LANG=de|en`,
+    `HERD_BOARD_ORG`, `HERD_BOARD_REPOS`. Closes itself after 5 idle minutes.
+  - `scripts/herd-spawn.sh`: starts a worker TUI in the tab `herde` (never as a split
+    beside the orchestrator), hands focus back, writes `herd.map`/`active.txt`, registers
+    the herd with the board. The prompt goes in as argv, so no `agent prompt` can race the
+    TUI; `--permission-mode auto` instead of `--dangerously-skip-permissions`.
+  - `hooks/herd-board-subagents.py`: Claude Code PreToolUse hook (`Agent|Task`) that puts
+    every main-thread subagent on the board; detached, never blocks the call.
+  - `templates/herd/COMMON.md`: worker rules + the `<slice>.status.json` contract.
+  - `install.sh` links `herd-board`/`herd-spawn` into `~/.local/bin` and registers the
+    hook (skipped with `--no-m2herd-hooks` or without python3).
+- Gotchas from the same fleet: stale `ANTHROPIC_API_KEY` shadowing a working login (silent
+  401 workers), `Connection refused` retry loops reported as `working`, the Codex update
+  prompt blocking workers, memory as the real worker cap (~1.4 GB RSS per Claude TUI),
+  herdr server restart recovery, `herdr update` refusing to run inside a pane, the auto-mode
+  merge gate, reviewer subagents kept off credentials.
+
+### Changed
+- §3/§4 and `reference.md` document the herdr ≥ 0.9 surface: `agent start` needs
+  `--kind` + an existing `--pane` and takes flags only (the binary path became the first
+  prompt), the agent-name pattern `^[a-z][a-z0-9_-]{0,31}$`, and `agent prompt` replacing
+  `agent send`.
+- `install.sh` moves a real file found where a bin symlink goes to `<file>.bak-<ts>`
+  instead of deleting it.
 
 ### Fixed
 - m2herd dispatch no longer leaves one herdr workspace per worker. herdr 0.9's
