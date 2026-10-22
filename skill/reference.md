@@ -127,12 +127,14 @@ herdr pane report-metadata <pane_id> --source ID [--agent LABEL] [--applies-to-s
 herdr agent list
 herdr agent get    <target>
 herdr agent read   <target> [--source visible|recent|recent-unwrapped] [--lines N] [--format text|ansi] [--ansi]
-herdr agent send   <target> <text>             # literal text (no Enter); settle ~1s before send-keys Enter
+herdr agent prompt <target> <text> [--wait]    # herdr >= 0.9: submits the prompt itself (replaces agent send)
+herdr agent send   <target> <text>             # pre-0.9 only: literal text (no Enter); settle ~1s before send-keys Enter
 herdr agent rename <target> <name>|--clear
 herdr agent focus  <target>
 herdr agent wait   <target> --until idle|working|blocked|done|unknown (repeatable; pre-0.9: --status) [--timeout MS]
 herdr agent attach <target> [--takeover]       # INTERACTIVE
-herdr agent start  <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>
+herdr agent start  <name> --kind <kind> --pane <ID> [--timeout MS] [-- <flags...>]   # herdr >= 0.9: existing shell pane; --kind picks the binary, so pass flags only; name ^[a-z][a-z0-9_-]{0,31}$
+herdr agent start  <name> [--cwd PATH] [--workspace ID] [--tab ID] [--split right|down] [--focus|--no-focus] -- <argv...>   # pre-0.9
 herdr agent explain <target> [--json|--verbose]
 herdr agent explain --file PATH --agent LABEL [--json|--verbose]
 ```
