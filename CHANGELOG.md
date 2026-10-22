@@ -16,7 +16,10 @@ adheres to [Semantic Versioning](https://semver.org/).
     line with an ellipsis. Footer: *Ready to merge* (open PRs of finished workers, with
     the orchestrator's sign-off pinned to the PR head sha) and *Merged today*. 16 theme
     colours with one meaning each, `NO_COLOR` respected. `HERD_BOARD_LANG=de|en`,
-    `HERD_BOARD_ORG`, `HERD_BOARD_REPOS`. Closes itself after 5 idle minutes.
+    `HERD_BOARD_ORG`, `HERD_BOARD_REPOS`. Closes itself after 5 idle minutes. A status file
+    that breaks the contract (`null`, a list in `missing`, a number as text) is bent into it,
+    and a failing repaint shows an error line instead of ending the board — a dead board pane
+    made every hook open another one. `herd-board --selftest` checks both (in `make test`/CI).
   - `scripts/herd-spawn.sh`: starts a worker TUI in the tab `herde` (never as a split
     beside the orchestrator), hands focus back, writes `herd.map`/`active.txt`, registers
     the herd with the board. The prompt goes in as argv, so no `agent prompt` can race the

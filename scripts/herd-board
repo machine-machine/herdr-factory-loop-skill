@@ -3,6 +3,7 @@
 
 Usage: herd-board [--anchor <pane>] [<herd-dir> ...]
        herd-board --open [--anchor <pane>]     (open the panel next to the anchor unless it is live)
+       herd-board --selftest                   (status files that break the contract must not end the board)
 
 Shows, one line each (icon, name, n/m, short text, age):
   - herd workers of every herd dir given or listed in ~/.cache/herd-board/<anchor>.herds
@@ -69,6 +70,32 @@ def t(key, **kw):
 def field(st, en, de):
     """A status.json field under its English or German key."""
     return st.get(en, st.get(de))
+
+
+TEXT_KEYS = ("sentence", "satz", "missing", "fehlt", "short", "kurz", "pr")
+NUM_KEYS = ("step", "schritt", "of", "von")
+
+
+def read_status(path):
+    """A worker's <slice>.status.json, bent into the contract: anything but an object is {}, a list in a text field
+    becomes "a, b", other values become text; step/of stay numbers (a digit string counts). Workers write this file by
+    hand, so a stray list or null must never take the board down."""
+    try:
+        st = json.load(open(path))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(st, dict):
+        return {}
+    out = {}
+    for k, v in st.items():
+        if k in NUM_KEYS:
+            v = int(v) if isinstance(v, str) and v.strip().isdigit() else v
+            out[k] = v if isinstance(v, int) and not isinstance(v, bool) else None
+        elif k in TEXT_KEYS:
+            out[k] = ", ".join(str(x) for x in v) if isinstance(v, list) else "" if v is None else str(v)
+        else:
+            out[k] = v
+    return out
 
 # Only the 16 theme colours (follow the terminal's palette), one meaning each, never meaning by colour alone (the icons
 # stay): red = needs me, yellow = waiting/attention, green = done/ok, cyan = herd worker running, blue = numbers and
@@ -235,6 +262,7 @@ def agent_rows(anchor):
             label, jsonl = open(reg).read().split("\n", 1)
             jsonl = jsonl.strip()
             meta = json.load(open(jsonl[:-6] + ".meta.json")) if os.path.exists(jsonl[:-6] + ".meta.json") else {}
+            meta = meta if isinstance(meta, dict) else {}
             age = (time.time() - os.path.getmtime(jsonl)) / 60
         except (OSError, ValueError):
             continue
@@ -326,10 +354,7 @@ def ready_prs(herds, agents):
             a = agents.get(pane)
             if not os.path.exists(rep) or (a and a["agent_status"] == "working"):
                 continue
-            try:
-                pr = str(json.load(open(os.path.join(herd, f"{s}.status.json"))).get("pr") or "")
-            except (OSError, ValueError):
-                continue
+            pr = read_status(os.path.join(herd, f"{s}.status.json")).get("pr") or ""
             wts = glob.glob(os.path.expanduser(f"~/.herdr/worktrees/*/{s}"))
             wt = a["cwd"] if a else (wts[0] if wts else None)
             home = os.path.basename(os.path.dirname(wt)) if wt else ""
@@ -363,11 +388,7 @@ def herd_rows(herd, agents):
         a = agents.get(pane)
         if not a and s not in queue and os.path.exists(os.path.join(herd, f"{s}.out.md")):
             continue  # report written and window closed: finished, nothing left to look at
-        st_file = os.path.join(herd, f"{s}.status.json")
-        try:
-            st = json.load(open(st_file))
-        except (OSError, ValueError):
-            st = {}
+        st = read_status(os.path.join(herd, f"{s}.status.json"))
         report = os.path.exists(os.path.join(herd, f"{s}.out.md"))
         acts = procs_in(s)
         t_age = transcript_age(a["cwd"]) if a else None
@@ -570,6 +591,18 @@ def render(anchor, given):
     return out, bool(rows) or bool(foot)
 
 
+def frame(anchor, given):
+    """One repaint. A failure is shown as a line on the board instead of ending it: a dead board pane stays open and
+    every hook would open another one beside it. The panel counts as busy then, so it does not close itself."""
+    try:
+        return render(anchor, given)
+    except Exception as e:
+        w = max(20, shutil.get_terminal_size((66, 40)).columns - 1)
+        msg = wrap(f"⚠ herd-board: {type(e).__name__}: {e}", w, 3) or ["⚠ herd-board"]
+        return [f"{BOLD}{CYAN}{t('title')}{RST} {DIM}{time.strftime('%H:%M')}{RST}"] + \
+            [f"{RED}{l}{RST}" for l in msg], True
+
+
 def live_file(anchor):
     return os.path.join(CACHE, "live", anchor.replace(":", "_"))
 
@@ -630,8 +663,61 @@ def open_panel(anchor, given):
               "".join(" " + shlex.quote(g) for g in given))
 
 
+def selftest():
+    """Malformed status files render instead of crashing, and a failing repaint becomes an error line. Offline: no
+    herdr, no gh. Exit 0 = pass."""
+    import tempfile
+    g = globals()
+    g.update(herdr_agents=lambda: {}, pr_state=lambda *a, **k: (None, None), merged_today=lambda: {})
+    strip = lambda ls: [re.sub(r"\033\[[0-9;?]*[A-Za-z]", "", l) for l in ls]
+    fails = []
+    def check(name, cond):
+        print(("ok: " if cond else "FAIL: ") + name)
+        cond or fails.append(name)
+    with tempfile.TemporaryDirectory() as herd:
+        cases = {  # slice -> status.json as written by a worker
+            "hbst-liste": '{"satz": "Board liest Listen", "schritt": 2, "von": 4, "fehlt": ["Tests", "Doku"]}',
+            "hbst-null": "null",
+            "hbst-array": '[1, 2]',
+            "hbst-typen": '{"sentence": 7, "step": "3", "of": "x", "missing": null, "pr": ["api #12", "ui #4"]}',
+        }
+        open(os.path.join(herd, "herd.map"), "w").write("".join(f"{s}=w0:p{i}\n" for i, s in enumerate(cases)))
+        for s, body in cases.items():
+            open(os.path.join(herd, f"{s}.status.json"), "w").write(body)
+        check("non-object status is {}", read_status(os.path.join(herd, "hbst-null.status.json")) == {}
+              and read_status(os.path.join(herd, "hbst-array.status.json")) == {})
+        st = read_status(os.path.join(herd, "hbst-typen.status.json"))
+        check("fields bent into the contract", st == {"sentence": "7", "step": 3, "of": None, "missing": "",
+                                                       "pr": "api #12, ui #4"})
+        try:
+            out, busy = render("", [herd])
+            text = "\n".join(strip(out))
+            check("render with malformed status files", busy and f"{t('missing')} Tests, Doku" in text)
+        except Exception as e:
+            check(f"render with malformed status files ({type(e).__name__}: {e})", False)
+        for s in cases:  # reports written: the footer reads every status file's "pr"
+            open(os.path.join(herd, f"{s}.out.md"), "w").write("done\n")
+        try:
+            check("ready-to-merge footer with malformed status files", isinstance(ready_prs([herd], {}), list))
+        except Exception as e:
+            check(f"ready-to-merge footer ({type(e).__name__}: {e})", False)
+        real = g["render"]
+        g["render"] = lambda *a: 1 / 0
+        try:
+            out, busy = frame("", [herd])
+            check("a failing repaint shows an error line", busy and any("ZeroDivisionError" in l for l in strip(out)))
+        except Exception as e:
+            check(f"a failing repaint shows an error line ({type(e).__name__})", False)
+        finally:
+            g["render"] = real
+    print("herd-board selftest: " + ("FAILED" if fails else "OK"))
+    return 1 if fails else 0
+
+
 def main():
     args = sys.argv[1:]
+    if args[:1] == ["--selftest"]:
+        sys.exit(selftest())
     anchor = os.environ.get("AGENT_PANE_ANCHOR", "")
     if "--anchor" in args:
         i = args.index("--anchor")
@@ -656,7 +742,7 @@ def main():
     quiet_since = time.time()
     try:
         while True:
-            out, busy = render(anchor, given)
+            out, busy = frame(anchor, given)
             rows = shutil.get_terminal_size((66, 40)).lines
             sys.stdout.write("\033[H" + "\n".join(l + "\033[K" for l in out[:rows - 1]) + "\033[J")
             sys.stdout.flush()
