@@ -93,6 +93,11 @@ herdr agent start claude --cwd ~/.herdr/worktrees/<repo>/feature-x --no-focus --
 > `herdr pane run "$P" "claude --permission-mode auto '<one-line pointer to the task file>'"`.
 > That is what `herd-spawn` (§16.7) does. Resume a crashed worker the same way with
 > `claude --continue …`, which keeps the transcript.
+> `herd-loop.sh` and `fleet-loop.sh` detect 0.9 (`--kind` in `agent start --help`) and use
+> the pane-then-start form: herd-loop opens workers in the `herde` tab of its own workspace
+> (its own workspace per worker when run outside herdr) and closes the workspaces 0.9's
+> `worktree create` opens on the side; fleet-loop gives each mission orchestrator a
+> workspace labelled with the mission, so each mission's herd gets its own `herde` tab.
 
 ### 4. Dispatch work to an agent
 > **herdr ≥ 0.9:** `agent send` is gone — `herdr agent prompt <target> "<text>"` submits by

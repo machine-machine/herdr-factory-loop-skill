@@ -41,6 +41,20 @@ adheres to [Semantic Versioning](https://semver.org/).
   instead of deleting it.
 
 ### Fixed
+- `herd-loop.sh` and `fleet-loop.sh` work on herdr 0.9. Both still called the removed
+  `agent start --cwd … -- <binary>` (which on 0.9 fails, or sends the binary path as
+  the first prompt) and `agent send` (gone, failure swallowed by `|| true`, so every
+  pointer was logged as sent and never arrived). They now detect the version once and,
+  on 0.9, open the pane themselves and run `agent start <name> --kind <k> --pane <p>
+  -- <flags>`, then submit with `agent prompt`; older herdr keeps the old calls.
+  Placement follows the herd view: herd-loop workers go to the `herde` tab of the
+  loop's own workspace (a workspace of their own when the loop runs outside herdr),
+  and the workspaces 0.9's `worktree create` opens on the side are closed (the
+  worktree stays on disk); `rotate` opens the successor orchestrator beside the old
+  one; fleet-loop opens each mission orchestrator in a workspace labelled with the
+  mission. Agent names are normalised to `^[a-z][a-z0-9_-]{0,31}$` (hash suffix when
+  cut). `rotate` also never submitted its resume pointer (it sent no Enter) — fixed
+  by the same `agent prompt` path.
 - m2herd dispatch no longer leaves one herdr workspace per worker. herdr 0.9's
   `worktree create` always opens a workspace (tab + root pane) for the new
   worktree, and also opens the source repo as a workspace when none has it open.
