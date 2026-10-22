@@ -5,9 +5,12 @@ The user watches the orchestrator's tab; in-process subagents are otherwise invi
 spawns are registered (a subagent's own children show up in its feed as "🤖 …" steps). Detaches at once and
 never blocks the tool call: a background child waits for the subagent transcript whose first message is this
 prompt, registers it in ~/.cache/herd-board/<anchor>.agents/ and runs `herd-board --open`, which splits the
-right third of the caller's tab unless a board is already live there. No-op outside a herdr pane.
+right third of the caller's tab unless a board is already live there. No-op outside a herdr pane and in a herd
+worker's pane (listed in a registered herd.map): the worker's subagents show in its own step feed.
 """
-import json, os, subprocess, sys, time
+import glob, json, os, subprocess, sys, time
+
+CACHE = os.path.expanduser("~/.cache/herd-board")
 
 
 def find_transcript(subdir, prompt, since, timeout=90):
@@ -37,6 +40,26 @@ def find_transcript(subdir, prompt, since, timeout=90):
     return None
 
 
+def is_herd_worker(pane):
+    """True when ``pane`` is a herd worker: some herd registered with a board lists it in herd.map. A pane that
+    registered herds itself is an orchestrator, never a worker (herdr may reuse an old worker's pane id)."""
+    if os.path.exists(os.path.join(CACHE, pane.replace(":", "_") + ".herds")):
+        return False
+    for reg in glob.glob(os.path.join(CACHE, "*.herds")):
+        try:
+            herds = [l.strip() for l in open(reg, encoding="utf-8") if l.strip()]
+        except OSError:
+            continue
+        for herd in herds:
+            try:
+                if any(l.strip().split("=", 1)[-1] == pane
+                       for l in open(os.path.join(herd, "herd.map"), encoding="utf-8") if "=" in l):
+                    return True
+            except OSError:
+                continue
+    return False
+
+
 def main():
     if len(sys.argv) > 1 and sys.argv[1] == "--child":
         subdir, prompt_file, label, since = sys.argv[2:6]
@@ -45,7 +68,7 @@ def main():
         path = find_transcript(subdir, prompt, float(since))
         anchor = os.environ.get("HERDR_PANE_ID", "")
         if path and anchor:
-            reg = os.path.expanduser(f"~/.cache/herd-board/{anchor.replace(':', '_')}.agents")
+            reg = os.path.join(CACHE, f"{anchor.replace(':', '_')}.agents")
             os.makedirs(reg, exist_ok=True)
             with open(os.path.join(reg, os.path.basename(path)), "w", encoding="utf-8") as f:
                 f.write(f"{label}\n{path}\n")
@@ -53,7 +76,7 @@ def main():
         return
 
     data = json.load(sys.stdin)
-    if not os.environ.get("HERDR_PANE_ID"):
+    if not os.environ.get("HERDR_PANE_ID") or is_herd_worker(os.environ["HERDR_PANE_ID"]):
         return
     if data.get("agent_id") or "/subagents/" in data.get("transcript_path", ""):
         return  # spawned by a subagent — its parent's pane already shows it
@@ -64,7 +87,7 @@ def main():
     label = (inp.get("description") or inp.get("subagent_type") or "agent")[:40]
     tp = data.get("transcript_path", "")
     subdir = os.path.join(tp[:-6] if tp.endswith(".jsonl") else tp, "subagents")
-    cache = os.path.expanduser("~/.cache/herd-board/prompts")
+    cache = os.path.join(CACHE, "prompts")
     os.makedirs(cache, exist_ok=True)
     pf = os.path.join(cache, f"prompt-{os.getpid()}-{time.time_ns()}.txt")
     with open(pf, "w", encoding="utf-8") as f:

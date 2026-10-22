@@ -25,7 +25,8 @@ adheres to [Semantic Versioning](https://semver.org/).
     the herd with the board. The prompt goes in as argv, so no `agent prompt` can race the
     TUI; `--permission-mode auto` instead of `--dangerously-skip-permissions`.
   - `hooks/herd-board-subagents.py`: Claude Code PreToolUse hook (`Agent|Task`) that puts
-    every main-thread subagent on the board; detached, never blocks the call.
+    every main-thread subagent on the board; detached, never blocks the call. Silent in a
+    herd worker's pane (listed in a registered `herd.map`), so workers open no boards of their own.
   - `templates/herd/COMMON.md`: worker rules + the `<slice>.status.json` contract.
   - `install.sh` links `herd-board`/`herd-spawn` into `~/.local/bin` and registers the
     hook (skipped with `--no-m2herd-hooks` or without python3).
