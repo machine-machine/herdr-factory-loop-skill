@@ -226,7 +226,7 @@ class SpawnTest(Base):
         self.assertIn("GIT_AUTHOR_EMAIL=bot@example.org", line)
         self.assertIn("unset ANTHROPIC_API_KEY", line)
         self.assertIn("COMMON.md", line)
-        self.assertNotIn("Mariusz", line)
+        self.assertEqual(line.count("GIT_AUTHOR_NAME="), 1)  # only the configured author, nothing hard-coded
         reg = rd(os.path.join(self.home, ".cache", "herd-board", "w1_p1.herds")).split()
         self.assertEqual(reg, [self.herd])
         self.assertIn("herd-board --open --anchor w1:p1", rd(self.env["FAKE_TOOL_LOG"]))

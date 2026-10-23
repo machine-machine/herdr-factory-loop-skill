@@ -62,7 +62,7 @@ LANG = "de" if os.environ.get("HERD_BOARD_LANG", "").lower().startswith("de") el
 STRINGS = {
     "en": {"title": "Herd", "load": "load", "done": "done", "check": "check", "working": "working",
            "still": "still", "needs_answer": "needs an answer", "ended": "ended without a report", "missing": "missing:",
-           "blocked": "blocked", "since": "since", "signed": "signed off, waiting for merge",
+           "blocked": "blocked", "since": "since", "signed": "rev'd",
            "in_review": "in review", "no_review": "no review yet", "merged": "Merged today ", "more": "more",
            "idle": "nothing running", "paused": "paused (memory), resumes as no. {pos}",
            "waiting": "waiting, starts as no. {pos}",
@@ -78,13 +78,13 @@ STRINGS = {
            "fix_queued": "findings back, starts as no. {pos}", "w_slot": "no free slot", "w_mem": "memory",
            "w_load": "load", "w_base_q": "base {b} not accepted", "accepted": "accepted", "review_due": "review due",
            "w_partner": "waits for {x}", "w_base": "waits for base {b}", "review_round": "review running, round {n}/3",
-           "reviewed": "reviewed", "stale": "stale", "stale_head": "{ref} has new commits",
+           "reviewed": "rev'd", "stale": "stale", "stale_head": "{ref} has new commits",
            "stale_main": "{repo} main moved", "stale_nomain": "{repo} main not recorded", "befund": "findings", "word": "say “{w}”",
            "v1": "v1 herd — herd-recover migrates it", "wf": "workflow: {r} running, {d} done",
            "no_core": "herd_events.py missing next to herd-board", "draw_err": "herd-board"},
     "de": {"title": "Herde", "load": "Last", "done": "fertig", "check": "prüfen", "working": "arbeitet",
            "still": "still", "needs_answer": "braucht Antwort", "ended": "beendet ohne Bericht", "missing": "fehlt:",
-           "blocked": "blockiert", "since": "seit", "signed": "geprüft, wartet auf Merge-Wort",
+           "blocked": "blockiert", "since": "seit", "signed": "rev'd",
            "in_review": "in Prüfung", "no_review": "noch ohne Review", "merged": "Heute gemergt ", "more": "weitere",
            "idle": "nichts läuft", "paused": "pausiert (Speicher), geht als {pos}. weiter",
            "waiting": "wartet, startet als {pos}.",
@@ -101,7 +101,7 @@ STRINGS = {
            "fix_queued": "Befunde zurück, startet als {pos}.", "w_slot": "kein Platz frei", "w_mem": "Speicher knapp",
            "w_load": "Last zu hoch", "w_base_q": "Basis {b} nicht abgenommen", "accepted": "abgenommen",
            "review_due": "Review steht an", "w_partner": "wartet auf {x}", "w_base": "wartet auf Basis {b}",
-           "review_round": "Review läuft, Runde {n}/3", "reviewed": "geprüft", "stale": "veraltet",
+           "review_round": "Review läuft, Runde {n}/3", "reviewed": "rev'd", "stale": "veraltet",
            "stale_head": "{ref} hat neue Commits", "stale_main": "{repo}-main ist weiter",
            "stale_nomain": "{repo}-main nicht erfasst", "befund": "Befunde",
            "word": "Wort: „{w}“", "v1": "v1-Herde — herd-recover migriert",
@@ -900,7 +900,7 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
                 and not any(stale.values()):
             word = f"merge {members[0]}"
             text = t("word", w=word) + (" · " + " ".join(refs) if refs else "")
-            lanes["needs"].append((0, name, "✓✓", GREEN, "", text, tags, dict(d, bold=True)))
+            lanes["needs"].append((0, name, "✓✓", BLUE, "", text, tags, dict(d, bold=True)))
             continue
         if any(ph[m] == "review_befund" for m in members):
             files = [os.path.basename(str(st[m].get("befunde_file") or "")) for m in members
@@ -923,7 +923,7 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
             row = (3, name, "◇", DIM, "", text, tags, d)
         else:  # reviewed, but a partner is not there yet or the base outside the package is not merged
             why = t("w_partner", x=", ".join(waiting)) if waiting else t("w_base", b=", ".join(ext_bases))
-            row = (4, name, "✓", GREEN, "", f"{t('reviewed')} " + " ".join(refs) + " · " + why, tags, d)
+            row = (4, name, "✓", BLUE, "", f"{t('reviewed')} " + " ".join(refs) + " · " + why, tags, d)
         lanes["ready"].append(row)
     return st
 
@@ -1022,7 +1022,7 @@ def v1_rows(herd, agents, lanes):
             busy = acts[0][0] if acts else ""
             lanes["work"].append((2, s, "⧗" if busy in LONG_RUNS else "●", CYAN, prog, kurz(st) or busy or t("working"),
                                   age, d))
-    look = {"ok": ("✓", GREEN, t("signed")), "alt": ("…", YEL, t("in_review")), "": ("◇", DIM, t("no_review"))}
+    look = {"ok": ("✓", BLUE, t("signed")), "alt": ("…", YEL, t("in_review")), "": ("◇", DIM, t("no_review"))}
     for repo, n, s, review in v1_ready_prs(herd, agents):
         icon, col, words = look[review]
         lanes["ready"].append((10, s, icon, col, "", f"{(repo + ' ') if repo else ''}#{n} {words}", "", {}))

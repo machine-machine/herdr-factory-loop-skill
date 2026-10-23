@@ -32,9 +32,10 @@ def check(name, cond, detail=""):
         print(f"FAIL {name}\n{detail[-2500:]}")
 
 
-# project words of the fabric these rules were generalised from; none may survive in the templates
-PROJECT_WORDS = re.compile(r"gst|yvonne|monday|arten|satie|mariusz|f(ö|oe)rster|gutacht|datenmappe|"
-                           r"workspace-6|spark1|staging-api|gruenstifter|herde-\d", re.I)
+# words of the fabric a team generalised its rules from: set HERD_LEAK_WORDS="word1,word2" locally so
+# none of them survives in the templates; the generic part (orchestrator names, herd dirs) always runs
+_LOCAL = [re.escape(w.strip()) for w in os.environ.get("HERD_LEAK_WORDS", "").split(",") if w.strip()]
+PROJECT_WORDS = re.compile("|".join([r"workspace-\d", r"herde-\d"] + _LOCAL), re.I)
 
 
 def main():
@@ -134,7 +135,7 @@ def main():
     check("SKILL version == CHANGELOG latest == 2.10.0", ver == latest == "2.10.0", f"{ver} {latest}")
 
     # the published docs carry examples, never the source fabric's ticket ids or memory file names
-    leaks = re.compile(r"\b\d{11}\b|gst|gruenstifter|yvonne|satie|mariusz|f(ö|oe)rster", re.I)
+    leaks = re.compile("|".join([r"\b\d{11}\b"] + _LOCAL), re.I)
     for rel in ("docs/herd-flow-v2.md", "README.md", "CHANGELOG.md", "skill/SKILL.md", "templates/herd/workflows/README.md"):
         with open(os.path.join(REPO, rel), encoding="utf-8") as f:
             hits = sorted({m.group(0) for m in leaks.finditer(f.read())})

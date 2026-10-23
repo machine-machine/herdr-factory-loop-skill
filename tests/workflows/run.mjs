@@ -47,7 +47,9 @@ function staticChecks(file) {
   ok(meta && meta.name && meta.description, `${name}: meta evaluates to a literal with name + description`)
   const code = src.replace(/'(?:[^'\\\n]|\\.)*'/g, "''")
   ok(!/Date\.now|Math\.random|new Date\s*\(|\brequire\s*\(|\bimport\s|\bprocess\.|\bfs\./.test(code.slice(end)), `${name}: no Date.now/Math.random/new Date/require/import/process/fs`)
-  for (const bad of ['gruenstifter', '/workspace', 'setup-wt', '#202', '#205', "'<branch>'", 'gst-gen', 'Mariusz', 'herde-2']) {
+  // generic leftovers of the per-herd copies; a team adds its own words via HERD_LEAK_WORDS="a,b"
+  const local = (process.env.HERD_LEAK_WORDS || '').split(',').map(w => w.trim()).filter(Boolean)
+  for (const bad of ['/workspace', 'setup-wt', '#202', '#205', "'<branch>'", 'herde-2', ...local]) {
     ok(!src.includes(bad), `${name}: no hard-coded ${bad}`)
   }
   return meta
