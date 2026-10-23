@@ -39,7 +39,7 @@ PROJECT_WORDS = re.compile("|".join([r"workspace-\d", r"herde-\d"] + _LOCAL), re
 
 
 def main():
-    files = ["WORKER.md", "REVIEWER.md", "FIXER.md", "MODELS.md"]
+    files = ["WORKER.md", "REVIEWER.md", "FIXER.md", "MODELS.md", "ORCHESTRATOR.md", "HERD-CUT.md", "STEER.md"]
     for n in files:
         check(f"{n} exists", os.path.isfile(os.path.join(RULES, n)))
     extra = [os.path.join(REPO, "templates", "herd", n) for n in ("COMMON.md", "task.md.example")]

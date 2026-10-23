@@ -92,6 +92,10 @@ test-herd:
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/docs/test_m2herd_migrate_mirror.py
 	bash tests/docs/test_install_links.sh
 	node tests/workflows/run.mjs
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/m2herd-purge --selftest
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/purge/test_m2herd_purge.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/m2herd-steer --selftest
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/steer/test_steer.py
 
 # ci — the documented pre-commit check: the same steps CI runs
 # (.github/workflows/ci.yml). Go steps run only when go is on PATH.

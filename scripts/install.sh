@@ -259,13 +259,15 @@ M2HERD_BUDGET_MATCHER="Bash|Edit|Write|MultiEdit|Agent|Task"
 # §16.7 herd view: puts the orchestrator's subagents on its herd-board
 HERD_BOARD_HOOK="herd-board-subagents.py"
 HERD_BOARD_MATCHER="Agent|Task"
+# STEER gate (docs/herd-flow-v2.md §8): deterministic nudge on open steering items
+M2HERD_STEER_HOOK="m2herd-steer-gate.sh"
 
 register_m2herd_hooks() {
   local hooks_dir="$HOME/.claude/hooks"
   local settings="$HOME/.claude/settings.json"
 
   if [ "$uninstall" -eq 1 ]; then
-    for h in "$M2HERD_SESSION_HOOK" "$M2HERD_PRECOMPACT_HOOK" "$M2HERD_BUDGET_HOOK" "$HERD_BOARD_HOOK"; do
+    for h in "$M2HERD_SESSION_HOOK" "$M2HERD_PRECOMPACT_HOOK" "$M2HERD_BUDGET_HOOK" "$HERD_BOARD_HOOK" "$M2HERD_STEER_HOOK"; do
       install_hook_file "$hooks_dir" "claude" "$h"
     done
     [ -f "$settings" ] || return 0
@@ -281,7 +283,7 @@ register_m2herd_hooks() {
     # that leaves it empty — foreign hooks a user consolidated into the same
     # group keep theirs.
     jq --arg ss "$M2HERD_SESSION_HOOK" --arg pc "$M2HERD_PRECOMPACT_HOOK" --arg bj "$M2HERD_BUDGET_HOOK" \
-       --arg hb "$HERD_BOARD_HOOK" '
+       --arg hb "$HERD_BOARD_HOOK" --arg sg "$M2HERD_STEER_HOOK" '
       def strip($ev; $name):
         if .hooks[$ev] then
           .hooks[$ev] = [ .hooks[$ev][]
@@ -293,12 +295,14 @@ register_m2herd_hooks() {
       | strip("PreCompact"; $pc)
       | strip("PostToolUse"; $bj)
       | strip("PreToolUse"; $hb)
+      | strip("UserPromptSubmit"; $sg)
+      | strip("Stop"; $sg)
     ' "$settings" > "$tmp" && mv "$tmp" "$settings"
     echo "[claude] removed m2herd hook entries from $settings"
     return 0
   fi
 
-  for h in "$M2HERD_SESSION_HOOK" "$M2HERD_PRECOMPACT_HOOK" "$M2HERD_BUDGET_HOOK" "$HERD_BOARD_HOOK"; do
+  for h in "$M2HERD_SESSION_HOOK" "$M2HERD_PRECOMPACT_HOOK" "$M2HERD_BUDGET_HOOK" "$HERD_BOARD_HOOK" "$M2HERD_STEER_HOOK"; do
     install_hook_file "$hooks_dir" "claude" "$h"
   done
   [ "$m2herd_hooks" -eq 1 ] || return 0
@@ -328,6 +332,7 @@ register_m2herd_hooks() {
      --arg matcher "$M2HERD_BUDGET_MATCHER" \
      --arg hb "$HERD_BOARD_HOOK" --arg hbcmd "python3 \"$hooks_dir/$HERD_BOARD_HOOK\"" \
      --arg hbmatcher "$HERD_BOARD_MATCHER" \
+     --arg sg "$M2HERD_STEER_HOOK" --arg sgcmd "bash \"$hooks_dir/$M2HERD_STEER_HOOK\"" \
      --argjson budget "$budget_ok" --argjson board "$board_ok" '
     def have($ev; $name): [ .hooks[$ev][]?.hooks[]?.command // "" ] | map(contains($name)) | any;
     .hooks = (.hooks // {})
@@ -343,8 +348,14 @@ register_m2herd_hooks() {
     | (if $board == 0 or have("PreToolUse"; $hb) then . else
          .hooks.PreToolUse = ((.hooks.PreToolUse // [])
            + [{"matcher":$hbmatcher,"hooks":[{"type":"command","command":$hbcmd,"timeout":5}]}]) end)
+    | (if $board == 0 or have("UserPromptSubmit"; $sg) then . else
+         .hooks.UserPromptSubmit = ((.hooks.UserPromptSubmit // [])
+           + [{"hooks":[{"type":"command","command":$sgcmd,"timeout":5}]}]) end)
+    | (if $board == 0 or have("Stop"; $sg) then . else
+         .hooks.Stop = ((.hooks.Stop // [])
+           + [{"hooks":[{"type":"command","command":($sgcmd + " Stop"),"timeout":5}]}]) end)
   ' "$settings" > "$tmp" && mv "$tmp" "$settings"
-  echo "[claude] registered m2herd hooks in $settings (SessionStart, PreCompact$([ "$budget_ok" -eq 1 ] && echo ", PostToolUse")$([ "$board_ok" -eq 1 ] && echo ", PreToolUse herd-board"))"
+  echo "[claude] registered m2herd hooks in $settings (SessionStart, PreCompact$([ "$budget_ok" -eq 1 ] && echo ", PostToolUse")$([ "$board_ok" -eq 1 ] && echo ", PreToolUse herd-board, UserPromptSubmit+Stop steer gate"))"
 }
 
 # --- Claude Code statusline: ctx-bridge.sh (the context-budget bridge WRITER).
@@ -417,6 +428,7 @@ M2HERD_BINS=(
   "herd-board=herd-board" "herd-spawn.sh=herd-spawn"
   "herd-phase=herd-phase" "herd-watch=herd-watch" "herd-limits=herd-limits" "herd-recover=herd-recover"
   "herd-clash=herd-clash" "herd-merge=herd-merge" "herd-context=herd-context"
+  "m2herd-purge=m2herd-purge" "m2herd-steer=m2herd-steer"
 )
 install_m2herd_bins() {
   local bin_dir="$HOME/.local/bin"

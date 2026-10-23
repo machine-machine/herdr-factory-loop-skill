@@ -147,8 +147,38 @@ All in `scripts/`, linked by `install.sh` into `~/.local/bin` without the extens
 
 ## 6. Rules templates (`templates/herd/rules/`)
 
-`WORKER.md`, `REVIEWER.md`, `FIXER.md` replace the per-herd COMMON chains. Per-herd values
-(orchestrator name, ports, base shas) are filled in by `herd-context`, never typed into the rules.
+`WORKER.md`, `REVIEWER.md`, `FIXER.md` replace the per-herd COMMON chains; `ORCHESTRATOR.md` and
+`HERD-CUT.md` (the pre-start check of the cut) are herd-level roles: `herd-context orchestrator|herd-cut
+<herd>` takes no slice and writes `<herd>/ctx.<role>.md` (plan, every task header or task, packages,
+stacks, clashes, phases, register excerpt); the cut check reports to `<herd>/HERD-CUT.out.md`. The
+skeptic has no file of its own — the loop points skeptics at the reviewer context, so `REVIEWER.md`
+carries an "As a skeptic" section. Per-herd values (orchestrator name, ports, base shas) are filled
+in by `herd-context`, never typed into the rules.
+
+Every role file has the same shape, borrowed from the BMad Method's agent personas (MIT; attribution
+in `NOTICE`): a **Role** table (owns, gets, hands off, never), numbered **Principles**, the
+**Workflow** or checks, the **handoff artifact** and its vocabulary, then the hard rules. Borrowed
+where it fits the flow:
+- orchestrator ← Product Owner: requirements written once in the task with their source, scope
+  decided once and recorded, queue ordered riskiest-first, done as a check the orchestrator runs,
+  replan when a report shows a later task no longer fits; a readiness standard before `queued`.
+- cut check ← readiness gate `PASS | CONCERNS | FAIL` plus the set and dependency checks and the
+  Architect's focus on invariants between slices built apart (hot files, missing pairs, interfaces).
+- worker ← Developer: the task is the spec, acceptance criteria `AC<n>` as vocabulary, no criterion
+  met without a check that would fail, red-green-refactor; the report sections and the blocking
+  conditions (`unclear intent`, `intent gap`, `decision needed`, `verification failed`,
+  `environment`, `base moved`) of the unattended build workflow.
+- reviewer/skeptic ← code review: lenses (acceptance, edge cases, verification gap, safety), verify
+  the claim before grading it, severity = harm of one occurrence, zero findings is valid;
+  pre-existing problems go to the after-merge list as `pre-existing:` lows.
+- fixer and the worker's fix round ← finding routing: fix / decision needed / not fixed.
+- `task.md.example` ← story format: numbered Given/When/Then criteria with a check each,
+  *Must not change* boundaries, marked `Assumption:` lines.
+Not borrowed: named personas, greetings, menus and customisation layers (agents here are started
+non-interactively); PRD, architecture and epic documents and a stored ticket tree or plan `status`
+(the flow writes down decisions, never state — phases live only in `herd.events.jsonl`); a
+`WAIVED` gate state (a medium/high finding is fixed or refuted, never waived); forced minimum
+finding counts.
 `MODELS.md` — the model table below; the authoritative copy of a team's choice lives in its own
 decisions register, MODELS.md is the skill default.
 
@@ -180,10 +210,111 @@ evidence reports. State is computed (`checks.sh`, `herd-board`, `lage card`).
                            status.json, out.md, befunde-<sha7>.md, ctx.<role>.md (generated, ignored)
       dispatch/            one-off investigations; > 21 days → archives/dispatch/<YYYY-MM>/
       archives/<date>/     INDEX.md one line per moved file
-    ~/.cache/m2herd/<project>/   run data: screens/, runs/, backups/ (deleted 14 days after the herd merged)
+    ~/.cache/m2herd/<project>/   run data: screens/, runs/, backups/, logs (deleted by m2herd-purge, below)
     ~/.m2herd/state/<project>/   runtime state: sqlite, *.lock, poll/watch state
 
 `m2herd-migrate [--apply]` — dry run by default: prints every move with size and every reader found
 by `grep -rl` (scripts, hooks, skills) that still references the old path; `--apply` refuses while
 any reader is unresolved unless `--force-readers`, writes `archives/<date>/INDEX.md`, never deletes
 (except `__pycache__`), and finishes with the reader check again.
+
+### 7.1 Weekly purge: `m2herd-purge`
+
+Migration happens once; files keep piling up afterwards (one fabric grew from 98 MB to 718 MB in a
+day, ~630 MB of it screenshots and run data). `m2herd-purge <fabric>` runs weekly and removes what
+nobody uses any more. `--help` has the full rules; the policy is:
+
+a. **Run data is deleted.** Under `~/.cache/m2herd/<project>/` every entry of a run-data dir
+   (`screens/ screenshots/ runs/ backups/ logs/`, `HERD_PURGE_RUN_DIRS`) and every top-level `*.log`
+   is deleted when its newest file is older than `HERD_PURGE_RUN_DAYS` (14). Herd run data
+   (`herden/<herd>/`) is one unit and counts from the herd's last `merged` event in
+   `<herd>/herd.events.jsonl` (read through `herd_events.py`, also in `archives/`). A herd with a
+   slice that is not `merged`/`parked` keeps all of its data, however old. When no event file is
+   found, the newest file mtime counts. `runs/CURRENT` and the run it names stay.
+b. **Inside the fabric only caches are deleted:** `__pycache__/`, stray `*.pyc`, `*.lock` files no
+   process holds (no fd in `/proc`, a non-blocking `flock` succeeds, lock and base file unused for
+   `HERD_PURGE_GRACE_HOURS`, 24), and empty dirs (empty for the grace time or emptied by this run; one
+   a sibling file names as `<dir>/`, like `deep: ./deep/`, stays). Everything else that is **no longer
+   used** is **moved** to `archives/<date>/<same path>`, and each move gets one line in
+   `archives/<date>/INDEX.md` (path, size, last modified, why). A file is no longer used when all three
+   hold: nothing in it changed for `HERD_PURGE_ARCHIVE_DAYS` (30), no reader references it, and it is
+   not on the keep list. Units are the top-level entries plus the entries of `dispatch/` and
+   `herden/`. A herd dir moves as a whole or stays, and no other dir is split either.
+   - *Readers* are the `m2herd-migrate` reader check, imported from that script: fixed strings
+     `.m2herd/<path>` under the `--readers` roots (`HERD_PURGE_READERS`, default
+     `~/.local/bin,~/.claude/hooks,~/.claude/skills`) plus the fabric's own scripts. On top of that
+     come the project dir's top-level files (decisions register, `CLAUDE.md`) and every text file of
+     the fabric that stays (RESUME, PHASE-NEXT, rules, live herds, recent reports; of `NOTES.md`
+     only the current month). A bare word like `context` counts only as `context/` or
+     `.m2herd/context`, so prose does not keep a dir. A reference from a file archived in the same
+     run keeps nothing.
+   - *Keep list:* `RESUME.md`, `NOTES.md`, `PHASE-NEXT-*`, `rules/`, `herden/`, `dispatch/`,
+     `archives/`, `checks.sh`, top-level register/decisions files, the m2herd engine's files (names in
+     `templates/m2herd/`), top-level scripts, runtime state (`*.sqlite3`, `*.db` and their side files,
+     `*state.json`, `.sync-*`; `m2herd-migrate` moves those), files with a `<file>.lock` sibling,
+     `*.jsonl` logs and dirs that hold one, dotfiles, live herds (v2: a slice not merged/parked; v1:
+     changed within `--live-hours`, 48), and `HERD_PURGE_KEEP` globs.
+c. **Run data found inside the fabric** goes to the cache first, the way migrate moves it: any dir
+   named like a run-data dir, so `dispatch/screens/`, `<herd>/screens/`, `<loop>/runs/` and `backups/`.
+   `dispatch/screens` → `screens/`, `<herd>/…` → `herden/<herd>/…`, any other path keeps its path.
+   After the move it falls under (a). An entry that (a) would delete straight away is deleted in
+   place, so it is never copied first. Entries newer than the grace time stay, and so do live herds.
+
+`archives/` is never touched, and nothing a process holds open is moved or deleted. Settings come
+from the command line, then the environment, then `<fabric>/rules/purge.env` (`KEY=VALUE` lines),
+then the defaults.
+
+Dry run by default: every action is printed with its size and reason, followed by totals (deleted,
+moved to the cache, archived, freed from disk). `--summary` prints only the totals and `--verbose`
+adds every kept entry with its reason. `--apply` does it. A `flock` on the fabric dir keeps two runs
+apart. When `--apply` changed something, one `- [<UTC ts>] m2herd-purge: …` line is appended to
+`NOTES.md` under `NOTES.md.lock`. Exit 0 = ok (also nothing to do), 1 = an action failed (the rest
+still ran; each failure is printed), 2 = usage error, missing fabric, or another run holds the lock.
+
+**Weekly, for every fabric.** List the fabrics in `~/.config/m2herd/fabrics`, one path per line,
+`#` for comments; `m2herd-purge --fabrics <file>` runs them in turn. The systemd user units in
+`templates/systemd/` (`m2herd-purge.service` + `.timer`: `OnCalendar=weekly`, `Persistent=true`) run
+`m2herd-purge --apply --fabrics %h/.config/m2herd/fabrics`. Nothing is installed or enabled for you:
+copy both into `~/.config/systemd/user/`, do one dry run, then
+`systemctl --user enable --now m2herd-purge.timer`. Without systemd, add a crontab line instead
+(`crontab -e`): `17 4 * * 1 $HOME/.local/bin/m2herd-purge --apply --fabrics $HOME/.config/m2herd/fabrics >>$HOME/.cache/m2herd/purge.log 2>&1`
+
+## 8. STEER: intelligent determinism
+
+Watchers append to `.m2herd/inbox/STEER.md` faster than anyone reads it, and a snapshot watcher
+re-posts the same findings every run with new counters, so the file grows into noise nobody
+drains. Hooks are deterministic but cannot judge; an agent judges but forgets. The fix splits
+the work in three and lets each part do only what it is good at:
+
+1. **Deterministic intake — `scripts/m2herd-steer`** (python3 stdlib). Parses every entry below
+   the marker; a `- <ts> <Source>: a; b; c[. Word: /path]` line is split into findings, anything
+   else is one finding. Key = normalised text (timestamps out, numbers below 6 digits -> `#`,
+   ids -> `<id>`) plus the subject (leading id chain, else first id, else text); `Label: id,id,…`
+   lists key on the label and carry the ids. Repeats fold into one item with first/last seen and
+   count. Append-only ledger `inbox/steer.ledger.jsonl` (flock `<ledger>.lock`): `seen`, `ack`,
+   `defer`, `superseded`, plus `compacted`/`vanished` so no line is ever counted twice. The intake
+   itself supersedes what a newer report replaced: a newer status for the same subject, or — for
+   snapshot watchers (consecutive reports share findings) — a finding absent from the source's
+   last 2 reports. Event-style sources (one finding per line) never lose items by absence.
+2. **Deterministic gate — `hooks/m2herd-steer-gate.sh`** (UserPromptSubmit, and Stop with argv
+   `Stop`). Pending > 0 → one `additionalContext` line: count, top 3 keys (urgent words first),
+   the rules path and the exact commands. Silent at 0, in herd worker panes (`M2HERD_WORKER=1`,
+   `HERD_SLICE`, herd.map membership as in `herd-board-subagents.py`), in subagents, on
+   `stop_hook_active`, with `M2HERD_STEER_GATE=0`. Same open set at most once per 30 min per
+   session (state in `~/.m2herd/state/<project>/steer-gate.json`). Never emits a `decision`, so
+   it never blocks a turn.
+3. **Agent judgment — `templates/herd/rules/STEER.md`**. Per item exactly one ledger action:
+   `done` (reopens when reported again), `ticket` / `register` / `delegated` (repeats stay quiet,
+   new ids reopen), `dropped` (never reopens), `defer --until` (open again after the date). One
+   subagent per group of related items, never per item; human lines are never dropped silently.
+4. **Deterministic verification — `m2herd-steer verify`** exits 1 while any item is neither acked,
+   superseded nor deferred into the future. This repo has no fabric check script; a project wires
+   `m2herd-steer --fabric <root> verify` into its own checks (session start, after a merge). Then
+   `m2herd-steer compact` moves entries whose findings are all closed into
+   `archives/steer/<YYYY-MM>.md` under `<STEER.md>.lock` (same-dir tmp + rename; a line an unlocked
+   appender writes meanwhile is carried over). Open or deferred entries never move; STEER.md is
+   never cleared by hand.
+
+Tests: `python3 tests/steer/test_steer.py` (offline, temp HOME; a synthetic STEER.md with a
+snapshot watcher, an event-style watcher and human/TUI lines; hook format, rate limit, worker
+silence, compaction, append-only ledger).

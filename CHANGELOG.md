@@ -7,6 +7,13 @@ adheres to [Semantic Versioning](https://semver.org/).
 ## [2.10.0] - 2026-10-23
 
 ### Added
+- **STEER: intelligent determinism** (`docs/herd-flow-v2.md` §8): `scripts/m2herd-steer` folds
+  `.m2herd/inbox/STEER.md` into stable-keyed items (repeats deduped with first/last seen and count,
+  newer watcher states supersede older ones) with an append-only `inbox/steer.ledger.jsonl`
+  (`list`, `ack`, `defer`, `pending-count`, `verify`, `compact` to `archives/steer/<YYYY-MM>.md`);
+  `hooks/m2herd-steer-gate.sh` (UserPromptSubmit/Stop) injects one rate-limited line while items
+  are open; `templates/herd/rules/STEER.md` says how each item ends in exactly one action; tests in
+  `tests/steer/`.
 - **Herd flow v2** (`docs/herd-flow-v2.md`, the build contract; SKILL.md §16.7): triage → plan +
   queue → worker reports → orchestrator accepts → review loop → clean ✓ or findings back to the
   top of the queue → merge only on the human's go. One schema for every piece:
@@ -44,6 +51,16 @@ adheres to [Semantic Versioning](https://semver.org/).
     in place, writes `archives/<date>/INDEX.md`, deletes nothing but `__pycache__`, and checks
     the readers again. `--selftest`; `tests/docs/test_m2herd_migrate_mirror.py` applies it to an
     emptied mirror of a real fabric and proves no file and no NOTES/RESUME line is lost.
+- `scripts/m2herd-purge` + `templates/systemd/m2herd-purge.{service,timer}` — weekly purge
+  (docs §7.1). Run data in `~/.cache/m2herd/<project>/` is deleted after `HERD_PURGE_RUN_DAYS`
+  (14); for herd run data the clock starts at the herd's last `merged` event. Run data found in the
+  fabric moves to that cache first. Inside the fabric only caches (`__pycache__`, `*.pyc`, unheld
+  locks, empty dirs) are deleted. Files unchanged for `HERD_PURGE_ARCHIVE_DAYS` (30) that no reader
+  names (the reader check is imported from `m2herd-migrate`) and that are not on the keep list move
+  to `archives/<date>/`, one `INDEX.md` line each. Dry run by default; `--apply` takes a lock and
+  writes one NOTES line when it changed something. Settings come from `rules/purge.env` or the
+  environment. `--fabrics` runs every fabric in `~/.config/m2herd/fabrics`. Tests in
+  `tests/purge/`.
 
 ### Changed
 - `herd-board` follows the v2 lanes (Needs you, Queue, Working, Ready to merge, Merged today),

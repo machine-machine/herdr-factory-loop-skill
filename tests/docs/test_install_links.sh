@@ -20,7 +20,7 @@ export PATH="$tmp/fakebin:$HOME/.local/bin:$PATH"
 pass=0 fail=0
 check() { if eval "$2"; then pass=$((pass + 1)); else fail=$((fail + 1)); echo "FAIL $1"; fi; }
 
-bins="m2herd m2herd-up m2herd-migrate herd-board herd-spawn herd-phase herd-watch herd-limits herd-recover herd-clash herd-merge herd-context"
+bins="m2herd m2herd-up m2herd-migrate herd-board herd-spawn herd-phase herd-watch herd-limits herd-recover herd-clash herd-merge herd-context m2herd-purge m2herd-steer"
 declare -A src=([m2herd]=m2herd.sh [m2herd-up]=m2herd-up.sh [herd-spawn]=herd-spawn.sh)
 
 # a link of the user's own, pointing elsewhere, must survive --uninstall

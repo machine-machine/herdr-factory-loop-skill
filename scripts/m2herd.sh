@@ -703,7 +703,11 @@ next_cmd() {
     fi
   fi
   if [ -f "$m2/inbox/STEER.md" ] && has_ink "$(live_tail "$m2/inbox/STEER.md")"; then
-    echo "NEXT: drain steering — read .m2herd/inbox/STEER.md, act, then clear below the marker"; return 0
+    if command -v m2herd-steer >/dev/null 2>&1; then
+      echo "NEXT: triage steering — m2herd-steer list --open, one ledger action per item (templates/herd/rules/STEER.md)"
+    else
+      echo "NEXT: drain steering — read .m2herd/inbox/STEER.md, act, then clear below the marker"
+    fi; return 0
   fi
   if ! machineroom_watching; then
     echo "NEXT: bring up the machineroom — run: m2herd-up up --room-only --repo $DIR"; return 0

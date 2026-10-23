@@ -5,7 +5,7 @@ Since 2.10.0 the rules for herd agents are role files, not a per-herd COMMON cha
 - `templates/herd/rules/WORKER.md`, `REVIEWER.md`, `FIXER.md` — the rules per role.
 - `templates/herd/rules/MODELS.md` — which model and effort for which task.
 
-`herd-context <role> <herd> <slice>` writes `<herd>/<slice>.ctx.<role>.md`: the role's rules with the
+`herd-context <role> <herd> [<slice>]` writes `<herd>/<slice>.ctx.<role>.md`: the role's rules with the
 herd's values filled in, then the task, report, findings, clash list, memory and register excerpt.
 `herd-spawn` points a worker at that file. It looks for the rules in `$HERD_RULES_DIR`, then
 `<project>/.m2herd/rules/` (project overrides), then these templates.

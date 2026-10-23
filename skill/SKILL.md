@@ -1125,10 +1125,10 @@ stored. Retired: `herd.map`, `active.txt`, `done.txt`, `<slice>.started`, `<slic
 `needs_memory`, `keywords`) — template `templates/herd/task.md.example`. `<slice>.repos` has one
 line `repo branch base` per repo; the base column is required.
 
-**Rules per role, not per herd.** `templates/herd/rules/WORKER.md`, `REVIEWER.md`, `FIXER.md`
+**Rules per role, not per herd** (structure adapted from the MIT-licensed BMAD method, see `NOTICE`). `templates/herd/rules/ORCHESTRATOR.md`, `HERD-CUT.md`, `WORKER.md`, `REVIEWER.md`, `FIXER.md`, `STEER.md`
 replace the per-herd COMMON chains; `MODELS.md` says which model and effort for which task. A
 project overrides them in `.m2herd/rules/`. Per-herd values (orchestrator name, ports, test
-commands, what is unreachable) go into `<herd>/ctx.env`; `herd-context <role> <herd> <slice>`
+commands, what is unreachable) go into `<herd>/ctx.env`; `herd-context <role> <herd> [<slice>]`
 fills them in and writes `<slice>.ctx.<role>.md` with the rules, task, report, findings, clash
 list, memory files and a register excerpt — the one file an agent starts from.
 
@@ -1137,11 +1137,13 @@ list, memory files and a register excerpt — the one file an agent starts from.
     herd-watch <herd>                        # long-running: starts fix_queued before queued, respects stacked_on, wakes $HERD_ORCH_PANE
     herd-limits [<herd>]                     # one budget for workers AND review agents (slots, free MB, load)
     herd-clash <herd> [--json]               # files two live slices both touch → ⇄ on the board
-    herd-context <role> <herd> <slice>       # the agent's context file
+    herd-context <role> <herd> [<slice>]     # worker|reviewer|fixer per slice; orchestrator|herd-cut per herd
     herd-merge <herd> <package> --go "<the human's words>"   # squash-merge in stacked_on order, restack children
     herd-recover <herd>                      # after a crash: reconcile events with panes, sessions, GitHub
     herd-board [--anchor <pane>] [<herd> …]  # the panel; --open splits the anchor's right third
     m2herd-migrate <.m2herd> [--readers d,d] # dry run of the .m2herd v2 layout; --apply moves, never deletes
+    m2herd-purge <.m2herd> [--apply]          # weekly (templates/systemd): run data out + old, archive unused, never delete docs
+    m2herd-steer list|ack|defer|verify|compact # STEER inbox → deduped items + ledger; the gate hook nudges, verify checks
 
 **The worker's side.** Keep `<herd>/<slice>.status.json` current (`sentence`, `step`/`of`,
 `missing` — `blocked:` when stuck —, `short`, `pr`; German keys are read too), stop its own
