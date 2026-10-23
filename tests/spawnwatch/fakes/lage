@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+echo "lage $*" >> "${FAKE_TOOL_LOG:-/dev/null}"

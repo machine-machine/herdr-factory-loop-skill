@@ -1,0 +1,69 @@
+tickets: 1111111111, 2222222222
+together_with: invoice-export-ui
+stacked_on: pdf-layout
+model: claude-opus-5-5
+effort: high
+needs_memory: stacked-pr-merge.md, worktree-setup.md
+keywords: invoice, export, CSV
+
+# invoice-export — invoices as CSV from the list view
+
+<!--
+Copy to <herd>/<slice>.task.md. The header is `key: value` lines up to the FIRST BLANK LINE
+(docs/herd-flow-v2.md §2); a line that is not `key: value` also ends it. Every key is optional:
+  tickets        ticket ids; herd-context pulls register entries and `lage` hits for them,
+                 herd-phase mirrors phase changes with `lage log <ticket> herd-<phase>`
+  together_with  partner slices merged as ONE package with this one (transitive)
+  stacked_on     base slice whose PRs must merge first; herd-watch starts this slice only once the
+                 base is at least `accepted`, and <slice>.repos then names the base's branch as base
+  model, effort  defaults claude-opus-5-5 / high — see rules/MODELS.md
+  needs_memory   memory files herd-context copies into the worker's context in full
+  keywords       search words for the register excerpt and `lage search` (default: slice name + title)
+Next to it, <slice>.repos — one line per repo, all three columns required:
+  acme-api  feat/invoice-export  origin/main
+  acme-ui   feat/invoice-export  feat/pdf-layout
+Delete this comment in the real task file.
+-->
+
+## Goal
+
+One or two sentences: what a user can do after this slice that they cannot do today, and why it
+matters. Name the ticket(s) it comes from.
+
+## Acceptance
+
+Numbered criteria; the worker's report and the reviewer refer to them by id. Each states a rule,
+not one example, at the outermost surface the goal names (the screen, the API call, the file a user
+gets) — not an internal proxy for it. Include the failure path.
+
+1. **AC1 — Export from the list view**
+   **Given** a list with 3 invoices, 1 of them cancelled
+   **When** the user clicks "Export CSV"
+   **Then** a file with a header row and 3 data rows downloads; the cancelled one is marked
+   **Check:** click path on the local UI, or `GET /invoices/export.csv`; test `test_export_rows`
+2. **AC2 — Empty list**
+   **Given** a filter that matches no invoice
+   **When** the user clicks "Export CSV"
+   **Then** the button is disabled with the hint "nothing to export"; no empty file is offered
+   **Check:** UI test `export-empty`
+3. **AC3 — Tests** — the export suite grows by at least the cases above and stays green.
+
+## Boundaries
+
+- Must not change: the existing PDF export and its URL.
+- Out of scope: scheduled exports (slice `invoice-export-cron`).
+- Interface with `invoice-export-ui`: `GET /invoices/export.csv?filter=<same as list>` →
+  `text/csv`, columns `number,date,customer,amount,status`. Both tasks say it the same way.
+
+## Context
+
+- Why now: the request or feedback this comes from, with the date and where it is written down.
+- Binding decisions: register ids (`d-<slug>`); open questions: `q-<slug>` and what they block.
+- Expected files and modules; shared files other slices touch too (the cut check reads these).
+
+## Notes
+
+One marked line each; delete the section when empty.
+
+- Assumption: an unconfirmed choice the worker may build on; once confirmed it becomes a
+  register decision.

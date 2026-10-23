@@ -1,0 +1,23 @@
+# m2herd-purge.service — weekly purge of every .m2herd fabric listed in ~/.config/m2herd/fabrics
+# (docs/herd-flow-v2.md §7). A systemd USER unit template; nothing installs or enables it for you:
+#
+#   mkdir -p ~/.config/systemd/user ~/.config/m2herd
+#   cp templates/systemd/m2herd-purge.{service,timer} ~/.config/systemd/user/
+#   echo "$HOME/<project>/.m2herd" >> ~/.config/m2herd/fabrics     # one fabric per line, # comments
+#   m2herd-purge --fabrics ~/.config/m2herd/fabrics                 # dry run first: read what it would do
+#   systemctl --user daemon-reload && systemctl --user enable --now m2herd-purge.timer
+#
+# Per-project settings live in <fabric>/rules/purge.env (HERD_PURGE_RUN_DAYS, HERD_PURGE_ARCHIVE_DAYS,
+# HERD_PURGE_READERS, …) — the unit itself passes none. Output goes to the journal:
+#   journalctl --user -u m2herd-purge.service
+[Unit]
+Description=m2herd weekly purge (run data, caches, unused fabric files)
+Documentation=https://github.com/machine-machine/herdr-factory-loop-skill/blob/main/docs/herd-flow-v2.md
+ConditionPathExists=%h/.config/m2herd/fabrics
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/m2herd-purge --apply --fabrics %h/.config/m2herd/fabrics
+Nice=10
+IOSchedulingClass=idle
+# exit 2 = a listed fabric is missing or another run holds its lock: shown as failed, retried next week
