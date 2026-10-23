@@ -455,9 +455,16 @@ def execute(herd, pkg, steps, mains, go, keep_branches, say):
     left = {}
     for x in steps:
         left.setdefault(x.slice, []).append(x)
+    def record(s):
+        # also for a slice whose PRs were all merged before this run (crash after `gh pr merge`, merge by hand)
+        if all(y.done for y in left[s]):
+            he.append(herd, s, "merged", by="merge", prs=merged_prs[s], go=go[:GO_MAX])
+            say(f"   {s} → merged")
+
     for i, x in enumerate(steps, 1):
         if x.done:
             merged_prs.setdefault(x.slice, []).append(f"{x.repo}#{x.n}@{x.merge_sha[:7]}")
+            record(x.slice)
             continue
         say(f"{i}. {x.name} ({x.slice})")
         pr = x.pr = pr_view(x.full, x.n)
@@ -484,9 +491,7 @@ def execute(herd, pkg, steps, mains, go, keep_branches, say):
         expected_main[x.full] = oid
         merged_prs.setdefault(x.slice, []).append(f"{x.repo}#{x.n}@{oid[:7]}")
         say(f"   merged as {oid[:7]}")
-        if all(y.done for y in left[x.slice]):
-            he.append(herd, x.slice, "merged", by="merge", prs=merged_prs[x.slice], go=go[:GO_MAX])
-            say(f"   {x.slice} → merged")
+        record(x.slice)
         keep = keep_branches
         for child, line, inplan in children_of(herd, x, steps):
             ok, stop = restack(herd, x, child, line, inplan, say, dry=False)

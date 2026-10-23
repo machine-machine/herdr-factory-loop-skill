@@ -245,8 +245,14 @@ def procs_in(slice_name, extra=()):
     return [(w, st) for w, (r, st) in sorted(best.items(), key=lambda kv: kv[1][0])]
 
 
+def claude_project_dir(cwd):
+    if he:
+        return he.claude_project_dir(cwd)
+    return os.path.expanduser("~/.claude/projects/" + re.sub(r"[^A-Za-z0-9]", "-", cwd))  # board without its core
+
+
 def transcript_age(cwd):
-    d = os.path.expanduser("~/.claude/projects/" + re.sub(r"[/.]", "-", cwd))
+    d = claude_project_dir(cwd)
     files = glob.glob(os.path.join(d, "*.jsonl"))
     return (time.time() - max(os.path.getmtime(f) for f in files)) / 60 if files else None
 
@@ -316,7 +322,7 @@ def last_action(jsonl):
 
 
 def newest_jsonl(cwd):
-    files = glob.glob(os.path.join(os.path.expanduser("~/.claude/projects/" + re.sub(r"[/.]", "-", cwd)), "*.jsonl"))
+    files = glob.glob(os.path.join(claude_project_dir(cwd), "*.jsonl"))
     return max(files, key=os.path.getmtime) if files else None
 
 

@@ -6,6 +6,7 @@ Stdlib only, so the board, the watcher and the hooks can import it without a ven
 """
 import datetime
 import fcntl
+import glob
 import json
 import os
 import re
@@ -44,6 +45,17 @@ def now():
 
 def path(herd):
     return os.path.join(herd, EVENTS)
+
+
+def claude_project_dir(cwd):
+    """~/.claude/projects/<slug> of a cwd, named the way Claude Code names it: every non-alphanumeric
+    character becomes "-"; a slug over 200 chars is cut and gets a hash suffix (found by glob)."""
+    root = os.path.expanduser("~/.claude/projects")
+    slug = re.sub(r"[^A-Za-z0-9]", "-", cwd)
+    if len(slug) <= 200:
+        return os.path.join(root, slug)
+    hits = sorted(glob.glob(os.path.join(glob.escape(root), glob.escape(slug[:200]) + "-*")))
+    return hits[0] if hits else os.path.join(root, slug[:200])
 
 
 def read(herd):

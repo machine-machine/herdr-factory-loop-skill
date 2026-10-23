@@ -133,6 +133,13 @@ def main():
         latest = re.search(r"^## \[(\d+\.\d+\.\d+)\]", f.read(), re.M).group(1)
     check("SKILL version == CHANGELOG latest == 2.10.0", ver == latest == "2.10.0", f"{ver} {latest}")
 
+    # the published docs carry examples, never the source fabric's ticket ids or memory file names
+    leaks = re.compile(r"\b\d{11}\b|gst|gruenstifter|yvonne|satie|mariusz|f(ö|oe)rster", re.I)
+    for rel in ("docs/herd-flow-v2.md", "README.md", "CHANGELOG.md", "skill/SKILL.md", "templates/herd/workflows/README.md"):
+        with open(os.path.join(REPO, rel), encoding="utf-8") as f:
+            hits = sorted({m.group(0) for m in leaks.finditer(f.read())})
+        check(f"{rel} carries no project ids", not hits, ", ".join(hits))
+
     print(f"test_rules_templates: {ok} passed, {fail} failed")
     return 0 if fail == 0 else 1
 

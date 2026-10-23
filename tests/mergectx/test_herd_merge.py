@@ -179,6 +179,68 @@ class Merges(Base):
         self.assertIn("already merged: a", out)
         self.assertEqual([self.phase(s) for s in "abc"], ["merged"] * 3)
 
+    def test_slice_merged_before_the_run_is_recorded(self):
+        # crash between `gh pr merge` and the merged event, or a merge by hand on GitHub
+        w = self.w
+        self.pair()
+        sha = w.sh(w.tmp, "git", "-C", os.path.join(w.tmp, "acme-api.git"), "rev-parse", "refs/heads/reviere-api")
+        w.sh(w.tmp, "gh", "pr", "merge", "1", "--repo", "acme/acme-api", "--squash", "--match-head-commit", sha)
+        self.assertEqual(w.pr("acme-api", 1)["state"], "MERGED")
+        rc, out, err = self.merge("reviere", go="merge reviere")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("already merged as", out)
+        for s in ("reviere", "reviere-ui"):
+            ev = he.last(w.herd, s)
+            self.assertEqual(ev["phase"], "merged", s)
+            self.assertEqual(ev["go"], "merge reviere")
+        self.assertEqual(he.last(w.herd, "reviere")["prs"], [f"acme-api#1@{w.pr('acme-api', 1)['merge_commit'][:7]}"])
+        self.assertEqual([c[c.index("--repo") + 1] for c in w.calls(["pr", "merge"])],
+                         ["acme/acme-api", "acme/acme-ui"], "the pre-merged PR is not merged again")
+        rc, out, err = self.merge("reviere", go="merge reviere")
+        self.assertEqual(rc, 0, out + err)
+        self.assertIn("nothing left to merge", out)
+
+
+class Races(Base):
+    """GitHub changes between the package preflight and a merge: the re-read and --match-head-commit."""
+    API_MERGED = ["pr", "merge", "1", "--repo", "acme/acme-api"]
+    UI_MAIN = ["api", "repos/acme/acme-ui/git/ref/heads/main"]
+
+    def push(self, wt, ref="reviere-ui"):
+        return (f"git -C {wt} commit -q --allow-empty -m late && "
+                f"git -C {wt} push -q origin HEAD:{ref}")
+
+    def assert_ui_not_merged(self, rc, out, err):
+        self.assertEqual(rc, 1, out + err)
+        self.assertEqual(self.w.pr("acme-ui", 1)["state"], "OPEN")
+        self.assertEqual(self.phase("reviere"), "merged")
+        self.assertEqual(self.phase("reviere-ui"), "review_ok")
+
+    def test_reread_catches_head_moved_after_preflight(self):
+        _, wu = self.pair()
+        self.w.after(self.API_MERGED, 1, self.push(wu))
+        rc, out, err = self.merge("reviere")
+        self.assert_ui_not_merged(rc, out, err)
+        self.assertIn("re-read before merge failed", err)
+        self.assertIn("≠ expected", err)
+
+    def test_reread_catches_main_moved_after_preflight(self):
+        self.pair()
+        other = self.w.worktree("acme-ui", "other", "other")
+        self.w.sh(other, "git", "checkout", "-q", "-B", "main", "origin/main")
+        self.w.after(self.API_MERGED, 1, self.push(other, "main"))
+        rc, out, err = self.merge("reviere")
+        self.assert_ui_not_merged(rc, out, err)
+        self.assertIn("re-read before merge failed", err)
+        self.assertIn("moved", err)
+
+    def test_match_head_commit_catches_head_moved_after_reread(self):
+        _, wu = self.pair()
+        self.w.after(self.UI_MAIN, 2, self.push(wu))  # 2nd = the re-read right before the ui merge
+        rc, out, err = self.merge("reviere")
+        self.assert_ui_not_merged(rc, out, err)
+        self.assertIn("--match-head-commit", " ".join(self.w.calls(["pr", "merge", "1", "--repo", "acme/acme-ui"])[0]))
+
 
 class Stacks(Base):
     def stack(self, child_phase="review_ok", in_package=False, change_patch=False):

@@ -9,6 +9,7 @@ and no lage index is ever touched.
 """
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -50,7 +51,7 @@ def system_path():
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.root = tempfile.mkdtemp(prefix="spawnwatch-")
+        self.root = tempfile.mkdtemp(prefix="spawn_watch.")  # "_" and "." as in real repo paths
         self.home = os.path.join(self.root, "home")
         self.herd = os.path.join(self.root, "herd")
         self.wtroot = os.path.join(self.root, "wt")
@@ -527,6 +528,19 @@ class WatchTest(Base):
         self.assertEqual(len(self.prompts()), 1)
         self.assertIn("mm gone", self.prompts()[0][3])
 
+    def test_gone_hint_is_a_step_that_works(self):
+        # herd-spawn --resume refuses a slice that is still `working`; the hint must name herd-recover
+        self.slice("mm")
+        self.phase("mm", "working", pane="w1:p99", session_id=str(uuid.uuid4()))
+        self.tick()
+        msg = self.prompts()[0][3]
+        self.assertIn(f"herd-recover {self.herd}", msg)
+        self.assertNotIn("or herd-spawn --resume", msg)
+        r = self.run_script("herd-recover", self.herd, "--no-gh")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(he.last(self.herd, "mm")["phase"], "queued")
+        self.assertIn("STARTED mm (queued, resume)", self.tick())
+
     def test_without_orch_pane_only_logs(self):
         self.live_worker("nn", "blocked")
         out = self.tick(env={"HERD_ORCH_PANE": ""})
@@ -588,8 +602,9 @@ class RecoverTest(Base):
         os.makedirs(cache)
         wr(os.path.join(cache, "review-state.json"), json.dumps({"api#210": "ok"}))
         # transcript of live1's worktree names its session
+        # Claude Code's project dir: every non-alphanumeric character of the cwd becomes "-"
         tdir = os.path.join(self.home, ".claude", "projects",
-                            os.path.join(self.wtroot, "api", "live1").replace("/", "-").replace(".", "-"))
+                            re.sub(r"[^A-Za-z0-9]", "-", os.path.join(self.wtroot, "api", "live1")))
         os.makedirs(tdir)
         wr(os.path.join(tdir, "11111111-2222-4333-8444-555555555555.jsonl"), "{}\n")
         self.add_herde([("w1:p2", 40, None)])   # live1: bare shell left, its TUI died

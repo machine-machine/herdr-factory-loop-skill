@@ -179,7 +179,8 @@ class Watch:
                     self.once(s, "reported", rnd, f"{s}.out.md written, agent {status or 'pane closed'}; read it and accept or send back")
                 continue
             if a is None and pane not in panes and time.time() - ts_epoch(rnd) > self.grace:
-                self.once(s, "gone", rnd, f"pane {pane} is gone without a report; herd-recover or herd-spawn --resume")
+                self.once(s, "gone", rnd, f"pane {pane} is gone without a report; run herd-recover {self.herd} "
+                          "(parks and re-queues it; herd-watch then resumes its session)")
         # an episode ends when the agent is no longer blocked: the next block wakes again
         if agents is not None:
             self.mem["blocked"] = [k for k in self.mem["blocked"] if k in blocked_now]

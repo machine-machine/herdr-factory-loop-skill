@@ -5,7 +5,10 @@ State file ($FAKE_GH_STATE, JSON):
   {"repos": {"acme/api": {"bare": "/tmp/.../api.git",
                           "prs": {"1": {"head": "feat-a", "base": "main", "state": "OPEN",
                                         "mergeable": null, "fail_merge": false, "merge_commit": null}}}},
-   "log": [[argv...], ...]}
+   "log": [[argv...], ...],
+   "after": [{"prefix": [argv...], "nth": 2, "sh": "git ..."}]}
+"after" simulates a change on GitHub between two calls of herd-merge: once the nth call starting with
+`prefix` has been answered successfully, `sh` runs (output discarded).
 Like GitHub: a PR whose base branch is deleted is CLOSED; mergeable is computed with
 `git merge-tree --write-tree` unless "mergeable" overrides it; squash merge = one commit on base.
 """
@@ -123,6 +126,9 @@ def main():
     save(st)
     if out is not None:
         print(json.dumps(out))
+    for hook in st.get("after") or []:
+        if sum(1 for c in st["log"] if c[:len(hook["prefix"])] == hook["prefix"]) == hook["nth"]:
+            subprocess.run(hook["sh"], shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
 if __name__ == "__main__":

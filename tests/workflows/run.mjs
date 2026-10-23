@@ -158,7 +158,8 @@ async function main() {
       { repo: 'org/ui', short: 'ui', n: 4, head: 'feat/reviere-ui', base: 'main', wt: u.wt, worker_model: 'claude-fable-5-1' }] }]
     const rt = runtime(handlerFor({
       review: l => l.endsWith('api#10') ? LOWONLY : CLEAN,
-      integrate: (l, o, p) => l.endsWith(':api') ? integ(apiMain, 'org/api', ['api#10']) : integ(uiMain, 'org/ui', ['ui#4']),
+      // the probe agent types repo freely ('api', not 'org/api'); main must still be keyed by the known repo
+      integrate: (l, o, p) => l.endsWith(':api') ? integ(apiMain, 'api', ['api#10']) : integ(uiMain, 'UI', ['ui#4']),
     }))
     const res = await rt.run(LOOP, base(herd, groups))
     const r = res.results[0]

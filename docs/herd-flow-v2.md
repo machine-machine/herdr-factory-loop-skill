@@ -54,12 +54,12 @@ Retired by v2 (read once by `herd-recover` for migration, then never written): `
 
 `<slice>.task.md` starts with a header block (YAML-ish `key: value` lines until the first blank line):
 
-    tickets: 13362298970, 13216640480
+    tickets: 1111111111, 2222222222
     together_with: reviere-ui        # package partner slices, merged as one unit
     stacked_on: kartenstil            # base slice whose PRs must merge first
     model: claude-opus-5-5            # default claude-opus-5-5
     effort: high                      # default high
-    needs_memory: gst-stacked-pr-merge.md, worktree-api-users-file.md
+    needs_memory: stacked-pr-merge.md, worktree-setup.md
 
 `<slice>.repos`: one line per repo `repo branch base` — the base column is REQUIRED (`origin/main`
 or the parent's branch). A package = transitive closure of `together_with`; a stack = `stacked_on`.

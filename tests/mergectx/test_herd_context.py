@@ -2,7 +2,9 @@
 """herd-context, herd-clash and register-excerpt.py against temp repos (offline, sealed PATH)."""
 import json
 import os
+import shutil
 import sys
+import tempfile
 import unittest
 
 sys.dont_write_bytecode = True
@@ -35,7 +37,7 @@ class Ctx(unittest.TestCase):
         os.makedirs(self.mem)
         with open(os.path.join(self.mem, "stacked-pr-merge.md"), "w") as f:
             f.write("Merge bottom-up; retarget the child before deleting the parent.\n")
-        w.env.update(HERD_MEMORY_DIR=self.mem, HERD_ORCH_NAME="workspace-6f")
+        w.env.update(HERD_MEMORY_DIR=self.mem, HERD_ORCH_NAME="orch-a1")
         w.fake_tool("lage", 'echo "lage-hit for: $3 $4 $5"\n')
         w.repo("acme-api", {"src/reviere.py": "a\n", "src/shared.py": "s\n", "tests/test_r.py": "t\n"})
         wa = w.worktree("acme-api", "reviere", "reviere-api")
@@ -62,7 +64,7 @@ class Ctx(unittest.TestCase):
         t = self.ctx("worker")
         self.assertIn(f"head {self.head[:12]}", t)
         self.assertIn("WORKER rules for reviere in", t)
-        self.assertIn("report to workspace-6f on port 8010", t)
+        self.assertIn("report to orch-a1 on port 8010", t)
         self.assertIn("unfilled placeholders: nope", t)
         self.assertIn("## Task", t)
         self.assertIn("Do the reviere thing.", t)
@@ -135,6 +137,29 @@ class Ctx(unittest.TestCase):
         self.assertTrue(out.startswith("# Context worker — reviere"))
         rc, out, err = self.w.run("herd-context", "boss", self.w.herd, "reviere")
         self.assertEqual(rc, 2)
+
+
+class ProjectDir(unittest.TestCase):
+    """herd-context (memory), herd-recover and the board (transcripts) share Claude Code's project-dir rule."""
+    def setUp(self):
+        self.home = tempfile.mkdtemp(prefix="projdir-")
+        self.old = os.environ.get("HOME")
+        os.environ["HOME"] = self.home
+
+    def tearDown(self):
+        os.environ["HOME"] = self.old
+        shutil.rmtree(self.home, ignore_errors=True)
+
+    def test_every_non_alphanumeric_becomes_dash(self):
+        self.assertEqual(he.claude_project_dir("/home/x/my_repo/sub.dir v2"),
+                         os.path.join(self.home, ".claude", "projects", "-home-x-my-repo-sub-dir-v2"))
+
+    def test_long_path_found_by_its_hash_suffix(self):
+        cwd = "/w/" + "a" * 250
+        slug = ("-w-" + "a" * 250)[:200]
+        d = os.path.join(self.home, ".claude", "projects", slug + "-k3x9")
+        os.makedirs(d)
+        self.assertEqual(he.claude_project_dir(cwd), d)
 
 
 class Clash(unittest.TestCase):

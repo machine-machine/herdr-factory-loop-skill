@@ -358,8 +358,10 @@ async function reviewGroup(g, gi) {
       findings.push({ severity: 'high', severity_final: 'high', survives: true, title: `integration probe for ${repoName(repo)} did not report`, file: '-', description: 'No probe result, so the package is not proven to merge onto current main.', repro: 're-run the loop', pr: keyOf(pr), slice: sliceOf(g, pr), source: 'integration' })
       return
     }
-    integration.push(x.res)
-    findings.push(...integFindings(g, x.res, x.mine))
+    // repo is the probed repo we know, never the agent's free-typed copy (review_ok.main is keyed by it)
+    const res = { ...x.res, repo: x.repo }
+    integration.push(res)
+    findings.push(...integFindings(g, res, x.mine))
   })
   revs.forEach((r, i) => {
     if (!r || r.error) {

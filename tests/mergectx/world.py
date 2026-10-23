@@ -117,6 +117,12 @@ class World:
         st["repos"][f"acme/{repo}"]["prs"][str(n)].update(kv)
         self.save_gh(st)
 
+    def after(self, prefix, nth, sh):
+        """Run shell `sh` once the fake gh has answered its nth call starting with `prefix`."""
+        st = self.gh_state()
+        st.setdefault("after", []).append({"prefix": list(prefix), "nth": nth, "sh": sh})
+        self.save_gh(st)
+
     def calls(self, prefix=None):
         log = self.gh_state()["log"]
         return [c for c in log if prefix is None or c[:len(prefix)] == prefix]

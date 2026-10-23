@@ -184,7 +184,7 @@ class Recover:
         if sid:
             return sid
         for wt in wts[:1]:
-            d = os.path.expanduser("~/.claude/projects/" + re.sub(r"[/.]", "-", os.path.abspath(wt)))
+            d = he.claude_project_dir(os.path.abspath(wt))
             files = glob.glob(os.path.join(d, "*.jsonl"))
             if files:
                 return os.path.basename(max(files, key=os.path.getmtime))[:-len(".jsonl")]

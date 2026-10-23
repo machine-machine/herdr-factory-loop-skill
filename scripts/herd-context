@@ -95,7 +95,7 @@ def memory_dir(root):
         return d
     if not root:
         return None
-    return os.path.join(os.path.expanduser("~/.claude/projects"), re.sub(r"[^A-Za-z0-9]", "-", root), "memory")
+    return os.path.join(he.claude_project_dir(root), "memory")
 
 
 def find_rules(role, root):
