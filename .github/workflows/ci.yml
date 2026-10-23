@@ -31,6 +31,9 @@ jobs:
           bash scripts/m2herd-up.sh selftest
           python3 scripts/herd-board --selftest
 
+      - name: herd flow v2 suites (offline)
+        run: make test-herd
+
       - name: hook contract smokes
         run: bash hooks/smoke.sh
 

@@ -12,7 +12,7 @@ LDFLAGS    := -s -w
 REPRO      := -trimpath -buildvcs=false
 TARGETS    := darwin-amd64 darwin-arm64 linux-amd64 linux-arm64
 
-.PHONY: tui tui-release release-check prebuilt-check check-go lint test ci
+.PHONY: tui tui-release release-check prebuilt-check check-go lint test test-herd ci
 
 check-go:
 	@command -v go >/dev/null 2>&1 || { echo "error: go not found on PATH — install Go (https://go.dev/dl/) to build the TUI"; exit 1; }
@@ -77,6 +77,21 @@ test:
 	bash scripts/m2herd.sh selftest
 	bash scripts/m2herd-up.sh selftest
 	python3 scripts/herd-board --selftest
+	$(MAKE) test-herd
+
+# herd flow v2 suites (docs/herd-flow-v2.md) — offline: temp HOME, stubbed herdr/gh/lage, no bytecode
+test-herd:
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/herd-clash --selftest
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/register-excerpt.py --selftest
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/m2herd-migrate --selftest
+	bash tests/board/test-herd-board.sh
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/spawnwatch/test_spawnwatch.py
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/mergectx/test_herd_merge.py
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/mergectx/test_herd_context.py
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/docs/test_rules_templates.py
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/docs/test_m2herd_migrate_mirror.py
+	bash tests/docs/test_install_links.sh
+	node tests/workflows/run.mjs
 
 # ci — the documented pre-commit check: the same steps CI runs
 # (.github/workflows/ci.yml). Go steps run only when go is on PATH.
