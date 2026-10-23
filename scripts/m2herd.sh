@@ -40,6 +40,14 @@
 #                                             #   repo: never edits target; prints a branch/patch recommendation;
 #                                             #   marks applied only with --ack-repo
 #   m2herd.sh evolve reject <id> [--dir P]    # flip proposal status to rejected
+#   m2herd.sh eval draft   --slice S --cmd C  # write candidate eval command to .m2herd/evals/draft/S/eval.json
+#   m2herd.sh eval approve --slice S          # freeze draft eval into .m2herd/evals/approved/S/ with checksum + read-only file
+#   m2herd.sh eval status  --slice S          # show draft/approved eval state
+#   m2herd.sh loop run --slice S --attempt-cmd C [--rounds N]
+#                                             # run N isolated git-worktree attempts against approved eval S,
+#                                             # score each round, keep best patch under .m2herd/loops/<run-id>/
+#   m2herd.sh loop status [--run ID]          # render loop run summary
+#   m2herd.sh loop promote --run ID           # apply the best patch to a clean current worktree
 #   m2herd.sh room    [--dir P]               # the machineroom viewer in THIS terminal: Go TUI (m2herd-tui) when installed,
 #                                             #   else the flicker-free bash watch — one command, always the best/latest viewer
 #   m2herd.sh dashboard [--dir P] [--watch [--interval N]]
@@ -74,8 +82,17 @@ GRAPH_ACTION=""
 if [ "$CMD" = "graph" ]; then
   case "${1:-}" in -*|"") : ;; *) GRAPH_ACTION="$1"; shift ;; esac
 fi
+EVAL_ACTION=""
+if [ "$CMD" = "eval" ]; then
+  case "${1:-}" in -*|"") : ;; *) EVAL_ACTION="$1"; shift ;; esac
+fi
+LOOP_ACTION=""
+if [ "$CMD" = "loop" ]; then
+  case "${1:-}" in -*|"") : ;; *) LOOP_ACTION="$1"; shift ;; esac
+fi
 CONFIG_ACTION=""; CONFIG_PATH=""; CONFIG_VALUE=""
 DIR="$PWD"; GOAL=""; AREA=""; TEXT=""; CHECK=0; PUSH=0; WATCH=0; INTERVAL=2; RUN=""; ACK_REPO=0; DRYRUN=0
+SLICE=""; EVAL_CMD=""; ATTEMPT_CMD=""; ROUNDS=3
 while [ $# -gt 0 ]; do
   case "$1" in
     --dir)   DIR="$2"; shift 2 ;;
@@ -87,6 +104,10 @@ while [ $# -gt 0 ]; do
     --watch) WATCH=1; shift ;;
     --interval) INTERVAL="$2"; shift 2 ;;
     --run)   RUN="$2"; shift 2 ;;
+    --slice) SLICE="$2"; shift 2 ;;
+    --cmd) EVAL_CMD="$2"; shift 2 ;;
+    --attempt-cmd) ATTEMPT_CMD="$2"; shift 2 ;;
+    --rounds) ROUNDS="$2"; shift 2 ;;
     --ack-repo) ACK_REPO=1; shift ;;
     -h|--help) CMD="help"; shift ;;
     *)
@@ -1598,6 +1619,211 @@ evolve_reject() {
   log "rejected $TEXT"
 }
 
+# ---------- eval + loop: locked judge, scored attempts, best patch -------------
+# The eval/loop layer is the objective optimization seam: an agent/command may
+# change code in an isolated worktree, but the approved eval lives in the main
+# .m2herd fabric and is checksummed before every run.
+eval_dir() { echo "$DIR/.m2herd/evals"; }
+loop_dir() { echo "$DIR/.m2herd/loops"; }
+
+hash_file() { # hash_file <path>
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | awk '{print $1}'
+  else shasum -a 256 "$1" | awk '{print $1}'; fi
+}
+
+eval_require_slice() {
+  [ -n "$SLICE" ] || { echo "$CMD $EVAL_ACTION needs --slice S" >&2; exit 2; }
+  validate_token "slice" "$SLICE"
+}
+
+loop_require_run() {
+  [ -n "$RUN" ] || { echo "loop $LOOP_ACTION needs --run ID" >&2; exit 2; }
+  validate_token "run id" "$RUN"
+}
+
+eval_draft() {
+  resolve_dir; need_init; eval_require_slice
+  [ -n "$EVAL_CMD" ] || { echo "eval draft needs --cmd C" >&2; exit 2; }
+  local d; d="$(eval_dir)/draft/$SLICE"
+  mkdir -p "$d"
+  jq -n --arg slice "$SLICE" --arg cmd "$EVAL_CMD" --arg ts "$(ts)" \
+    '{schema_version:1, slice:$slice, created_at:$ts, cmd:$cmd,
+      contract:"Run in an isolated attempt worktree. Print JSON with numeric score, optional passed/failed/regressions/hard_failed; non-JSON falls back to exit-code scoring."}' \
+    > "$d/eval.json"
+  log "draft eval → .m2herd/evals/draft/$SLICE/eval.json"
+}
+
+eval_approve() {
+  resolve_dir; need_init; eval_require_slice
+  local src dst sum
+  src="$(eval_dir)/draft/$SLICE/eval.json"; dst="$(eval_dir)/approved/$SLICE"
+  [ -f "$src" ] || { echo "no draft eval for $SLICE (run: m2herd eval draft --slice $SLICE --cmd ...)" >&2; exit 1; }
+  mkdir -p "$dst"
+  chmod u+w "$dst/eval.json" "$dst/APPROVED.sha256" 2>/dev/null || true
+  cp "$src" "$dst/eval.json"
+  sum="$(hash_file "$dst/eval.json")"
+  printf '%s  eval.json\n' "$sum" > "$dst/APPROVED.sha256"
+  chmod a-w "$dst/eval.json" "$dst/APPROVED.sha256" 2>/dev/null || true
+  log "approved eval → .m2herd/evals/approved/$SLICE/ (sha256 $sum)"
+}
+
+eval_verify_approved() { # eval_verify_approved <slice>
+  local slice="$1" d json sum want
+  d="$(eval_dir)/approved/$slice"; json="$d/eval.json"
+  [ -f "$json" ] || { echo "no approved eval for $slice (run: m2herd eval approve --slice $slice)" >&2; exit 1; }
+  [ -f "$d/APPROVED.sha256" ] || { echo "approved eval for $slice has no checksum: $d/APPROVED.sha256" >&2; exit 1; }
+  want="$(awk '{print $1}' "$d/APPROVED.sha256")"
+  sum="$(hash_file "$json")"
+  [ "$sum" = "$want" ] || { echo "approved eval checksum mismatch for $slice (expected $want, got $sum)" >&2; exit 1; }
+}
+
+eval_status() {
+  resolve_dir; need_init; eval_require_slice
+  local base draft approved
+  base="$(eval_dir)"; draft="$base/draft/$SLICE/eval.json"; approved="$base/approved/$SLICE/eval.json"
+  if [ -f "$draft" ]; then echo "draft:    .m2herd/evals/draft/$SLICE/eval.json"; else echo "draft:    missing"; fi
+  if [ -f "$approved" ]; then
+    eval_verify_approved "$SLICE"
+    echo "approved: .m2herd/evals/approved/$SLICE/eval.json"
+  else echo "approved: missing"; fi
+}
+
+eval_cmd_for_slice() { jq -r '.cmd // empty' "$(eval_dir)/approved/$1/eval.json"; }
+
+run_attempt_command() { # run_attempt_command <round> <cwd> <cmd> <log>
+  local round="$1" cwd="$2" cmd="$3" logf="$4"
+  ( cd "$cwd" && M2HERD_LOOP_ROUND="$round" bash -lc "$cmd" ) >"$logf" 2>&1
+}
+
+run_eval_command() { # run_eval_command <round> <cwd> <cmd> <stdout> <stderr>
+  local round="$1" cwd="$2" cmd="$3" outf="$4" errf="$5"
+  ( cd "$cwd" && M2HERD_LOOP_ROUND="$round" bash -lc "$cmd" ) >"$outf" 2>"$errf"
+}
+
+score_from_eval() { # score_from_eval <stdout> <exit-code> <score-json-out>
+  local stdout="$1" rc="$2" out="$3"
+  if jq -e 'type=="object" and (.score|type=="number")' "$stdout" >/dev/null 2>&1; then
+    jq --argjson rc "$rc" '. + {exit_code:$rc}' "$stdout" > "$out"
+  else
+    jq -n --argjson rc "$rc" \
+      '{score:(if $rc == 0 then 1 else 0 end), passed:(if $rc == 0 then 1 else 0 end),
+        failed:(if $rc == 0 then 0 else 1 end), hard_failed:($rc != 0), exit_code:$rc,
+        notes:"eval did not emit JSON score; used exit-code fallback"}' > "$out"
+  fi
+}
+
+score_value() { jq -r '.score' "$1"; }
+score_hard_failed() { jq -e '(.hard_failed // false) == true' "$1" >/dev/null 2>&1; }
+score_gt() { jq -n --argjson a "$1" --argjson b "$2" -e '$a > $b' >/dev/null; }
+
+loop_run() {
+  resolve_dir; need_init
+  [ -n "$SLICE" ] || { echo "loop run needs --slice S" >&2; exit 2; }
+  validate_token "slice" "$SLICE"
+  [ -n "$ATTEMPT_CMD" ] || { echo "loop run needs --attempt-cmd C" >&2; exit 2; }
+  case "$ROUNDS" in ''|*[!0-9]*) echo "loop run --rounds must be a positive integer" >&2; exit 2 ;; esac
+  [ "$ROUNDS" -ge 1 ] || { echo "loop run --rounds must be >= 1" >&2; exit 2; }
+  git -C "$DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "loop run needs a git repository" >&2; exit 1; }
+  eval_verify_approved "$SLICE"
+
+  local rid root rounds_dir wtroot eval_cmd best_score best_round best_patch i wt rd score rc hard patch
+  rid="l-$(date -u +%Y%m%dT%H%M%SZ)-$SLICE-$$"
+  root="$(loop_dir)/$rid"; rounds_dir="$root/rounds"; wtroot="$root/worktrees"
+  mkdir -p "$rounds_dir" "$wtroot"
+  eval_cmd="$(eval_cmd_for_slice "$SLICE")"
+  jq -n --arg id "$rid" --arg slice "$SLICE" --arg ts "$(ts)" --argjson rounds "$ROUNDS" \
+        --arg attempt "$ATTEMPT_CMD" --arg eval "$eval_cmd" \
+    '{schema_version:1, run_id:$id, slice:$slice, created_at:$ts, state:"running",
+      rounds_requested:$rounds, attempt_cmd:$attempt, eval_cmd:$eval, best_round:null,
+      best_score:null, best_patch:null, rounds:[]}' > "$root/run.json"
+
+  best_score="-1000000000"; best_round=""; best_patch=""
+  for i in $(seq 1 "$ROUNDS"); do
+    rd="$rounds_dir/$i"; wt="$wtroot/round-$i"; mkdir -p "$rd"
+    log "loop $rid round $i/$ROUNDS"
+    git -C "$DIR" worktree add --detach "$wt" HEAD >"$rd/worktree.log" 2>&1
+    set +e
+    run_attempt_command "$i" "$wt" "$ATTEMPT_CMD" "$rd/attempt.log"
+    rc=$?
+    set -e
+    printf '%s\n' "$rc" > "$rd/attempt.exit"
+    set +e
+    run_eval_command "$i" "$wt" "$eval_cmd" "$rd/eval.stdout" "$rd/eval.stderr"
+    rc=$?
+    set -e
+    printf '%s\n' "$rc" > "$rd/eval.exit"
+    score_from_eval "$rd/eval.stdout" "$rc" "$rd/score.json"
+    git -C "$wt" diff --binary > "$rd/patch.diff"
+    score="$(score_value "$rd/score.json")"; hard=false
+    if score_hard_failed "$rd/score.json"; then hard=true; fi
+    patch="$rd/patch.diff"
+    jq --argjson round "$i" --arg wt "$wt" --arg patch "$patch" --argjson score "$score" --argjson hard "$hard" \
+      '.rounds += [{round:$round, worktree:$wt, patch:$patch, score:$score, hard_failed:$hard}]' \
+      "$root/run.json" > "$root/run.json.tmp" && mv "$root/run.json.tmp" "$root/run.json"
+    if [ "$hard" = false ] && [ -s "$patch" ] && score_gt "$score" "$best_score"; then
+      best_score="$score"; best_round="$i"; best_patch="$patch"
+    fi
+    git -C "$DIR" worktree remove --force "$wt" >/dev/null 2>&1 || true
+  done
+
+  if [ -n "$best_round" ]; then
+    jq --arg br "$best_round" --argjson bs "$best_score" --arg bp "$best_patch" --arg ts "$(ts)" \
+      '.state="scored" | .completed_at=$ts | .best_round=($br|tonumber) | .best_score=$bs | .best_patch=$bp' \
+      "$root/run.json" > "$root/run.json.tmp" && mv "$root/run.json.tmp" "$root/run.json"
+    log "best round $best_round score $best_score → .m2herd/loops/$rid/rounds/$best_round/patch.diff"
+  else
+    jq --arg ts "$(ts)" '.state="no_promotable_patch" | .completed_at=$ts' "$root/run.json" > "$root/run.json.tmp" && mv "$root/run.json.tmp" "$root/run.json"
+    log "no promotable patch (all rounds hard-failed or produced empty diffs)"
+  fi
+}
+
+resolve_loop_run_id() {
+  if [ -n "$RUN" ]; then validate_token "run id" "$RUN"; printf '%s' "$RUN"; return 0; fi
+  local d id=""; for d in "$(loop_dir)"/l-*; do [ -d "$d" ] && id="${d##*/}"; done
+  printf '%s' "$id"
+}
+
+loop_status() {
+  resolve_dir; need_init
+  local rid f; rid="$(resolve_loop_run_id)"
+  [ -n "$rid" ] || { echo "no loop runs yet" >&2; exit 1; }
+  f="$(loop_dir)/$rid/run.json"
+  [ -f "$f" ] || { echo "no such loop run: $rid" >&2; exit 1; }
+  jq -r '"run: \(.run_id)\nslice: \(.slice)\nstate: \(.state)\nbest: \(.best_round // "-") score=\(.best_score // "-") patch=\(.best_patch // "-")\nrounds:\n" + ([.rounds[]? | "  \(.round): score=\(.score) hard_failed=\(.hard_failed)"] | join("\n"))' "$f"
+}
+
+loop_promote() {
+  resolve_dir; need_init; loop_require_run
+  git -C "$DIR" rev-parse --is-inside-work-tree >/dev/null 2>&1 || { echo "loop promote needs a git repository" >&2; exit 1; }
+  [ -z "$(git -C "$DIR" status --porcelain)" ] || { echo "refusing to promote into a dirty worktree" >&2; exit 1; }
+  local f patch
+  f="$(loop_dir)/$RUN/run.json"
+  [ -f "$f" ] || { echo "no such loop run: $RUN" >&2; exit 1; }
+  patch="$(jq -r '.best_patch // empty' "$f")"
+  [ -n "$patch" ] && [ -s "$patch" ] || { echo "loop run has no best patch to promote: $RUN" >&2; exit 1; }
+  git -C "$DIR" apply "$patch"
+  jq --arg ts "$(ts)" '.state="promoted" | .promoted_at=$ts' "$f" > "$f.tmp" && mv "$f.tmp" "$f"
+  log "promoted best patch from $RUN"
+}
+
+eval_cmd_group() {
+  case "$EVAL_ACTION" in
+    draft) eval_draft ;;
+    approve) eval_approve ;;
+    status) eval_status ;;
+    *) echo "usage: m2herd.sh eval {draft|approve|status} --slice S [--cmd C]" >&2; exit 2 ;;
+  esac
+}
+
+loop_cmd_group() {
+  case "$LOOP_ACTION" in
+    run) loop_run ;;
+    status) loop_status ;;
+    promote) loop_promote ;;
+    *) echo "usage: m2herd.sh loop {run|status|promote} ..." >&2; exit 2 ;;
+  esac
+}
+
 # ---------- reap: close panes of finished workers ------------------------------
 # A pane worker that reached done|failed keeps its claude/codex TUI session
 # alive — an idle process still holding an API connection slot. reap closes
@@ -2130,6 +2356,33 @@ selftest() {
   rlines="$(printf '%s\n' "$resume_out" | wc -l | tr -d ' ')"
   [ "$rlines" -le 45 ] || fail "resume report is $rlines lines (want <= ~40)"
 
+  # ---- eval + loop: approved immutable eval, scored rounds, promote best patch --
+  (
+    cd "$td"
+    git init -q
+    git config user.email selftest@example.invalid
+    git config user.name "m2herd selftest"
+    printf 'base\n' > score.txt
+    git add .gitignore score.txt
+    git commit -qm "selftest base"
+  )
+  step eval draft --dir "$td" --slice loopdemo --cmd 'case "$(cat score.txt 2>/dev/null)" in good) jq -n "{score:0.9,passed:1,failed:0,hard_failed:false}" ;; bad) jq -n "{score:0.2,passed:0,failed:1,hard_failed:false}" ;; *) jq -n "{score:0.0,passed:0,failed:1,hard_failed:false}" ;; esac'
+  step eval approve --dir "$td" --slice loopdemo
+  "$self" eval status --dir "$td" --slice loopdemo | grep -q '^approved:' || fail "eval status missing approved eval"
+  step loop run --dir "$td" --slice loopdemo --rounds 2 --attempt-cmd 'if [ "$M2HERD_LOOP_ROUND" = "1" ]; then printf "bad\n" > score.txt; else printf "good\n" > score.txt; fi'
+  local loop_run_id loop_json
+  loop_run_id="$(ls -1d "$td/.m2herd/loops"/l-* 2>/dev/null | sed 's#.*/##' | tail -1)"
+  [ -n "$loop_run_id" ] || fail "loop run did not create .m2herd/loops/l-*"
+  loop_json="$td/.m2herd/loops/$loop_run_id/run.json"
+  jq -e '(.state=="scored") and (.best_round==2) and (.best_score==0.9)
+         and (.rounds|length==2) and ([.rounds[] | select(.round==1) | .score][0] == 0.2)' \
+    "$loop_json" >/dev/null || { cat "$loop_json" >&2; fail "loop run scoring assert"; }
+  "$self" loop status --dir "$td" --run "$loop_run_id" | grep -q '^best: 2 score=0.9' \
+    || fail "loop status missing best-round summary"
+  step loop promote --dir "$td" --run "$loop_run_id"
+  [ "$(cat "$td/score.txt")" = "good" ] || fail "loop promote did not apply the best patch"
+  jq -e '.state=="promoted"' "$loop_json" >/dev/null || fail "loop promote did not mark run promoted"
+
   # ---- dispatcher honesty: unknown subcommand FAILS -------------------------
   # `dispatch --all` shells out to `graph next`; a fallback that printed usage and
   # exited 0 was parsed by the caller as a ready-slice list. `help` still exits 0.
@@ -2306,6 +2559,8 @@ case "$CMD" in
       *) echo "usage: m2herd.sh evolve {analyze|proposals|show|apply|reject} ..." >&2; exit 2 ;;
     esac
     ;;
+  eval)     eval_cmd_group ;;
+  loop)     loop_cmd_group ;;
   dashboard)
     # Tier-3 chain: --watch prefers the Go TUI (m2herd-tui, bubbletea) when installed —
     # correct Unicode widths + adaptive colors on any terminal. M2HERD_NO_TUI=1 forces

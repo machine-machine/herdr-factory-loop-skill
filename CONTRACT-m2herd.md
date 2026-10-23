@@ -589,6 +589,50 @@ against `graph-engine`'s implementation — the contract is the interface, so th
 parallel and integrate at collect. Docs, CHANGELOG and the version bump are the
 orchestrator's, at collect time.
 
+## Amendment v2.4 — approved evals and scored loop runs
+
+**Doctrine.** A builder may optimize code, but it must not own the judge. Objective loop
+runs are only valid against an approved eval that is stored outside the attempt worktree and
+verified by checksum before execution.
+
+**Eval state.**
+
+```
+.m2herd/evals/
+  draft/<slice>/eval.json
+  approved/<slice>/eval.json
+  approved/<slice>/APPROVED.sha256
+```
+
+`m2herd.sh eval draft --slice S --cmd C` writes a candidate eval. `approve` copies that
+candidate into `approved/`, writes the checksum, and makes the approved files read-only on a
+best-effort basis. Every loop run MUST verify `APPROVED.sha256` before running attempts.
+
+**Loop state.**
+
+```
+.m2herd/loops/<loop-id>/
+  run.json
+  rounds/<N>/
+    attempt.log
+    attempt.exit
+    eval.stdout
+    eval.stderr
+    eval.exit
+    score.json
+    patch.diff
+```
+
+`m2herd.sh loop run --slice S --attempt-cmd C --rounds N` creates one detached git worktree
+per round from `HEAD`, runs the attempt command there, runs the approved eval command in the
+same worktree, captures a binary diff, and removes the worktree. The eval SHOULD print JSON
+with numeric `score`; if not, the engine falls back to exit-code scoring. A round whose
+`score.json` has `hard_failed: true` is not promotable. The best non-hard-failed, non-empty
+patch is recorded in `run.json`.
+
+`m2herd.sh loop promote --run ID` applies only the recorded best patch and refuses to run
+unless the current checkout is clean. Promotion never re-runs the builder command.
+
 ## conventions (all slices)
 - bash: `set -euo pipefail`, mechanical + idempotent, the style of `scripts/herd-loop.sh`.
 - jq required for JSON (hooks degrade silent without it); timestamps `date -u +%Y-%m-%dT%H:%M:%SZ`.
