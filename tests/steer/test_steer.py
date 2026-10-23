@@ -182,6 +182,23 @@ class Intake(Base):
         opened = sorted(i["text"][:20] for i in d["items"] if i["status"] == "open")
         self.assertEqual(len(opened), 8, (opened, st.keys()))
 
+    def test_repeating_event_watcher_is_not_a_snapshot(self):
+        ev = ["- 2026-10-14T08:00:00Z ci-watch: PR #42 red on run 987654399",
+              "- 2026-10-14T09:00:00Z ci-watch: PR #42 red on run 987654410",
+              "- 2026-10-14T10:00:00Z ci-watch: PR #43 red on run 987654444",
+              "- 2026-10-14T11:00:00Z ci-watch: PR #43 red on run 987654460"]
+        f = Fabric(ev)
+        try:
+            d = f.items("--all")
+            self.assertEqual(sorted(i["status"] for i in d["items"]), ["open", "open"],
+                             "one finding per line: repeats share a key, absence still means nothing")
+            self.assertEqual(f.run("pending-count").stdout.strip(), "2")
+            f.append("- 2026-10-14T12:00:00Z ci-watch: PR #44 red on run 987654470")
+            f.append("- 2026-10-14T13:00:00Z ci-watch: PR #44 red on run 987654480")
+            self.assertEqual(f.run("pending-count").stdout.strip(), "3", "no flapping with more reports")
+        finally:
+            f.close()
+
     def test_pending_count_and_verify(self):
         p = self.f.run("pending-count")
         self.assertEqual(p.stdout.strip(), "8")
@@ -250,6 +267,13 @@ class Ledger(Base):
         self.f.append(snap("2026-10-16T09:30:00+00:00", "Open follow-up: " + ",".join(IDS)))
         it = self.f.by_text(self.f.items("--all"), "Open follow-up")
         self.assertEqual((it["status"], it["reopened"]), ("open", "1 new id(s) since ticket"))
+
+    def test_ticket_ignores_incidental_ids(self):
+        k = self.key("PR #43 red")
+        self.f.run("ack", k, "--action", "ticket", "--note", "T-9: CI red")
+        self.f.append("- 2026-10-15T11:00:00Z ci-watch: PR #43 red on run 987654470")
+        it = self.f.by_text(self.f.items("--all"), "PR #43 red")
+        self.assertEqual((it["status"], it["count"]), ("acked", 2), "a new run number is not new work")
 
     def test_superseded_reopens_when_reported_again(self):
         self.assertEqual(self.f.by_text(self.f.items("--all"), "old lane")["status"], "superseded")
@@ -375,6 +399,7 @@ class Gate(Base):
                     "m2herd-steer verify", "templates/herd/rules/STEER.md"):
             self.assertIn(cmd, line)
         self.assertNotIn("decision", json.dumps(o), "never blocks")
+        self.assertIn("Mid-task: finish first", line)
         # same set, same session, within 30 min: silent
         self.assertIsNone(self.out(self.f.gate(self.payload(), now="2026-10-16T12:20:00Z")))
         # another session has not seen it
@@ -389,6 +414,14 @@ class Gate(Base):
     def test_stop_event(self):
         o = self.out(self.f.gate(self.payload(hook_event_name="Stop"), "Stop"))
         self.assertEqual(o["hookSpecificOutput"]["hookEventName"], "Stop")
+        # additionalContext on Stop makes Claude Code continue the turn: the nudge must fit a turn end
+        line = o["hookSpecificOutput"]["additionalContext"]
+        self.assertNotIn("Mid-task", line)
+        self.assertIn("Turn end: triage now", line)
+        with open(os.path.join(REPO, "docs", "herd-flow-v2.md"), encoding="utf-8") as fh:
+            sec = fh.read().split("## 8.", 1)[1].split("\n## ", 1)[0]
+        self.assertNotIn("never blocks a turn", sec)
+        self.assertIn("continues the turn", sec)
         o = self.out(self.f.gate({"session_id": "s3", "cwd": self.f.root}, "Stop"))
         self.assertEqual(o["hookSpecificOutput"]["hookEventName"], "Stop", "event from argv when payload lacks it")
         self.assertIsNone(self.out(self.f.gate(self.payload(session_id="s4", hook_event_name="Stop",

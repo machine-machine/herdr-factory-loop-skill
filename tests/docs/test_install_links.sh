@@ -43,6 +43,22 @@ check "herd-phase --help via link" '"$HOME/.local/bin/herd-phase" --help >/dev/n
 check "herd-context --help via link" '"$HOME/.local/bin/herd-context" --help >/dev/null 2>&1'
 check "m2herd-migrate --help via link" '"$HOME/.local/bin/m2herd-migrate" --help >/dev/null 2>&1'
 
+# the steer gate's registered timeout covers its own limits (read -t 5 + timeout 8 in the hook)
+st="$HOME/.claude/settings.json"
+if command -v jq >/dev/null 2>&1; then
+steer_to() { jq -r --arg ev "$1" '[.hooks[$ev][]?.hooks[]? | select(.command | contains("m2herd-steer-gate")) | .timeout] | join(",")' "$st"; }
+check "steer gate UserPromptSubmit timeout >= 15" '[ "$(steer_to UserPromptSubmit)" -ge 15 ]'
+check "steer gate Stop timeout >= 15" '[ "$(steer_to Stop)" -ge 15 ]'
+# an earlier install's 5 s entry is raised in place, not duplicated
+jq '(.hooks.UserPromptSubmit[].hooks[] | select(.command | contains("m2herd-steer-gate")) | .timeout) = 5
+    | (.hooks.Stop[].hooks[] | select(.command | contains("m2herd-steer-gate")) | .timeout) = 5' "$st" > "$st.t" && mv "$st.t" "$st"
+bash "$REPO/scripts/install.sh" --claude >/dev/null 2>&1
+check "old 5 s steer timeouts raised, not duplicated" '[ "$(steer_to UserPromptSubmit)" = 15 ] && [ "$(steer_to Stop)" = 15 ]'
+else
+  echo "skip: jq not on PATH — steer gate timeout checks skipped"
+fi
+check "hook limits unchanged (5 + 8 < 15)" 'grep -q "read -r -t 5 " "$REPO/hooks/m2herd-steer-gate.sh" && grep -q "timeout 8 " "$REPO/hooks/m2herd-steer-gate.sh"'
+
 # idempotent: a second run leaves the same links and no new backups
 before="$(ls -la "$HOME/.local/bin" | awk '{print $9, $10, $11}' | sort)"
 out2="$(bash "$REPO/scripts/install.sh" --claude 2>&1)" || { echo "$out2"; echo "FAIL reinstall exit"; exit 1; }

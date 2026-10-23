@@ -340,8 +340,66 @@ def main():
     settings_and_fabrics()
     failing_action()
     usage_and_templates()
+    not_a_fabric()
+    flock_only_locks()
     print(f"m2herd-purge tests: {ok} passed, {fail} failed")
     return 0 if fail == 0 else 1
+
+
+def not_a_fabric():
+    """A project root passed instead of <proj>/.m2herd (a typo in the weekly fabrics list) is refused:
+    its backups/, logs/, screens/ dirs are project data, not fabric run data."""
+    tmp = tempfile.mkdtemp(prefix="m2herd-purge-test-")
+    try:
+        home = os.path.join(tmp, "home")
+        os.makedirs(home)
+        proj = os.path.join(tmp, "proj")
+        os.makedirs(os.path.join(proj, ".m2herd"))
+        files = [w(proj, rel, "x\n", OLD) for rel in
+                 ("src/logs/app.log", "backups/db.dump", "data/screens/x/1.png", "README.md")]
+        before = snapshot(proj)
+        rc, txt = cli([proj, "--readers", "", "--date", TODAY, "--apply"], home)
+        check("project root is refused (exit 2)", rc == 2 and "not a .m2herd fabric" in txt
+              and os.path.join(proj, ".m2herd") in txt, txt)
+        check("project root: nothing deleted, moved or written", snapshot(proj) == before
+              and all(os.path.isfile(f) for f in files), txt)
+        bare = os.path.join(tmp, "plain")
+        w(bare, "logs/old.log", "x\n", OLD)
+        lst = w(tmp, "fabrics", f"{bare}\n{small_fabric(tmp, 'p9')}\n")
+        rc, txt = cli(["--fabrics", lst, "--readers", "", "--date", TODAY, "--apply"], home)
+        check("--fabrics: a non-fabric line is refused, the others still run",
+              rc == 2 and "not a .m2herd fabric" in txt and "p9/.m2herd" in txt
+              and os.path.isfile(os.path.join(bare, "logs/old.log")), txt)
+        link = os.path.join(tmp, "fabric-link")
+        os.symlink(os.path.join(tmp, "p9", ".m2herd"), link)
+        rc, txt = cli([link, "--readers", "", "--date", TODAY], home)
+        check("a symlink to a .m2herd dir is a fabric", rc == 0 and "not a .m2herd fabric" not in txt, txt)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def flock_only_locks():
+    """A flock-only lock (opened "a", flocked, never written) keeps its creation mtime although the
+    gate hook takes it on every prompt: in a quiet fabric lock and base are both days old. Such a lock
+    must stay while its base exists; only an orphaned lock (base gone) is a cache."""
+    tmp = tempfile.mkdtemp(prefix="m2herd-purge-test-")
+    try:
+        home = os.path.join(tmp, "home")
+        os.makedirs(home)
+        m = small_fabric(tmp, "p8")
+        for rel in ("inbox/STEER.md", "inbox/steer.ledger.jsonl", "NOTES.md"):
+            w(m, rel, "x\n", MID)
+            w(m, rel + ".lock", "", MID)
+        w(m, "inbox/gone.json.lock", "", MID)
+        rc, txt = cli([m, "--readers", "", "--date", TODAY, "--apply"], home)
+        plan = txt.split("totals")[0]
+        check("flock-only locks of existing files stay", rc == 0 and ".lock" not in plan.replace("gone.json.lock", "")
+              and all(os.path.isfile(os.path.join(m, r + ".lock"))
+                      for r in ("inbox/STEER.md", "inbox/steer.ledger.jsonl", "NOTES.md")), txt)
+        check("orphaned old lock is deleted", "DELETE  inbox/gone.json.lock" in plan
+              and not os.path.exists(os.path.join(m, "inbox/gone.json.lock")), txt)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def small_fabric(tmp, name):

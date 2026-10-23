@@ -19,9 +19,10 @@ name of the dir holding .m2herd):
      herd's last `merged` event (<herd>/herd.events.jsonl, read through herd_events.py); a herd with a
      slice not merged/parked is kept whatever its age; a herd whose events are not found falls back to
      the newest file mtime.
-  b) inside the fabric nothing is deleted except caches: __pycache__/, stray *.pyc, *.lock files nobody
-     holds (no open fd in /proc, a non-blocking flock succeeds, lock and its base file unused for
-     HERD_PURGE_GRACE_HOURS (24)) and empty directories (empty for the grace time, or emptied by this
+  b) inside the fabric nothing is deleted except caches: __pycache__/, stray *.pyc, orphaned *.lock files
+     (the base file <x> of <x>.lock — or <x> of <x>.<y>.lock — is gone, the lock is unchanged for
+     HERD_PURGE_GRACE_HOURS (24), no open fd in /proc, a non-blocking flock succeeds; a lock whose base
+     file exists always stays, since flock-only locks never change their mtime) and empty directories (empty for the grace time, or emptied by this
      run; one a sibling file names as `<dir>/`, like `deep: ./deep/`, stays). Everything else that is "no longer used" is MOVED to archives/<date>/<same path>, with one
      line per entry in archives/<date>/INDEX.md (path, size, last modified, why). No longer used means
      all three: no file in it modified for HERD_PURGE_ARCHIVE_DAYS (30); not referenced by any reader;
@@ -52,8 +53,8 @@ HERD_PURGE_RUN_DAYS, HERD_PURGE_ARCHIVE_DAYS, HERD_PURGE_GRACE_HOURS, HERD_PURGE
 HERD_PURGE_RUN_DIRS, HERD_PURGE_KEEP (comma-separated).
 
 Exit: 0 ok (dry run printed, or apply finished — also when there was nothing to do); 1 at least one
-action failed (the others still ran; each failure is printed); 2 usage error, missing fabric, or another
-m2herd-purge run holds the lock. With --fabrics the highest code of all fabrics.
+action failed (the others still ran; each failure is printed); 2 usage error, missing fabric, a path
+that is not a .m2herd fabric (it must end in /.m2herd), or another m2herd-purge run holds the lock. With --fabrics the highest code of all fabrics.
 """
 import argparse
 import datetime
@@ -390,13 +391,13 @@ class Purge:
         bases = [os.path.join(d, n)]
         if "." in n:
             bases.append(os.path.join(d, n.rsplit(".", 1)[0]))   # <file>.<x>.lock
+        # A flock-only lock (opened "a", never written) keeps its creation mtime however often it is
+        # taken, so age says nothing about use. While its base file exists it stays: unlinking it would
+        # let a process that opened the old inode and the next one that creates a new file both "hold" it.
         for b in bases:
-            try:
-                if os.lstat(b).st_mtime >= self.grace_cut:
-                    return None
-            except OSError:
-                pass
-        return f"lock unused since {day(lm)}, no holder"
+            if os.path.lexists(b):
+                return None
+        return f"orphaned lock (no {os.path.basename(bases[0])}), unchanged since {day(lm)}, no holder"
 
     def run_dest(self, p):
         name, hdir = self.herd_of(p)
@@ -867,6 +868,10 @@ def run_one(fabric, a, out):
     fabric = os.path.abspath(os.path.expanduser(fabric))
     if not os.path.isdir(fabric):
         out.write(f"m2herd-purge: no directory {fabric}\n")
+        return 2
+    why = mg.fabric_problem(fabric)
+    if why:
+        out.write(f"m2herd-purge: {why} — nothing done\n")
         return 2
     lock = os.open(fabric, os.O_RDONLY | os.O_DIRECTORY)
     try:

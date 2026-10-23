@@ -231,9 +231,10 @@ a. **Run data is deleted.** Under `~/.cache/m2herd/<project>/` every entry of a 
    `<herd>/herd.events.jsonl` (read through `herd_events.py`, also in `archives/`). A herd with a
    slice that is not `merged`/`parked` keeps all of its data, however old. When no event file is
    found, the newest file mtime counts. `runs/CURRENT` and the run it names stay.
-b. **Inside the fabric only caches are deleted:** `__pycache__/`, stray `*.pyc`, `*.lock` files no
-   process holds (no fd in `/proc`, a non-blocking `flock` succeeds, lock and base file unused for
-   `HERD_PURGE_GRACE_HOURS`, 24), and empty dirs (empty for the grace time or emptied by this run; one
+b. **Inside the fabric only caches are deleted:** `__pycache__/`, stray `*.pyc`, orphaned `*.lock`
+   files (the base file is gone, the lock unchanged for `HERD_PURGE_GRACE_HOURS`, 24, no fd in
+   `/proc`, a non-blocking `flock` succeeds; a lock whose base file exists always stays, because a
+   flock-only lock never changes its mtime and unlinking it races its next holder), and empty dirs (empty for the grace time or emptied by this run; one
    a sibling file names as `<dir>/`, like `deep: ./deep/`, stays). Everything else that is **no longer
    used** is **moved** to `archives/<date>/<same path>`, and each move gets one line in
    `archives/<date>/INDEX.md` (path, size, last modified, why). A file is no longer used when all three
@@ -269,7 +270,8 @@ moved to the cache, archived, freed from disk). `--summary` prints only the tota
 adds every kept entry with its reason. `--apply` does it. A `flock` on the fabric dir keeps two runs
 apart. When `--apply` changed something, one `- [<UTC ts>] m2herd-purge: …` line is appended to
 `NOTES.md` under `NOTES.md.lock`. Exit 0 = ok (also nothing to do), 1 = an action failed (the rest
-still ran; each failure is printed), 2 = usage error, missing fabric, or another run holds the lock.
+still ran; each failure is printed), 2 = usage error, missing fabric, a path that is not a `.m2herd` dir (a project root listed by
+mistake is refused, never purged), or another run holds the lock.
 
 **Weekly, for every fabric.** List the fabrics in `~/.config/m2herd/fabrics`, one path per line,
 `#` for comments; `m2herd-purge --fabrics <file>` runs them in turn. The systemd user units in
@@ -294,18 +296,22 @@ the work in three and lets each part do only what it is good at:
    count. Append-only ledger `inbox/steer.ledger.jsonl` (flock `<ledger>.lock`): `seen`, `ack`,
    `defer`, `superseded`, plus `compacted`/`vanished` so no line is ever counted twice. The intake
    itself supersedes what a newer report replaced: a newer status for the same subject, or — for
-   snapshot watchers (consecutive reports share findings) — a finding absent from the source's
-   last 2 reports. Event-style sources (one finding per line) never lose items by absence.
+   snapshot watchers (consecutive reports share findings, and some report carries more than one) —
+   a finding absent from the source's last 2 reports. Event-style sources (one finding per line)
+   never lose items by absence, even when they repeat a finding.
 2. **Deterministic gate — `hooks/m2herd-steer-gate.sh`** (UserPromptSubmit, and Stop with argv
    `Stop`). Pending > 0 → one `additionalContext` line: count, top 3 keys (urgent words first),
    the rules path and the exact commands. Silent at 0, in herd worker panes (`M2HERD_WORKER=1`,
    `HERD_SLICE`, herd.map membership as in `herd-board-subagents.py`), in subagents, on
    `stop_hook_active`, with `M2HERD_STEER_GATE=0`. Same open set at most once per 30 min per
-   session (state in `~/.m2herd/state/<project>/steer-gate.json`). Never emits a `decision`, so
-   it never blocks a turn.
+   session (state in `~/.m2herd/state/<project>/steer-gate.json`). Never emits a `decision`. On
+   UserPromptSubmit the line rides along with the prompt; on Stop Claude Code feeds it back and
+   **continues the turn** for one more round so the orchestrator can triage (the nudge says "Turn
+   end: triage now, or defer"); that round's Stop carries `stop_hook_active`, so a turn is extended
+   at most once, and the rate limit keeps it to once per open set per 30 min.
 3. **Agent judgment — `templates/herd/rules/STEER.md`**. Per item exactly one ledger action:
    `done` (reopens when reported again), `ticket` / `register` / `delegated` (repeats stay quiet,
-   new ids reopen), `dropped` (never reopens), `defer --until` (open again after the date). One
+   new ids in a `Label: id,id,…` list reopen; a new run number in a repeat does not), `dropped` (never reopens), `defer --until` (open again after the date). One
    subagent per group of related items, never per item; human lines are never dropped silently.
 4. **Deterministic verification — `m2herd-steer verify`** exits 1 while any item is neither acked,
    superseded nor deferred into the future. This repo has no fabric check script; a project wires

@@ -37,7 +37,7 @@ Everything else stays and is listed as kept. Any entry a running process holds o
 cwd, read from /proc) is skipped. <project> = --project, else the name of the dir holding .m2herd.
 
 Readers are found by fixed strings `.m2herd/<old path>`; a reader that builds the path from variables
-is not found — check those by hand. Exit: 0 ok, 1 a move failed (stops there), 2 usage, 3 refused.
+is not found — check those by hand. Exit: 0 ok, 1 a move failed (stops there), 2 usage (also a path not ending in /.m2herd), 3 refused.
 """
 import argparse
 import datetime
@@ -74,6 +74,19 @@ KEEP_TOP = {"RESUME.md", "NOTES.md", "rules", "herden", "dispatch", "archives"}
 
 
 # ---------------------------------------------------------------------------------------- helpers
+
+def fabric_problem(path):
+    """None when `path` names a .m2herd fabric, else why not (usage error).
+
+    Both tools treat every dir named like run data as theirs and move top-level files, so a project
+    root passed by mistake (a typo in ~/.config/m2herd/fabrics) must be refused, not purged."""
+    if os.path.basename(os.path.normpath(path)) == ".m2herd" or \
+            os.path.basename(os.path.realpath(path)) == ".m2herd":
+        return None
+    hint = os.path.join(path, ".m2herd")
+    hint = f"; did you mean {hint}?" if os.path.isdir(hint) else ""
+    return f"{path} is not a .m2herd fabric (the path must end in /.m2herd){hint}"
+
 
 def human(n):
     for unit in ("B", "KiB", "MiB", "GiB"):
@@ -619,6 +632,10 @@ def main(argv=None, out=sys.stdout):
     if not os.path.isdir(a.m2herd):
         print(f"m2herd-migrate: no directory {a.m2herd}", file=sys.stderr)
         return 2
+    why = fabric_problem(a.m2herd)
+    if why:
+        print(f"m2herd-migrate: {why} — nothing done", file=sys.stderr)
+        return 2
     plan = Plan(a.m2herd, a)
     plan.build()
     pats = plan.patterns()
@@ -837,6 +854,14 @@ def selftest():
         with contextlib.redirect_stderr(io.StringIO()):
             rc = main(["--date", "23.10.2026", m], out=io.StringIO())
         check("bad date is usage error", rc == 2)
+
+        before = sorted(os.path.relpath(os.path.join(r, f), proj) for r, _, fs in os.walk(proj) for f in fs)
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            rc = main([proj, "--apply", "--force-readers", "--readers", ""], out=io.StringIO())
+        after = sorted(os.path.relpath(os.path.join(r, f), proj) for r, _, fs in os.walk(proj) for f in fs)
+        check("project root instead of .m2herd is refused", rc == 2 and "not a .m2herd fabric" in err.getvalue()
+              and before == after, err.getvalue())
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     print(f"m2herd-migrate selftest: {ok} passed, {fail} failed")

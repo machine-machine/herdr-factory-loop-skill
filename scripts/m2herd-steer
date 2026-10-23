@@ -26,10 +26,12 @@ label and carry the ids as payload. Repeats fold into one item with first/last s
 Ledger `<inbox>/steer.ledger.jsonl`, append-only, flock on `<ledger>.lock`:
   seen        one per newly observed entry, with its findings (keys, ids, text)
   ack         action + note; `done` reopens when reported again, `ticket|register|delegated`
-              reopen only when new ids appear, `dropped` never reopens
+              reopen only when new ids appear in a `Label: id,id,…` list item (a list that grew;
+              incidental ids like a run number never reopen), `dropped` never reopens
   defer       until + note; open again once the date has passed
   superseded  written by intake for open items of a source: a newer status for the same subject,
-              or (snapshot watchers only) absent from the source's last 2 reports; a superseded
+              or (snapshot watchers only: consecutive reports share findings and some report
+              carries more than one) absent from the source's last 2 reports; a superseded
               item reopens when it is reported again
   compacted / vanished   bookkeeping so a moved or hand-deleted entry is never read twice
 STEER.md itself is only ever rewritten by `compact`, under the engine's `<file>.lock` flock.
@@ -400,7 +402,9 @@ def state_of(r, now):
             return "acked", ""
         if a == "done":
             return ("open", "reported again after done") if r["count"] > n else ("acked", "")
-        new = [i for i in r.get("ids") or [] if i not in set(c.get("ids") or [])]
+        # Only a list item's ids are its content (a list that grew). An id item's subject is in its key;
+        # its other ids are incidental (the run number of "PR #43 red on run <n>" is new every time).
+        new = [i for i in r.get("ids") or [] if i not in set(c.get("ids") or [])] if r.get("kind") == "list" else []
         if new and r["count"] > n:
             return "open", f"{len(new)} new id(s) since {a}"
         return "acked", ""
@@ -415,10 +419,14 @@ def state_of(r, now):
 
 
 def snapshot_sources(reports):
-    """Sources whose reports repeat findings (a full-state watcher), not one-event-per-line."""
+    """Sources whose reports repeat findings (a full-state watcher), not one-event-per-line.
+
+    A source whose every report carries exactly one finding is event-style whatever repeats: an
+    event watcher reporting the same thing twice ("PR #42 red on run <n>" for two runs) shares keys
+    too, and absence from its next reports says nothing about the item."""
     out = set()
     for src, reps in reports.items():
-        if len(reps) < 2:
+        if len(reps) < 2 or all(len(keys) <= 1 for _, keys in reps):
             continue
         pairs = list(zip(reps, reps[1:]))
         shared = sum(1 for (_, a), (_, b) in pairs if a & b)
@@ -772,7 +780,8 @@ def cmd_gate(a):
             f"`m2herd-steer list --open`, then per item exactly one `m2herd-steer ack <key> "
             f"--action done|dropped|ticket|register|delegated --note \"...\"` or `m2herd-steer defer <key> "
             f"--until <date> --note \"...\"`; `m2herd-steer verify` exits 0 when none is left. "
-            f"Mid-task: finish first, this comes back.")
+            + ("Turn end: triage now, or defer what has to wait." if event == "Stop"
+               else "Mid-task: finish first, this comes back."))
     print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": line}}, ensure_ascii=False))
     return 0
 

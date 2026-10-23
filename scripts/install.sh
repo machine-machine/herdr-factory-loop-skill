@@ -259,8 +259,11 @@ M2HERD_BUDGET_MATCHER="Bash|Edit|Write|MultiEdit|Agent|Task"
 # §16.7 herd view: puts the orchestrator's subagents on its herd-board
 HERD_BOARD_HOOK="herd-board-subagents.py"
 HERD_BOARD_MATCHER="Agent|Task"
-# STEER gate (docs/herd-flow-v2.md §8): deterministic nudge on open steering items
+# STEER gate (docs/herd-flow-v2.md §8): deterministic nudge on open steering items.
+# The hook may spend up to 5s on stdin plus 8s in python (hooks/m2herd-steer-gate.sh); the
+# registered timeout must stay above that, or Claude Code kills it and shows a hook error.
 M2HERD_STEER_HOOK="m2herd-steer-gate.sh"
+M2HERD_STEER_TIMEOUT=15
 
 register_m2herd_hooks() {
   local hooks_dir="$HOME/.claude/hooks"
@@ -333,8 +336,16 @@ register_m2herd_hooks() {
      --arg hb "$HERD_BOARD_HOOK" --arg hbcmd "python3 \"$hooks_dir/$HERD_BOARD_HOOK\"" \
      --arg hbmatcher "$HERD_BOARD_MATCHER" \
      --arg sg "$M2HERD_STEER_HOOK" --arg sgcmd "bash \"$hooks_dir/$M2HERD_STEER_HOOK\"" \
+     --argjson sgto "$M2HERD_STEER_TIMEOUT" \
      --argjson budget "$budget_ok" --argjson board "$board_ok" '
     def have($ev; $name): [ .hooks[$ev][]?.hooks[]?.command // "" ] | map(contains($name)) | any;
+    # an entry an earlier install registered with a too-short timeout is raised, nothing else changes
+    def raise($ev; $name; $to):
+      if .hooks[$ev] then
+        .hooks[$ev] |= map(if .hooks then .hooks |= map(
+          if ((.command // "") | contains($name)) and ((.timeout // 0) < $to) then .timeout = $to else . end)
+          else . end)
+      else . end;
     .hooks = (.hooks // {})
     | (if have("SessionStart"; $ss) then . else
          .hooks.SessionStart = ((.hooks.SessionStart // [])
@@ -350,10 +361,11 @@ register_m2herd_hooks() {
            + [{"matcher":$hbmatcher,"hooks":[{"type":"command","command":$hbcmd,"timeout":5}]}]) end)
     | (if $board == 0 or have("UserPromptSubmit"; $sg) then . else
          .hooks.UserPromptSubmit = ((.hooks.UserPromptSubmit // [])
-           + [{"hooks":[{"type":"command","command":$sgcmd,"timeout":5}]}]) end)
+           + [{"hooks":[{"type":"command","command":$sgcmd,"timeout":$sgto}]}]) end)
     | (if $board == 0 or have("Stop"; $sg) then . else
          .hooks.Stop = ((.hooks.Stop // [])
-           + [{"hooks":[{"type":"command","command":($sgcmd + " Stop"),"timeout":5}]}]) end)
+           + [{"hooks":[{"type":"command","command":($sgcmd + " Stop"),"timeout":$sgto}]}]) end)
+    | raise("UserPromptSubmit"; $sg; $sgto) | raise("Stop"; $sg; $sgto)
   ' "$settings" > "$tmp" && mv "$tmp" "$settings"
   echo "[claude] registered m2herd hooks in $settings (SessionStart, PreCompact$([ "$budget_ok" -eq 1 ] && echo ", PostToolUse")$([ "$board_ok" -eq 1 ] && echo ", PreToolUse herd-board, UserPromptSubmit+Stop steer gate"))"
 }

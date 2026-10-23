@@ -12,6 +12,10 @@
 #            this hook chain already held once (stop_hook_active), or with M2HERD_STEER_GATE=0
 #   rate     the same set of open keys at most once per 30 min per session (M2HERD_STEER_RATE)
 #   never    blocks: no `decision`, always exit 0, any failure is silence
+#   Stop     additionalContext on Stop is fed back to the model and Claude Code CONTINUES the turn
+#            (it does not end there): the orchestrator gets one more round to triage. That round's
+#            own Stop carries stop_hook_active, so the chain ends after one extension, and the rate
+#            limit keeps it to once per open set per 30 min per session.
 #
 # Wire as  UserPromptSubmit: bash <skill>/hooks/m2herd-steer-gate.sh
 #          Stop:             bash <skill>/hooks/m2herd-steer-gate.sh Stop
