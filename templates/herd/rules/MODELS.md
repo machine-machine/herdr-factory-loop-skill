@@ -22,6 +22,21 @@ the scripts: Opus 5.5 = `claude-opus-5-5`, Fable 5.1 = `claude-fable-5-1`, Sonne
 | Team-facing ticket text | Opus 5.5 | high | Plain words for readers without the technical context; tone matters more than speed. |
 | Mechanical bulk (screenshots, list diff, lint/rename, first drafts) | Sonnet 5.5 | medium — never review, skeptic, domain slice or code on a herd branch | Cheap and fast for work whose result is checked mechanically. Never where its output is trusted as judgement or merged. |
 
+## Rules file per role
+
+Each table row above runs under one rules file; `herd-context <role> <herd> [<slice>]` renders it.
+
+| Rules file | `herd-context` role | Table row(s) |
+|---|---|---|
+| `ORCHESTRATOR.md` | `orchestrator` (no slice) | Orchestrator; conflict resolution, restacking; team-facing ticket text |
+| `HERD-CUT.md` | `herd-cut` (no slice) | Pre-start check of the herd cut |
+| `WORKER.md` | `worker` | Worker (both rows); fix after review (its "Fix round" section) |
+| `REVIEWER.md` | `reviewer` | Main reviewer; skeptics (its "As a skeptic" section — the loop points skeptics at the reviewer context) |
+| `FIXER.md` | `fixer` | Fix after review, only with `fixBy: "fixer"` |
+
+Data digging and mechanical bulk run as one-off agents of the orchestrator without a rules file of
+their own; their prompt names what they may touch.
+
 ## Settings that follow from the table
 
 - Review loop arg `reviewModel: "other"` (default; `HERD_REVIEW_MODEL` in the spec) picks the main

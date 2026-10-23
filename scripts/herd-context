@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """herd-context — write the context file one agent of the herd starts from (docs/herd-flow-v2.md §4).
 
-  herd-context <role> <herd> <slice> [--print] [--register-bytes N]
+  herd-context <role> <herd> <slice> [--print] [--register-bytes N]     slice roles
+  herd-context <role> <herd> [--print] [--register-bytes N]             herd roles
   herd-context --selftest
 
-role: worker | reviewer | fixer. Writes <herd>/<slice>.ctx.<role>.md (or prints it with --print).
+Slice roles: worker | reviewer | fixer — write <herd>/<slice>.ctx.<role>.md.
+Herd roles: orchestrator | herd-cut (the pre-start check of the cut) — take no slice and write
+<herd>/ctx.<role>.md; their sections are the rules, PLAN.md, every slice's task header and .repos
+(herd-cut: every task in full), packages and stacks, herd-clash over all live slices, the computed
+phase of every slice and a register excerpt over all tickets and keywords. {{report}} is
+<herd>/HERD-CUT.out.md for herd-cut (upper case, so no slice can own that name).
+--print prints instead of writing the file.
 Head: generation time, the head sha of every worktree and its base, and the command behind every
 section. Sections, each skipped with a one-line note when its source or tool is absent:
   rules       <ROLE>.md from $HERD_RULES_DIR, else <repo root>/.m2herd/rules/, else the skill's
@@ -20,6 +27,7 @@ section. Sections, each skipped with a one-line note when its source or tool is 
               with the task's tickets, touched files and keywords
   lage        `lage search "<keywords>" --limit 10` when lage is on PATH
 Placeholders: {{herd}} {{slice}} {{role}} {{report}} {{status}} {{worktrees}} {{base_shas}}
+(slice roles only: slice, status, worktrees, base_shas)
 {{orchestrator}} ($HERD_ORCH_NAME) {{orch_pane}} ($HERD_ORCH_PANE), plus KEY=value lines of
 <herd>/ctx.env and $HERD_CTX_<KEY> as {{key}}. Unfilled placeholders are listed in the head.
 Keywords: the `keywords:` header if present, else the slice name parts and the task title words.
@@ -39,6 +47,7 @@ sys.path.insert(0, HERE)
 import herd_events as he  # noqa: E402
 
 ROLES = ("worker", "reviewer", "fixer")
+HERD_ROLES = ("orchestrator", "herd-cut")
 STOP = {"the", "and", "for", "with", "from", "into", "that", "this", "eine", "einer", "einen", "einem", "und",
         "oder", "der", "die", "das", "den", "dem", "des", "mit", "für", "von", "auf", "aus", "bei", "nach",
         "ist", "sind", "wird", "werden", "nicht", "auch", "noch", "task", "slice", "herde", "worker"}
@@ -187,6 +196,132 @@ def load_clash():
     return mod
 
 
+def register_section(section, root, tickets, files, kws, register_bytes):
+    reg = os.environ.get("HERD_REGISTER") or (os.path.join(root, "decisions-questions.json") if root else None)
+    if not reg or not os.path.isfile(reg):
+        section("Register", "", note=f"no register at {reg or '(no repo root)'} (set HERD_REGISTER)")
+        return
+    rcmd = [sys.executable, os.path.join(HERE, "register-excerpt.py"), "--register", reg,
+            "--max-bytes", str(register_bytes)]
+    for t in tickets:
+        rcmd += ["--ticket", t]
+    for f in sorted(set(files)):
+        rcmd += ["--file", f]
+    for k in kws:
+        rcmd += ["--keyword", k]
+    rc, out, err = sh(rcmd)
+    if rc == 0:
+        section("Register", q(["register-excerpt.py"] + rcmd[2:]), out)
+    else:
+        section("Register", "", note=f"register-excerpt failed: {(err or out).strip()[:200]}")
+
+
+def slices_of(herd):
+    return sorted(f[:-len(".task.md")] for f in os.listdir(herd)
+                  if f.endswith(".task.md") and he.SLICE_RE.match(f[:-len(".task.md")]))
+
+
+def build_herd(role, herd, register_bytes=12000):
+    """Context for a role that works on the whole herd (orchestrator, herd-cut), not on one slice."""
+    herd = os.path.abspath(herd)
+    root = repo_root(herd)
+    clash = load_clash()
+    names = slices_of(herd)
+    st = he.state(herd)
+    sections, notes = [], []
+
+    def section(title, cmd, text=None, note=None):
+        if note:
+            notes.append(f"{title}: {note}")
+            sections.append(f"## {title}\n\n_skipped: {note}_\n")
+        else:
+            sections.append(f"## {title}\n\n> source: `{cmd}`\n\n{text.rstrip()}\n")
+
+    rules, tried = find_rules(role, root)
+    v = ctx_vars(herd, "", role, [])
+    for k in ("slice", "status", "worktrees", "base_shas"):  # slice-only values make no sense here
+        v.pop(k, None)
+    v["report"] = os.path.join(herd, f"{role.upper()}.out.md")
+    missing = []
+    if rules:
+        with open(rules, encoding="utf-8") as f:
+            text, missing = fill(f.read(), v)
+        section(f"Rules ({role.upper()}.md)", f"cat {rules}", text)
+    else:
+        section(f"Rules ({role.upper()}.md)", "", note="no rules file in " + ", ".join(tried))
+    plan = os.path.join(herd, "PLAN.md")
+    if os.path.isfile(plan):
+        with open(plan, encoding="utf-8") as f:
+            section("Plan", f"cat {plan}", f.read())
+    else:
+        section("Plan", "", note="no PLAN.md in the herd dir")
+    # slices: header + repos (+ full task for herd-cut) and the computed phase
+    tickets, kws, parts = [], [], []
+    for s in names:
+        hdr = he.task_header(herd, s)
+        body = task_body(herd, s) or ""
+        tickets += [t for t in hdr.get("tickets") or [] if t not in tickets]
+        kws += [k for k in keywords(herd, s, hdr, body) if k not in kws]
+        phase = (st.get(s) or {}).get("phase", "none")
+        try:
+            rl = [f"{r['repo']} {r['branch']} {r['base']}" for r in he.repos(herd, s)] or [f"no {s}.repos"]
+        except ValueError as e:
+            rl = [str(e)]
+        if role == "herd-cut":
+            parts.append(f"### {s} — phase {phase}\n\nrepos: {'; '.join(rl)}\n\n{body.rstrip()}\n")
+        else:
+            title = next((ln.lstrip("#").strip() for ln in body.splitlines() if ln.startswith("#")), "")
+            keys = ", ".join(f"{k}: {', '.join(x) if isinstance(x, list) else x}" for k, x in hdr.items()) or "no header"
+            parts.append(f"- **{s}** ({phase}) {title}\n  {keys}\n  repos: {'; '.join(rl)}")
+    if names:
+        section("Slices", f"cat {herd}/*.task.md {herd}/*.repos" if role == "herd-cut"
+                else f"head of {herd}/*.task.md, {herd}/*.repos, herd-phase {herd} --state", "\n".join(parts))
+    else:
+        section("Slices", "", note="no <slice>.task.md in the herd dir")
+    # packages and stacks
+    seen, pk = set(), []
+    for s in names:
+        p = he.package(herd, s)
+        if len(p) > 1 and tuple(p) not in seen:
+            seen.add(tuple(p))
+            lost = [x for x in p if x not in names]
+            pk.append(f"- package: {' + '.join(p)}" + (f" (no task file here: {', '.join(lost)})" if lost else ""))
+    for s in names:
+        base = he.task_header(herd, s).get("stacked_on")
+        if base:
+            pk.append(f"- stack: {s} on {base}" + ("" if base in names else " (base has no task file here)"))
+    if pk:
+        section("Packages and stacks", "together_with / stacked_on of every task header", "\n".join(pk))
+    else:
+        section("Packages and stacks", "", note="no together_with or stacked_on in any task header")
+    # clash over all live slices
+    if clash is None:
+        section("Clash", "", note="herd-clash not found next to herd-context")
+    else:
+        rc, out, err = sh([sys.executable, os.path.join(HERE, "herd-clash"), herd, "--json"], timeout=120)
+        try:
+            res = json.loads(out) if rc == 0 else None
+        except ValueError:
+            res = None
+        if res is None:
+            section("Clash", "", note=f"herd-clash failed: {(err or out).strip()[:200]}")
+        else:
+            section("Clash", f"herd-clash {herd}", clash.render(res))
+    register_section(section, root, tickets, [], kws[:24], register_bytes)
+
+    head = [f"# Context {role} — {os.path.basename(herd)}", "",
+            f"- generated: {he.now()} by `herd-context {role} {herd}`",
+            f"- herd: {herd}; slices: {len(names)}",
+            f"- tickets: {', '.join(tickets) or '-'}; keywords: {', '.join(kws[:24]) or '-'}"]
+    if role == "herd-cut":
+        head.append(f"- report: {v['report']}")
+    if missing:
+        head.append(f"- unfilled placeholders: {', '.join(missing)}")
+    if notes:
+        head.append(f"- skipped: {len(notes)} ({'; '.join(notes)})")
+    return "\n".join(head) + "\n\n" + "\n".join(sections)
+
+
 def build(role, herd, slice_name, register_bytes=12000):
     herd = os.path.abspath(herd)
     root = repo_root(herd)
@@ -272,24 +407,7 @@ def build(role, herd, slice_name, register_bytes=12000):
                 parts.append(f"### {m}\n\n_missing: {p}_\n")
                 notes.append(f"memory: {m} missing")
         section("Memory", f"cat {mdir}/{{{','.join(need)}}}", "\n".join(parts))
-    # register
-    reg = os.environ.get("HERD_REGISTER") or (os.path.join(root, "decisions-questions.json") if root else None)
-    if not reg or not os.path.isfile(reg):
-        section("Register", "", note=f"no register at {reg or '(no repo root)'} (set HERD_REGISTER)")
-    else:
-        rcmd = [sys.executable, os.path.join(HERE, "register-excerpt.py"), "--register", reg,
-                "--max-bytes", str(register_bytes)]
-        for t in hdr.get("tickets") or []:
-            rcmd += ["--ticket", t]
-        for f in sorted(set(touched)):
-            rcmd += ["--file", f]
-        for k in kws:
-            rcmd += ["--keyword", k]
-        rc, out, err = sh(rcmd)
-        if rc == 0:
-            section("Register", q(["register-excerpt.py"] + rcmd[2:]), out)
-        else:
-            section("Register", "", note=f"register-excerpt failed: {(err or out).strip()[:200]}")
+    register_section(section, root, hdr.get("tickets") or [], touched, kws, register_bytes)
     # lage
     if not shutil.which("lage"):
         section("Lage", "", note="lage not on PATH")
@@ -335,9 +453,9 @@ def main():
     ap = argparse.ArgumentParser(prog="herd-context", description=__doc__.split("\n\n")[0],
                                  formatter_class=argparse.RawDescriptionHelpFormatter,
                                  epilog=__doc__.split("\n\n", 1)[1])
-    ap.add_argument("role", choices=ROLES)
+    ap.add_argument("role", choices=ROLES + HERD_ROLES)
     ap.add_argument("herd")
-    ap.add_argument("slice")
+    ap.add_argument("slice", nargs="?", help="required for worker, reviewer, fixer; none for herd roles")
     ap.add_argument("--print", action="store_true", help="print instead of writing the file")
     ap.add_argument("--register-bytes", type=int, default=12000)
     ap.add_argument("--selftest", action="store_true", help="run tests/mergectx/test_herd_context.py")
@@ -345,14 +463,24 @@ def main():
     if not os.path.isdir(a.herd):
         print(f"herd-context: no herd dir {a.herd}", file=sys.stderr)
         return 2
-    if not he.SLICE_RE.match(a.slice):
-        print(f"herd-context: bad slice name {a.slice!r}", file=sys.stderr)
-        return 2
-    text = build(a.role, a.herd, a.slice, a.register_bytes)
+    if a.role in HERD_ROLES:
+        if a.slice:
+            print(f"herd-context: {a.role} works on the whole herd and takes no slice", file=sys.stderr)
+            return 2
+        text = build_herd(a.role, a.herd, a.register_bytes)
+        out = os.path.join(a.herd, f"ctx.{a.role}.md")
+    else:
+        if not a.slice:
+            print(f"herd-context: {a.role} needs a slice", file=sys.stderr)
+            return 2
+        if not he.SLICE_RE.match(a.slice):
+            print(f"herd-context: bad slice name {a.slice!r}", file=sys.stderr)
+            return 2
+        text = build(a.role, a.herd, a.slice, a.register_bytes)
+        out = os.path.join(a.herd, f"{a.slice}.ctx.{a.role}.md")
     if a.print:
         sys.stdout.write(text)
         return 0
-    out = os.path.join(a.herd, f"{a.slice}.ctx.{a.role}.md")
     tmp = out + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         f.write(text)

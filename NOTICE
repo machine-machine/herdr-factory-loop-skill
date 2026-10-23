@@ -1,0 +1,63 @@
+herdr-factory-loop-skill
+Copyright (c) 2026 machine-machine — MIT License, see LICENSE.
+
+This project contains material adapted from third-party work, listed below with its license.
+
+----------------------------------------------------------------------------------------------------
+BMad Method — https://github.com/bmad-code-org/BMAD-METHOD
+----------------------------------------------------------------------------------------------------
+
+Adapted (rewritten for the herd flow, not copied verbatim) from the agent personas and workflows of
+the BMad Method, as read at commit 61e01f82644c4bb533750cfa0d6d61ab61d2cc9b (2026-10-18):
+
+  templates/herd/rules/ORCHESTRATOR.md  role-file structure; backlog principles of the Product Owner
+                                        persona (requirements written once with their source, scope
+                                        decided once, done as a check the owner runs, replan);
+                                        orchestrator duties of the autonomous development loop
+  templates/herd/rules/HERD-CUT.md      readiness standard, PASS / CONCERNS / FAIL readiness gate,
+                                        set and dependency checks, the Architect's focus on
+                                        invariants between independently built units
+  templates/herd/rules/WORKER.md        Developer persona principles (the ticket is the spec, no task
+                                        complete without passing tests, red-green-refactor, comments
+                                        explain why); run-result report and blocking conditions of
+                                        the autonomous build workflow
+  templates/herd/rules/REVIEWER.md      review lenses (adversarial, edge case, verification gap);
+                                        code-review triage (verify the claim before grading it,
+                                        severity as the harm of one occurrence, no judging by
+                                        similarity, zero findings is valid)
+  templates/herd/rules/FIXER.md         finding routing (patch / decision needed / defer)
+  templates/herd/task.md.example        numbered Given / When / Then acceptance criteria, boundaries
+                                        ("Must not change"), marked note lines
+
+The BMad Method is distributed under the following license:
+
+  MIT License
+
+  Copyright (c) 2025 BMad Code, LLC
+
+  This project incorporates contributions from the open source community.
+  See [CONTRIBUTORS.md](CONTRIBUTORS.md) for contributor attribution.
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+  (CONTRIBUTORS.md refers to the file in the BMad Method repository.)
+
+Trademarks: BMad, BMad Method and BMad Core are trademarks of BMad Code, LLC and are not licensed
+under the MIT License. They are used here only to name the source of the adapted material. This
+project is not affiliated with, endorsed by or certified by BMad Code, LLC.

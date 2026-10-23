@@ -27,20 +27,43 @@ Delete this comment in the real task file.
 
 ## Goal
 
-One or two sentences: what a user can do after this slice that they cannot do today.
+One or two sentences: what a user can do after this slice that they cannot do today, and why it
+matters. Name the ticket(s) it comes from.
 
 ## Acceptance
 
-- Observable result 1 (how to check it: click path or call, expected outcome).
-- Observable result 2.
-- Tests: which suite proves it, and that its count goes up.
+Numbered criteria; the worker's report and the reviewer refer to them by id. Each states a rule,
+not one example, at the outermost surface the goal names (the screen, the API call, the file a user
+gets) — not an internal proxy for it. Include the failure path.
+
+1. **AC1 — Export from the list view**
+   **Given** a list with 3 invoices, 1 of them cancelled
+   **When** the user clicks "Export CSV"
+   **Then** a file with a header row and 3 data rows downloads; the cancelled one is marked
+   **Check:** click path on the local UI, or `GET /invoices/export.csv`; test `test_export_rows`
+2. **AC2 — Empty list**
+   **Given** a filter that matches no invoice
+   **When** the user clicks "Export CSV"
+   **Then** the button is disabled with the hint "nothing to export"; no empty file is offered
+   **Check:** UI test `export-empty`
+3. **AC3 — Tests** — the export suite grows by at least the cases above and stays green.
+
+## Boundaries
+
+- Must not change: the existing PDF export and its URL.
+- Out of scope: scheduled exports (slice `invoice-export-cron`).
+- Interface with `invoice-export-ui`: `GET /invoices/export.csv?filter=<same as list>` →
+  `text/csv`, columns `number,date,customer,amount,status`. Both tasks say it the same way.
 
 ## Context
 
 - Why now: the request or feedback this comes from, with the date and where it is written down.
-- Recorded decisions that bind this slice (register ids).
-- Files and modules you expect to touch; shared files other slices touch too.
+- Binding decisions: register ids (`d-<slug>`); open questions: `q-<slug>` and what they block.
+- Expected files and modules; shared files other slices touch too (the cut check reads these).
 
-## Out of scope
+## Notes
 
-- What this slice must not do, and which slice does it instead.
+One marked line each; delete the section when empty.
+
+- Assumption: an unconfirmed choice the worker may build on; once confirmed it becomes a
+  register decision.

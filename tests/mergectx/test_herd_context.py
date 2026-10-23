@@ -138,6 +138,78 @@ class Ctx(unittest.TestCase):
         rc, out, err = self.w.run("herd-context", "boss", self.w.herd, "reviere")
         self.assertEqual(rc, 2)
 
+    def herd_ctx(self, role):
+        rc, out, err = self.w.run("herd-context", role, self.w.herd)
+        self.assertEqual(rc, 0, err)
+        path = os.path.join(self.w.herd, f"ctx.{role}.md")
+        self.assertEqual(out.strip(), path)
+        with open(path) as f:
+            return f.read()
+
+    def herd_rules(self):
+        for role in ("ORCHESTRATOR", "HERD-CUT"):
+            with open(os.path.join(self.project, ".m2herd", "rules", f"{role}.md"), "w") as f:
+                f.write(f"{role} rules for {{{{herd}}}}; to {{{{orchestrator}}}}; report {{{{report}}}}; "
+                        f"slice {{{{slice}}}}\n")
+        with open(os.path.join(self.w.herd, "PLAN.md"), "w") as f:
+            f.write("Cut: reviere first because it is the riskiest path.\n")
+        with open(os.path.join(self.w.herd, "kollision.task.md"), "w") as f:
+            f.write("together_with: reviere\nkeywords: kollision\n\n# kollision task\n\nDo the kollision thing.\n")
+
+    def test_herd_cut_sees_every_task_in_full(self):
+        self.herd_rules()
+        t = self.herd_ctx("herd-cut")
+        h = self.w.herd
+        self.assertIn(f"HERD-CUT rules for {h}; to orch-a1; report {h}/HERD-CUT.out.md", t)
+        self.assertIn("unfilled placeholders: slice", t, "slice values do not exist for a herd role")
+        self.assertIn("Cut: reviere first", t)
+        self.assertIn("Do the reviere thing.", t)
+        self.assertIn("Do the kollision thing.", t)
+        self.assertIn("repos: acme-api reviere-api origin/main", t)
+        self.assertIn("package: kollision + reviere", t)
+        self.assertIn("reviere ⇄ kollision", t.replace("kollision ⇄ reviere", "reviere ⇄ kollision"))
+        self.assertIn("q-reviere-rollen", t, "tickets of every slice select register entries")
+        for title in ("Rules", "Plan", "Slices", "Packages and stacks", "Clash", "Register"):
+            block = t.split(f"## {title}")[1].split("\n", 1)[1]
+            self.assertTrue(block.lstrip().startswith(("> source: `", "_skipped:")), title)
+
+    def test_orchestrator_sees_headers_not_bodies(self):
+        self.herd_rules()
+        t = self.herd_ctx("orchestrator")
+        self.assertIn("ORCHESTRATOR rules for", t)
+        self.assertIn(f"report {self.w.herd}/ORCHESTRATOR.out.md", t)
+        self.assertIn("**reviere** (working) reviere task", t)
+        self.assertIn("tickets: 10000000001", t)
+        self.assertNotIn("Do the reviere thing.", t)
+        self.assertNotIn("## Memory", t)
+
+    def test_herd_role_arguments(self):
+        rc, _, err = self.w.run("herd-context", "herd-cut", self.w.herd, "reviere")
+        self.assertEqual(rc, 2)
+        self.assertIn("takes no slice", err)
+        rc, _, err = self.w.run("herd-context", "worker", self.w.herd)
+        self.assertEqual(rc, 2)
+        self.assertIn("needs a slice", err)
+        os.remove(os.path.join(self.w.herd, "reviere.task.md"))
+        os.remove(os.path.join(self.w.herd, "kollision.task.md"))
+        t = self.herd_ctx("orchestrator")
+        self.assertIn("_skipped: no <slice>.task.md in the herd dir_", t)
+        self.assertIn("_skipped: no PLAN.md in the herd dir_", t)
+
+    def test_shipped_herd_rules_fill_completely(self):
+        # the skill's own ORCHESTRATOR.md / HERD-CUT.md use only herd-level values and documented keys
+        shipped = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..",
+                                                "templates", "herd", "rules"))
+        self.w.env["HERD_RULES_DIR"] = shipped
+        with open(os.path.join(self.w.herd, "ctx.env"), "w") as f:
+            for k in ("ORCHESTRATOR", "LANGUAGE", "PORTS", "TEST_CMDS", "UNAVAILABLE", "TICKET_CMD", "REGISTER_LINT"):
+                f.write(f"{k}=value-of-{k.lower()}\n")
+        for role in ("orchestrator", "herd-cut"):
+            t = self.herd_ctx(role)
+            self.assertIn(f"{shipped}/{role.upper()}.md", t)
+            self.assertNotIn("unfilled placeholders", t)
+            self.assertNotRegex(t, r"\{\{\s*[a-z_]+\s*\}\}")
+
 
 class ProjectDir(unittest.TestCase):
     """herd-context (memory), herd-recover and the board (transcripts) share Claude Code's project-dir rule."""
