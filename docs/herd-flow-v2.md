@@ -210,7 +210,8 @@ evidence reports. State is computed (`checks.sh`, `herd-board`, `lage card`).
                            status.json, out.md, befunde-<sha7>.md, ctx.<role>.md (generated, ignored)
       dispatch/            one-off investigations; > 21 days → archives/dispatch/<YYYY-MM>/
       archives/<date>/     INDEX.md one line per moved file
-    ~/.cache/m2herd/<project>/   run data: screens/, runs/, backups/, logs (deleted by m2herd-purge, below)
+    ~/.cache/m2herd/<project>/   run data: screens/, nested <loop>/runs/, backups/, logs (deleted by m2herd-purge, below);
+                                 the fabric's own runs/ stays — it is the engine's run store
     ~/.m2herd/state/<project>/   runtime state: sqlite, *.lock, poll/watch state
 
 `m2herd-migrate [--apply]` — dry run by default: prints every move with size and every reader found

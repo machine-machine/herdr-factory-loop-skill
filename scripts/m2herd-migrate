@@ -20,7 +20,7 @@ What moves (paths relative to <m2herd-dir>; <date> = --date, default today):
                                                                changed within --live-hours, default 48) unless
                                                                --move-live.
   dispatch/screens/           -> <cache-root>/<project>/screens/   run data (cache-root ~/.cache/m2herd)
-  backups/, runs/             -> <cache-root>/<project>/…
+  backups/                    -> <cache-root>/<project>/…   (runs/ stays: the engine's run store)
   dispatch/<other>            -> archives/dispatch/<YYYY-MM>/<other>   when its newest file is older than
                                                                --age days (default 21); YYYY-MM of that file
   PHASE-NEXT-<d>.md           -> archives/<date>/              every one but the newest
@@ -251,7 +251,8 @@ class Plan:
                     self.move("dispatch-old", p, os.path.join(root, "archives", "dispatch", ym, n),
                               f"newest file {datetime.datetime.fromtimestamp(newest).strftime('%Y-%m-%d')}")
         # run data
-        for n in ("backups", "runs"):
+        # runs/ is NOT run data to move: `m2herd evolve --run` and m2herd-up read and write .m2herd/runs
+        for n in ("backups",):
             p = os.path.join(root, n)
             if os.path.isdir(p):
                 self.move("cache", p, os.path.join(self.cache, n))
@@ -770,8 +771,7 @@ def selftest():
         check("pycache deleted twice", txt.count("DELETE ") == 2, txt)
         check("reader found with boundary", "tool: .m2herd/dispatch/herde-0101" in txt and "herde-0101x" not in txt, txt)
         check("live herd reader ignored", "other:" not in txt, txt)
-        check("runs/ to cache, engine flagged as reader", "MOVE   runs/ ->" in txt
-              and re.search(r"tool: .*\.m2herd/runs", txt), txt)
+        check("runs/ stays in the fabric (engine run store)", "MOVE   runs/ ->" not in txt, txt)
         check("moved script naming its own old path", "herde-0101/spawn.sh: .m2herd/dispatch/herde-0101" in txt, txt)
         check("kept fabric script, relative path", "sync.sh: .m2herd/.sync-stamp" in txt, txt)
         check("secret-looking files never read", "tool-env.sh" not in txt.split("READERS")[1]
