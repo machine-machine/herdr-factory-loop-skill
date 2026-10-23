@@ -1,65 +1,112 @@
 #!/usr/bin/env python3
-"""herd-board — the ONE status panel in the right third of the orchestrator tab.
+"""herd-board — the ONE status panel in the right third of the orchestrator tab (docs/herd-flow-v2.md §3).
 
 Usage: herd-board [--anchor <pane>] [<herd-dir> ...]
        herd-board --open [--anchor <pane>]     (open the panel next to the anchor unless it is live)
-       herd-board --selftest                   (status files that break the contract must not end the board)
+       herd-board --once [<herd-dir> ...]      (print one frame and exit; size from COLUMNS/LINES)
+       herd-board --selftest                   (offline: synthetic events for every lane + the v1 fallback)
+       herd-board --help
 
-Shows, one line each (icon, name, n/m, short text, age):
-  - herd workers of every herd dir given or listed in ~/.cache/herd-board/<anchor>.herds
-    (dir holds herd.map "slice=pane", optional queue.txt, <slice>.status.json, <slice>.out.md);
-    a worker whose pane is closed after its report is finished and drops off the board
-  - the orchestrator's own subagents, registered by hooks/herd-board-subagents.py in
-    ~/.cache/herd-board/<anchor>.agents/ (text = the subagent's last action)
-The panel height is shared evenly: one worker gets its progress bar, sentence and step feed, ten get a line each.
-Footer: open PRs of finished workers ("ready to merge", with the orchestrator's sign-off state) and today's merges.
+Herd dirs: those given plus those listed in ~/.cache/herd-board/<anchor>.herds. The state of a slice is its last
+event in <herd>/herd.events.jsonl (read through herd_events.py next to this script); everything live is computed.
+Lanes, top to bottom, each drawn only when non-empty:
+  1. Needs you      ✓✓ package reviewed on current heads -> the exact merge word; ? herdr reports `blocked`
+  2. Queue          ! fix_queued (always first), ◌ queued "starts as no. n" + why it waits (slot, base, memory)
+  3. Working        ● working (⧗ tests/build, ↺ fix round), ✓ reported (report written, idle), ⚠ still, ✕ gone,
+                    plus the orchestrator's own subagents (◆) and Workflow runs (▸ with their agents)
+  4. Ready to merge one row per package: ◇ accepted (+ why the review waits), … review running (round n/3),
+                    ✓ reviewed, ⟳ stale (PR head or main moved since review_ok), ! findings
+  5. Merged today   numbers from `merged` events plus the GitHub search (HERD_BOARD_ORG)
+Each slice row ends dim with age and model·effort from its working event (O·hi = Opus/high). ⇄ marks a file
+overlap with another live slice (`herd-clash <herd> --json`, on PATH or next to this script; skipped when absent).
+Header: time, `you: n`, `slots n/m (k review)` from `herd-limits` (when present), free RAM, free disk, and the
+time of the last human input into the anchor session once that is > 30 min ago.
+A herd dir with no herd.events.jsonl but a herd.map is a v1 herd: shown the old way with a dim
+"v1 herd — herd-recover migrates it" line, so live herds keep working until `herd-recover` migrates them.
+
+The panel height is shared evenly in the Working lane: one worker gets its progress bar, sentence and step feed,
+ten get a line each. Lanes 4 and 5 are pinned to the bottom. Nothing is cut silently: overflow says "+N more".
 Closes itself after IDLE_CLOSE_MIN with nothing to show. Never sends keys. Repaints every 5 s.
 
 Worker status contract (<slice>.status.json, written by the worker, English or German keys):
   {"sentence"|"satz": "...", "step"|"schritt": 3, "of"|"von": 6, "missing"|"fehlt": "...",
    "short"|"kurz": "3-6 words", "pr": "PR #12" | "api #12 + ui #4" | "https://github.com/o/r/pull/12"}
-Orchestrator sign-off (<slice>.signoff or <slice>.freigabe): lines "<repo> #<n> <head-sha>" — valid only while the
-PR head still equals that sha.
 
 Environment:
   HERD_BOARD_LANG   en (default) | de
-  HERD_BOARD_ORG    GitHub owner for short PR refs and the "merged today" line (unset: no merged-today line)
-  HERD_BOARD_REPOS  short names used in PR refs, e.g. "api=my-api,ui=my-ui" (unset: "#n" = the worker's own repo)
+  HERD_BOARD_ORG    GitHub owner(s), comma-separated, for bare repo names and the "merged today" search
+                    (unset: no search; gh resolves repos from the slice's worktree)
+  HERD_BOARD_REPOS  short names used in refs, e.g. "api=my-api,ui=my-ui,ma=other-owner/agent"
+  HERD_BOARD_DISK   path whose free space the header shows (default: the first herd dir, else the cwd)
   NO_COLOR          plain text
 """
 import calendar, glob, json, os, re, shlex, shutil, subprocess, sys, textwrap, time
 
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+try:
+    import herd_events as he  # the one source of herd state; never forked here
+except ImportError:  # board copied without its core: v2 herds show an error line, v1 herds still render
+    he = None
+
 CACHE = os.path.expanduser("~/.cache/herd-board")
 IDLE_CLOSE_MIN = 5      # nothing to show for this long -> the panel closes itself
 AGENT_DONE_KEEP_MIN = 2  # a finished subagent stays visible this long
-ORG = os.environ.get("HERD_BOARD_ORG", "")
-REPOS = dict(p.split("=", 1) for p in os.environ.get("HERD_BOARD_REPOS", "").split(",") if "=" in p)
-SHORT = {v: k for k, v in REPOS.items()}
+START_GRACE_S = 180     # a fresh `working` event whose pane herdr does not list yet is "starting", not "gone"
+ORGS = [o.strip() for o in os.environ.get("HERD_BOARD_ORG", "").split(",") if o.strip()]
+ORG = ORGS[0] if ORGS else ""
+REPOS = dict(p.strip().split("=", 1) for p in os.environ.get("HERD_BOARD_REPOS", "").split(",") if "=" in p)
+SHORT = {v.split("/")[-1]: k for k, v in REPOS.items()}
 
 LANG = "de" if os.environ.get("HERD_BOARD_LANG", "").lower().startswith("de") else "en"
 STRINGS = {
-    "en": {"title": "Herd", "free": "GB free", "load": "load", "done": "done", "check": "check", "working": "working",
-           "still": "still", "needs_answer": "needs an answer", "paused": "paused (memory), resumes as no. {pos}",
-           "waiting": "waiting, starts as no. {pos}", "ended": "ended without a report", "missing": "missing:",
-           "blocked": "blocked", "since": "since", "ready": "Ready to merge", "signed": "signed off, waiting for merge",
+    "en": {"title": "Herd", "load": "load", "done": "done", "check": "check", "working": "working",
+           "still": "still", "needs_answer": "needs an answer", "ended": "ended without a report", "missing": "missing:",
+           "blocked": "blocked", "since": "since", "signed": "signed off, waiting for merge",
            "in_review": "in review", "no_review": "no review yet", "merged": "Merged today ", "more": "more",
-           "idle": "nothing running",
+           "idle": "nothing running", "paused": "paused (memory), resumes as no. {pos}",
+           "waiting": "waiting, starts as no. {pos}",
            "read": "reads {f}", "edit": "edits {f}", "write": "writes {f}", "grep": "searches “{p}”",
            "glob": "looks for files {p}", "send": "reports to the orchestrator", "monitor": "waits for a result",
            "tests": "runs the tests", "build": "checks and builds the UI", "shots": "takes screenshots",
            "devsrv": "UI preview is running", "srv": "test server is running", "deps": "installs packages",
-           "push": "uploads"},
-    "de": {"title": "Herde", "free": "GB frei", "load": "Last", "done": "fertig", "check": "prüfen", "working": "arbeitet",
-           "still": "still", "needs_answer": "braucht Antwort", "paused": "pausiert (Speicher), geht als {pos}. weiter",
-           "waiting": "wartet, startet als {pos}.", "ended": "beendet ohne Bericht", "missing": "fehlt:",
-           "blocked": "blockiert", "since": "seit", "ready": "Merge-bereit", "signed": "geprüft, wartet auf Merge-Wort",
+           "push": "uploads",
+           "ram": "GB RAM", "ram_s": "G RAM", "disk": "GB disk", "disk_s": "G disk", "input": "input ",
+           "slots": "slots {u}/{m} ({k} review)", "slots_s": "{u}/{m}", "you": "you: {n}", "you_s": "you {n}",
+           "lane_needs": "Needs you", "lane_queue": "Queue", "lane_work": "Working", "lane_ready": "Ready to merge",
+           "checking": "checking", "starting": "starting", "queued": "starts as no. {pos}",
+           "fix_queued": "findings back, starts as no. {pos}", "w_slot": "no free slot", "w_mem": "memory",
+           "w_load": "load", "w_base_q": "base {b} not accepted", "accepted": "accepted", "review_due": "review due",
+           "w_partner": "waits for {x}", "w_base": "waits for base {b}", "review_round": "review running, round {n}/3",
+           "reviewed": "reviewed", "stale": "stale", "stale_head": "{ref} has new commits",
+           "stale_main": "{repo} main moved", "stale_nomain": "{repo} main not recorded", "befund": "findings", "word": "say “{w}”",
+           "v1": "v1 herd — herd-recover migrates it", "wf": "workflow: {r} running, {d} done",
+           "no_core": "herd_events.py missing next to herd-board", "draw_err": "herd-board"},
+    "de": {"title": "Herde", "load": "Last", "done": "fertig", "check": "prüfen", "working": "arbeitet",
+           "still": "still", "needs_answer": "braucht Antwort", "ended": "beendet ohne Bericht", "missing": "fehlt:",
+           "blocked": "blockiert", "since": "seit", "signed": "geprüft, wartet auf Merge-Wort",
            "in_review": "in Prüfung", "no_review": "noch ohne Review", "merged": "Heute gemergt ", "more": "weitere",
-           "idle": "nichts läuft",
+           "idle": "nichts läuft", "paused": "pausiert (Speicher), geht als {pos}. weiter",
+           "waiting": "wartet, startet als {pos}.",
            "read": "liest {f}", "edit": "ändert {f}", "write": "schreibt {f}", "grep": "sucht „{p}“",
            "glob": "sucht Dateien {p}", "send": "meldet sich beim Orchestrator", "monitor": "wartet auf ein Ergebnis",
            "tests": "lässt die Tests laufen", "build": "prüft und baut die Oberfläche", "shots": "macht Bildschirmfotos",
            "devsrv": "Vorschau der Oberfläche läuft", "srv": "Test-Server läuft", "deps": "installiert Pakete",
-           "push": "lädt hoch"},
+           "push": "lädt hoch",
+           "ram": "GB RAM", "ram_s": "G RAM", "disk": "GB Platte", "disk_s": "G Platte", "input": "Eingabe ",
+           "slots": "Plätze {u}/{m} ({k} Review)", "slots_s": "{u}/{m}", "you": "du: {n}", "you_s": "du {n}",
+           "lane_needs": "Braucht dich", "lane_queue": "Warteschlange", "lane_work": "Arbeit",
+           "lane_ready": "Merge-bereit",
+           "checking": "prüfe ich", "starting": "startet", "queued": "startet als {pos}.",
+           "fix_queued": "Befunde zurück, startet als {pos}.", "w_slot": "kein Platz frei", "w_mem": "Speicher knapp",
+           "w_load": "Last zu hoch", "w_base_q": "Basis {b} nicht abgenommen", "accepted": "abgenommen",
+           "review_due": "Review steht an", "w_partner": "wartet auf {x}", "w_base": "wartet auf Basis {b}",
+           "review_round": "Review läuft, Runde {n}/3", "reviewed": "geprüft", "stale": "veraltet",
+           "stale_head": "{ref} hat neue Commits", "stale_main": "{repo}-main ist weiter",
+           "stale_nomain": "{repo}-main nicht erfasst", "befund": "Befunde",
+           "word": "Wort: „{w}“", "v1": "v1-Herde — herd-recover migriert",
+           "wf": "Workflow: {r} laufen, {d} fertig", "no_core": "herd_events.py fehlt neben herd-board",
+           "draw_err": "herd-board"},
 }
 
 
@@ -72,6 +119,16 @@ def field(st, en, de):
     return st.get(en, st.get(de))
 
 
+def as_list(v):
+    """An event field that should be a list: a lone string or number becomes a one-item list, None nothing.
+    Events are written by herd-phase from LLM-typed --field values; a wrong shape must not end the board."""
+    if v is None or v == "":
+        return []
+    if isinstance(v, (list, tuple)):
+        return [x for x in v if x is not None]
+    return [v]
+
+
 TEXT_KEYS = ("sentence", "satz", "missing", "fehlt", "short", "kurz", "pr")
 NUM_KEYS = ("step", "schritt", "of", "von")
 
@@ -81,7 +138,7 @@ def read_status(path):
     becomes "a, b", other values become text; step/of stay numbers (a digit string counts). Workers write this file by
     hand, so a stray list or null must never take the board down."""
     try:
-        st = json.load(open(path))
+        st = json.load(open(path, encoding="utf-8"))
     except (OSError, ValueError):
         return {}
     if not isinstance(st, dict):
@@ -97,22 +154,25 @@ def read_status(path):
             out[k] = v
     return out
 
+
 # Only the 16 theme colours (follow the terminal's palette), one meaning each, never meaning by colour alone (the icons
 # stay): red = needs me, yellow = waiting/attention, green = done/ok, cyan = herd worker running, blue = numbers and
-# progress, magenta = my subagents and references (PR #, commit). Dim = secondary. NO_COLOR (no-color.org) turns it off.
+# progress, magenta = my subagents, review running and references (PR #, commit). ORANGE (fix round, findings) is
+# bright red, the slot palettes like Solarized fill with orange. Dim = secondary. NO_COLOR (no-color.org) turns it off.
 _C = not os.environ.get("NO_COLOR")
-DIM, BOLD, ITAL, GREEN, RED, CYAN, YEL, BLUE, MAG, RST = (
-    ("\033[2m", "\033[1m", "\033[3m", "\033[32m", "\033[31m", "\033[36m", "\033[33m", "\033[34m", "\033[35m", "\033[0m")
-    if _C else ("",) * 10)
+DIM, BOLD, ITAL, GREEN, RED, CYAN, YEL, BLUE, MAG, ORANGE, RST = (
+    ("\033[2m", "\033[1m", "\033[3m", "\033[32m", "\033[31m", "\033[36m", "\033[33m", "\033[34m", "\033[35m",
+     "\033[91m", "\033[0m") if _C else ("",) * 11)
 # words and references that carry their own colour wherever they appear
 TOKENS = [
-    (re.compile(r"(?<![\w#])(?:PR\s)?#\d+\b|\b[a-z][\w-]{1,20}\s#\d+\b"), MAG),
+    (re.compile(r"(?<![\w#])(?:PR\s)?#\d+\b|\b[a-z][\w-]{1,20}\s?#\d+(?:@[0-9a-f]{7,40})?\b"), MAG),
     (re.compile(r"\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,12}\b"), YEL),
     (re.compile(r"\b(?:done|merged|green|passed|ok|fertig|gemergt|grün|bestanden)\b", re.I), GREEN),
     (re.compile(r"\b(?:blocked|failed|errors?|red|aborted|blockiert|Fehler\w*|rot|fehlgeschlagen|abgebrochen)\b",
                 re.I), RED),
     (re.compile(r"\b\d+(?:[.,]\d+)?\s?(?:%|GB|MB|ha|min|h|Min|Std|tests?|Tests?)\b|\b\d+/\d+\b"), BLUE),
 ]
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 
 
 def paint(text, base=""):
@@ -129,6 +189,8 @@ def paint(text, base=""):
         out += text[pos:a] + RST + col + text[a:b] + RST + base
         pos = b
     return out + text[pos:] + (RST if base else "")
+
+
 STILL_MIN = 10          # no transcript write and no process for this long -> "still"
 
 # what a process in the worktree means, in plain words (first match wins); tests and builds get the ⧗ icon
@@ -152,9 +214,12 @@ def herdr_agents():
         return {}
 
 
-def procs_in(slice_name):
+def procs_in(slice_name, extra=()):
     """Plain-word activities of processes whose cwd lies in any worktree of this slice."""
-    roots = glob.glob(os.path.expanduser(f"~/.herdr/worktrees/*/{slice_name}"))
+    roots = set(glob.glob(os.path.expanduser(f"~/.herdr/worktrees/*/{slice_name}")))
+    roots |= {os.path.expanduser(str(p)).rstrip("/") for p in extra if p}
+    if not roots:
+        return []
     found = []
     for pid in os.listdir("/proc"):
         if not pid.isdigit():
@@ -188,7 +253,7 @@ def transcript_age(cwd):
 
 def read_list(path):
     try:
-        return [l.strip() for l in open(path) if l.strip()]
+        return [l.strip() for l in open(path, encoding="utf-8") if l.strip() and not l.startswith("#")]
     except OSError:
         return []
 
@@ -255,12 +320,94 @@ def newest_jsonl(cwd):
     return max(files, key=os.path.getmtime) if files else None
 
 
-def agent_rows(anchor):
+# ---------------------------------------------------------------------------------------------------------------
+# The orchestrator's own subagents and Workflow runs
+# ---------------------------------------------------------------------------------------------------------------
+
+WF_DONE_KEEP_MIN = 10  # a workflow without running agents stays registered this long (gaps between phases)
+WF_STALE_MIN = 30      # a run with no movement for this long was stopped
+
+
+def workflow_rows(reg, label, wdir):
+    """Rows for a Workflow run: one per running agent (journal 'started' without 'result'), finished ones briefly."""
+    try:
+        events = [json.loads(l) for l in open(os.path.join(wdir, "journal.jsonl"), encoding="utf-8") if l.strip()]
+        jage = (time.time() - os.path.getmtime(os.path.join(wdir, "journal.jsonl"))) / 60
+    except (OSError, ValueError):
+        return []
+    events = [e for e in events if isinstance(e, dict)]
+    started = {e["agentId"]: e.get("label") or "agent" for e in events
+               if e.get("type") == "started" and e.get("agentId")}
+    done = {e["agentId"] for e in events if e.get("type") == "result" and e.get("agentId")}
+    running = [a for a in started if a not in done]
+    # a stopped run (TaskStop, session end) never writes "result": when neither the journal nor any agent
+    # transcript moved for WF_STALE_MIN, the run is over — drop it instead of showing "still" forever
+    try:
+        newest = max(os.path.getmtime(f) for f in glob.glob(os.path.join(wdir, "*.jsonl")))
+    except ValueError:
+        newest = 0
+    if (running and (time.time() - newest) / 60 > WF_STALE_MIN) or (not running and jage > WF_DONE_KEEP_MIN):
+        try:
+            os.unlink(reg)
+        except OSError:
+            pass
+        return []
+    # all rows rank 2 and a shared sort key, so the run stays one block: header first, then its agents
+    rows = [(2, label, "▸", MAG, "", t("wf", r=len(running), d=len(done)), "", {"sort": label})]
+    for aid, alabel in started.items():
+        jsonl = os.path.join(wdir, f"agent-{aid}.jsonl")
+        try:
+            age = (time.time() - os.path.getmtime(jsonl)) / 60
+        except OSError:
+            continue
+        tail = f"{int(age)}m" if age >= 1 else ""
+        name = f"  {alabel}"[:40]
+        d = {"jsonl": jsonl, "sort": f"{label}\x01{alabel}"}
+        if aid in done:
+            if age <= AGENT_DONE_KEEP_MIN:
+                rows.append((2, name, "✓", GREEN, "", t("done"), "", d))
+        elif age >= STILL_MIN:
+            rows.append((2, name, "⚠", RED, "", f"{t('still')} {tail}", "", d))
+        else:
+            rows.append((2, name, "◆", MAG, "", last_action(jsonl) or t("working"), tail, d))
+    return rows
+
+
+def discover_workflows(anchor, agents):
+    """Register the anchor session's own Workflow runs without a hook (hooks load only at session start): the
+    Claude session id of the anchor pane leads to ~/.claude/projects/*/<session>/subagents/workflows/wf_*/."""
+    sess = ((agents.get(anchor) or {}).get("agent_session") or {}).get("value")
+    if not sess:
+        return
+    reg = os.path.join(CACHE, f"{anchor.replace(':', '_')}.agents")
+    for wdir in glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sess}/subagents/workflows/wf_*")):
+        wid = os.path.basename(wdir)
+        try:
+            if (time.time() - os.path.getmtime(os.path.join(wdir, "journal.jsonl"))) / 60 > WF_DONE_KEEP_MIN:
+                continue
+        except OSError:
+            continue
+        if os.path.exists(os.path.join(reg, wid)):
+            continue
+        scripts = glob.glob(os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(wdir))), "workflows",
+                                         "scripts", f"*-{wid}.js"))
+        name = os.path.basename(scripts[0])[:-len(f"-{wid}.js")] if scripts else wid
+        os.makedirs(reg, exist_ok=True)
+        with open(os.path.join(reg, wid), "w", encoding="utf-8") as f:
+            f.write(f"wf {name}"[:40] + f"\n{wdir}\n")
+
+
+def agent_rows(anchor, agents=None):
     rows = []
+    if agents is not None:
+        discover_workflows(anchor, agents)
     for reg in glob.glob(os.path.join(CACHE, f"{anchor.replace(':', '_')}.agents", "*")):
         try:
-            label, jsonl = open(reg).read().split("\n", 1)
+            label, jsonl = open(reg, encoding="utf-8").read().split("\n", 1)
             jsonl = jsonl.strip()
+            if os.path.isdir(jsonl):
+                rows += workflow_rows(reg, label, jsonl)
+                continue
             meta = json.load(open(jsonl[:-6] + ".meta.json")) if os.path.exists(jsonl[:-6] + ".meta.json") else {}
             meta = meta if isinstance(meta, dict) else {}
             age = (time.time() - os.path.getmtime(jsonl)) / 60
@@ -280,62 +427,521 @@ def agent_rows(anchor):
     return rows
 
 
-PR_STATE = {}           # (repo, n) -> (state, head sha, checked_at); GitHub is asked at most every PR_CHECK_S per PR
+# ---------------------------------------------------------------------------------------------------------------
+# GitHub (cached; every call degrades to "unknown" offline)
+# ---------------------------------------------------------------------------------------------------------------
+
+PR_STATE = {}           # key -> (state, head sha, checked_at); GitHub is asked at most every PR_CHECK_S per PR
 PR_CHECK_S = 45
+MAIN_HEAD = {}          # key -> (sha, checked_at)
+MAIN_CHECK_S = 60
+
+
+def slug_for(repo):
+    """"owner/name" for a short name, a bare name under HERD_BOARD_ORG or an owner/name; "" = let gh resolve it
+    from the worktree's git remote."""
+    v = REPOS.get(repo, repo or "")
+    return v if "/" in v else f"{ORG}/{v}" if v and ORG else ""
+
+
+def short_repo(repo):
+    name = str(repo or "").split("/")[-1]
+    return SHORT.get(name, name)
 
 
 def pr_state(repo, n, cwd=None):
     """(state, head sha) of a PR, cached PR_CHECK_S seconds. `repo` is "owner/name", a bare name under
     HERD_BOARD_ORG, or empty — then gh resolves the repo from the git remote of `cwd` (the worker's worktree)."""
-    slug = repo if "/" in repo else f"{ORG}/{repo}" if repo and ORG else ""
+    slug = repo if "/" in (repo or "") else f"{ORG}/{repo}" if repo and ORG else ""
     key = (slug or cwd or repo, n)
     st, head, at = PR_STATE.get(key, (None, None, 0))
     if time.time() - at < PR_CHECK_S:
         return st, head
-    if slug or cwd:
+    if slug or (cwd and os.path.isdir(cwd)):
         try:
             r = subprocess.run(["gh", "pr", "view", str(n), *(["-R", slug] if slug else []), "--json",
                                 "state,headRefOid", "-q", '.state + " " + .headRefOid'],
                                capture_output=True, text=True, timeout=8, cwd=None if slug else cwd)
-            st, head = (r.stdout.split() + [None, None])[:2] if r.stdout.strip() else (st, head)
+            st, head = (r.stdout.split() + [None, None])[:2] if r.returncode == 0 and r.stdout.strip() else (st, head)
         except Exception:
             pass
     PR_STATE[key] = (st, head, time.time())
     return st, head
 
 
-MERGED = {"at": 0, "day": "", "prs": {}}   # repo short -> sorted PR numbers merged today (org-wide), cached
-MERGED_CHECK_S = 120
+def main_head(slug, cwd=None):
+    """sha of the default branch head of `slug` (or of the repo behind `cwd`), cached MAIN_CHECK_S; None = unknown."""
+    key = slug or cwd
+    if not key:
+        return None
+    sha, at = MAIN_HEAD.get(key, (None, 0))
+    if time.time() - at < MAIN_CHECK_S:
+        return sha
+    if slug or (cwd and os.path.isdir(cwd)):
+        try:
+            r = subprocess.run(["gh", "api", f"repos/{slug or '{owner}/{repo}'}/commits/HEAD", "-q", ".sha"],
+                               capture_output=True, text=True, timeout=8, cwd=None if slug else cwd)
+            out = r.stdout.strip()
+            sha = out if r.returncode == 0 and re.fullmatch(r"[0-9a-f]{7,40}", out) else sha
+        except Exception:
+            pass
+    MAIN_HEAD[key] = (sha, time.time())
+    return sha
+
+
+MERGED = {"at": 0, "day": "", "prs": {}}   # repo short -> sorted PR numbers merged today, cached
+MERGED_CHECK_S = 300   # the search API has a tight secondary rate limit; several boards may poll it
 
 
 def merged_today():
-    """PRs of HERD_BOARD_ORG merged today, grouped by repo: {"api": [176, 177, …], "ui": [72, 73]}."""
-    if not ORG:
+    """PRs merged today under HERD_BOARD_ORG (plus HERD_BOARD_REPOS entries of other owners), by repo:
+    {"api": [176, 177, …], "ui": [72, 73]}."""
+    if not ORGS:
         return {}
     day = time.strftime("%Y-%m-%d")
     if MERGED["day"] == day and time.time() - MERGED["at"] < MERGED_CHECK_S:
         return MERGED["prs"]
-    try:
-        r = subprocess.run(["gh", "api", "-X", "GET", "search/issues", "-f",
-                            f"q=org:{ORG} is:pr is:merged merged:>={day}", "-f", "per_page=100", "--jq",
-                            '.items[] | "\\(.repository_url | split("/") | last) \\(.number)"'],
-                           capture_output=True, text=True, timeout=10)
+    # one search per owner: mixing org: and repo: qualifiers in one query returned only one of the two sets
+    queries = [f"org:{o}" for o in ORGS]
+    outside = [v for v in REPOS.values() if "/" in v and v.split("/")[0] not in ORGS]
+    if outside:
+        queries.append(" ".join(f"repo:{v}" for v in outside))
+    prs, ok = {}, False
+    for q in queries:
+        try:
+            r = subprocess.run(["gh", "api", "-X", "GET", "search/issues", "-f",
+                                f"q={q} is:pr is:merged merged:>={day}", "-f", "per_page=100", "--jq",
+                                '.items[] | "\\(.repository_url | split("/") | last) \\(.number)"'],
+                               capture_output=True, text=True, timeout=10)
+        except Exception:
+            continue
         if r.returncode == 0:
-            prs = {}
+            ok = True
             for line in r.stdout.split("\n"):
-                if line.strip():
-                    repo, n = line.split()
-                    prs.setdefault(SHORT.get(repo, repo), []).append(int(n))
-            MERGED.update(prs={k: sorted(v) for k, v in prs.items()}, day=day)
-    except Exception:
-        pass
+                parts = line.split()
+                if len(parts) == 2 and parts[1].isdigit():
+                    prs.setdefault(short_repo(parts[0]), []).append(int(parts[1]))
+    if ok:
+        # union with what was already seen today: the search index sometimes returns a partial list
+        if MERGED["day"] == day:
+            for k, v in MERGED["prs"].items():
+                prs.setdefault(k, []).extend(v)
+        MERGED.update(prs={k: sorted(set(v)) for k, v in prs.items()}, day=day)
     MERGED["at"] = time.time()
     return MERGED["prs"]
 
 
-def signoffs(herd, s):
-    """The orchestrator's sign-offs `<slice>.signoff` (or `.freigabe`): lines "<repo> #<n> <sha>" — the exact PR
-    head it accepted after review or re-check. Written by the orchestrator, never by the worker."""
+# ---------------------------------------------------------------------------------------------------------------
+# Computed facts from sibling tools: herd-limits (slots) and herd-clash (file overlap). Both optional.
+# ---------------------------------------------------------------------------------------------------------------
+
+TOOL_CACHE = {}         # (tool, herd) -> (at, value)
+LIMITS_CHECK_S = 15
+CLASH_CHECK_S = 30
+
+
+def find_tool(name):
+    """A sibling tool on PATH, else next to this script (with or without .sh/.py); None when absent."""
+    hit = shutil.which(name)
+    if hit:
+        return hit
+    for ext in ("", ".sh", ".py"):
+        p = os.path.join(HERE, name + ext)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _cached(key, ttl, fn):
+    at, val = TOOL_CACHE.get(key, (0, None))
+    if time.time() - at < ttl:
+        return val
+    val = fn()
+    TOOL_CACHE[key] = (time.time(), val)
+    return val
+
+
+def _limits_env(herd):
+    env = {}
+    for l in read_list(os.path.join(herd, "limits.env")) if herd else []:
+        m = re.match(r"(?:export\s+)?(HERD_\w+)=['\"]?([^'\"\s]*)", l)
+        if m:
+            env[m[1]] = m[2]
+    return env
+
+
+def parse_limits(text, rc, herd=None):
+    """herd-limits output -> {"used", "max", "review", "ok", "reason"} (reason: slot|memory|load|None).
+    Reads `herd-limits --json` (used/max/review/free_mb/min_free_mb/load/max_load/reasons) or its text line
+    `slots used/max (k review), free N MB (min M), load L (max X)` + `no slot: <reasons>`. Exit 2 (cannot measure)
+    is None. A refusal whose reason is not named is derived from the thresholds in the output, else from the
+    defaults of docs §4 (HERD_MIN_FREE_MB 8000, HERD_MAX_LOAD cores×2.5; env and <herd>/limits.env win)."""
+    if rc not in (0, 1):
+        return None
+    d = {}
+    try:
+        j = json.loads(text)
+        d = j if isinstance(j, dict) else {}
+    except ValueError:
+        pass
+    num = lambda v: float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else \
+        float(v) if isinstance(v, str) and re.fullmatch(r"\d+(?:\.\d+)?", v.strip()) else None
+    used = num(d.get("used", d.get("slots_used")))
+    mx = num(d.get("max", d.get("slots_max")))
+    review = num(d.get("review", d.get("review_slots")))
+    free_mb = num(d.get("free_mb"))
+    load = num(d.get("load"))
+    min_free, max_load = num(d.get("min_free_mb")), num(d.get("max_load"))
+    reasons = " ".join(str(r) for r in as_list(d.get("reasons"))) if d else \
+        (re.search(r"no slot:(.*)", text) or [None, ""])[1]
+    reason = d.get("reason") if d.get("reason") in ("slot", "memory", "load") else \
+        "slot" if re.search(r"slots? used", reasons) else "memory" if re.search(r"\bMB\b", reasons) else \
+        "load" if re.search(r"\bload\b", reasons) else None
+    if not d:
+        m = re.search(r"(\d+)\s*/\s*(\d+)", text)
+        used, mx = (float(m[1]), float(m[2])) if m else (None, None)
+        m = re.search(r"(\d+)\s*(?:review|Review)", text)
+        review = float(m[1]) if m else None
+        m = re.search(r"(\d+)\s*MB", text)
+        free_mb = float(m[1]) if m else None
+        m = re.search(r"\(min (\d+)\)", text)
+        min_free = float(m[1]) if m else None
+        m = re.search(r"\(max (\d+(?:\.\d+)?)\)", text)
+        max_load = float(m[1]) if m else None
+        m = re.search(r"(?:load|Last)\D{0,3}(\d+(?:\.\d+)?)", text)
+        load = float(m[1]) if m else None
+    if used is None or mx is None:
+        return None
+    ok = rc == 0
+    if not ok and not reason:
+        env = dict(_limits_env(herd), **{k: v for k, v in os.environ.items() if k.startswith("HERD_")})
+        val = lambda k, dflt: num(env.get(k)) if num(env.get(k)) is not None else dflt
+        min_free = min_free if min_free is not None else val("HERD_MIN_FREE_MB", 8000)
+        max_load = max_load if max_load is not None else val("HERD_MAX_LOAD", (os.cpu_count() or 1) * 2.5)
+        reason = "slot" if used >= mx else "memory" if free_mb is not None and free_mb < min_free else \
+            "load" if load is not None and load >= max_load else "slot"
+    return {"used": int(used), "max": int(mx), "review": None if review is None else int(review), "ok": ok,
+            "reason": None if ok else reason}
+
+
+def herd_limits(herd, anchor=""):
+    """`herd-limits <herd> --json [--anchor A]`, cached LIMITS_CHECK_S; None when absent or unmeasurable."""
+    tool = find_tool("herd-limits")
+    if not tool:
+        return None
+
+    def ask():
+        try:
+            r = subprocess.run([tool, *([herd] if herd else []), "--json", *(["--anchor", anchor] if anchor else [])],
+                               capture_output=True, text=True, timeout=8)
+        except Exception:
+            return None
+        return parse_limits(r.stdout or "", r.returncode, herd)
+    return _cached(("limits", herd), LIMITS_CHECK_S, ask)
+
+
+def parse_clash(data):
+    """herd-clash --json -> {slice: {other slices}}. Reads its `pairs` list ({"repo", "slices": [a, b], "files"});
+    without one, any nested {"slices": [a, b, ...]} or {"a": .., "b": ..} object counts (anything else is ignored)."""
+    pairs = []
+    if isinstance(data, dict) and isinstance(data.get("pairs"), list):
+        data = data["pairs"]
+
+    def walk(x):
+        if isinstance(x, dict):
+            sl = x.get("slices", x.get("pair"))
+            if isinstance(sl, list) and len([s for s in sl if isinstance(s, str)]) >= 2:
+                pairs.append([s for s in sl if isinstance(s, str)])
+            elif isinstance(x.get("a"), str) and isinstance(x.get("b"), str):
+                pairs.append([x["a"], x["b"]])
+            for v in x.values():
+                if isinstance(v, (dict, list)):
+                    walk(v)
+        elif isinstance(x, list):
+            for v in x:
+                walk(v)
+    walk(data)
+    out = {}
+    for p in pairs:
+        for s in p:
+            out.setdefault(s, set()).update(o for o in p if o != s)
+    return out
+
+
+def herd_clash(herd):
+    tool = find_tool("herd-clash")
+    if not tool:
+        return {}  # skipped: the tool is not installed
+
+    def ask():
+        try:
+            r = subprocess.run([tool, herd, "--json"], capture_output=True, text=True, timeout=10)
+            return parse_clash(json.loads(r.stdout)) if r.returncode == 0 and r.stdout.strip() else {}
+        except Exception:
+            return {}
+    return _cached(("clash", herd), CLASH_CHECK_S, ask) or {}
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# v2 herds: lanes from herd_events.state() plus computed states
+# ---------------------------------------------------------------------------------------------------------------
+
+READYISH = ("accepted", "review_running", "review_ok", "review_befund")
+AT_LEAST_ACCEPTED = READYISH + ("merged",)
+PR_REF = re.compile(r"^\s*([\w./-]+?)\s*#\s*(\d+)(?:\s*@\s*([0-9a-f]{7,40}))?\s*$")
+MAIN_REF = re.compile(r"^\s*([\w./-]+?)\s*@\s*([0-9a-f]{7,40})\s*$")
+
+
+def model_tag(model, effort):
+    """`O·hi` from model claude-opus-5-5 and effort high; empty when the event names neither."""
+    m = str(model or "").lower()
+    letter = next((v for k, v in (("opus", "O"), ("fable", "F"), ("sonnet", "S"), ("haiku", "H"), ("gpt", "G"),
+                                  ("codex", "X")) if k in m), (re.sub(r"[^a-z]", "", m)[:1] or "").upper())
+    e = str(effort or "").lower()
+    eff = {"low": "lo", "medium": "md", "high": "hi", "xhigh": "xh", "max": "mx"}.get(e, e[:2])
+    return "·".join(x for x in (letter, eff) if x)
+
+
+def ts_epoch(ts):
+    try:
+        return calendar.timegm(time.strptime(str(ts)[:19], "%Y-%m-%dT%H:%M:%S"))
+    except ValueError:
+        return None
+
+
+def cwd_for(wts, repo=""):
+    """The slice worktree that belongs to `repo` (its path names the repo), else the first existing one."""
+    paths = [os.path.expanduser(str(w)) for w in wts]
+    name = str(repo or "").split("/")[-1]
+    full = REPOS.get(name, name).split("/")[-1] if name else ""
+    for p in paths:
+        if full and f"/{full}/" in p + "/" and os.path.isdir(p):
+            return p
+    return next((p for p in paths if os.path.isdir(p)), None)
+
+
+def stale_of(ev, wts, merged_evs, package_members):
+    """Why a review_ok is stale (computed, docs §1), or "": a PR head moved off the reviewed sha, the repo's main moved
+    off the recorded sha, or a `merged` event of another package on a covered repo landed after the review."""
+    covered = set()
+    for ref in as_list(ev.get("prs")):
+        m = PR_REF.match(str(ref))
+        if not m:
+            continue
+        covered.add(short_repo(m[1]))
+        if not m[3]:
+            continue
+        state, head = pr_state(slug_for(m[1]), int(m[2]), cwd_for(wts, m[1]))
+        if head and state in (None, "OPEN") and not (head.startswith(m[3]) or m[3].startswith(head)):
+            return t("stale_head", ref=f"{short_repo(m[1])}#{m[2]}")
+    recorded = set()
+    for ref in as_list(ev.get("main")):
+        m = MAIN_REF.match(str(ref))
+        if not m:
+            continue
+        recorded.add(short_repo(m[1]))
+        cur = main_head(slug_for(m[1]), cwd_for(wts, m[1]))
+        if cur and not (cur.startswith(m[2]) or m[2].startswith(cur)):
+            return t("stale_main", repo=short_repo(m[1]))
+    # a review_ok without a main sha for a covered repo (herd-recover's migrated v1 sign-off) cannot be merged:
+    # herd-merge refuses it, so it needs a re-probe, never the merge word
+    for repo in sorted(covered - recorded):
+        return t("stale_nomain", repo=repo)
+    covered |= recorded
+    for mev in merged_evs:
+        if mev.get("slice") in package_members or str(mev.get("ts", "")) <= str(ev.get("ts", "")):
+            continue
+        for ref in as_list(mev.get("prs")):
+            m = PR_REF.match(str(ref))
+            if m and short_repo(m[1]) in covered:
+                return t("stale_main", repo=short_repo(m[1]))
+    return ""
+
+
+def pr_refs(ev):
+    """`api#210@6cb1f80` short refs of an event's prs field."""
+    out = []
+    for ref in as_list(ev.get("prs")):
+        m = PR_REF.match(str(ref))
+        if m:
+            out.append(f"{short_repo(m[1])}#{m[2]}" + (f"@{m[3][:7]}" if m[3] else ""))
+    return out
+
+
+def limits_reason(limits):
+    if not limits or limits.get("ok"):
+        return ""
+    return {"memory": t("w_mem"), "load": t("w_load")}.get(limits.get("reason"), t("w_slot"))
+
+
+def v2_rows(herd, agents, limits, merged_evs, lanes):
+    """Rows of one v2 herd into lanes {"needs", "queue", "work", "ready"}. Row = (rank, name, icon, colour, n/m, text,
+    tail, detail). Returns the herd's state, so the caller does not read the file again."""
+    st = he.state(herd)
+    lastwork, hdrs = {}, {}
+    for ev in he.read(herd):
+        if ev["phase"] == "working":
+            lastwork[ev["slice"]] = ev
+
+    def hdr(s):
+        if s not in hdrs:
+            try:
+                hdrs[s] = he.task_header(herd, s)
+            except (OSError, ValueError):
+                hdrs[s] = {}
+        return hdrs[s]
+
+    def tag(s):
+        w = lastwork.get(s) or {}
+        return model_tag(w.get("model") or hdr(s).get("model"), w.get("effort") or hdr(s).get("effort"))
+
+    def tail(*parts):
+        return " ".join(p for p in parts if p)
+
+    def phase(s):
+        return (st.get(s) or {}).get("phase")
+
+    clash = herd_clash(herd)
+    live = {s for s, ev in st.items() if ev["phase"] not in ("merged", "parked")}
+    clash_of = lambda *ss: ", ".join(sorted({o for s in ss for o in clash.get(s, ()) if o in live and o not in ss}))
+
+    # 2. queue: fix_queued first (by time), then queued by `pos`, queue.txt order, time
+    qtxt = read_list(os.path.join(herd, "queue.txt"))
+    qidx = lambda s: qtxt.index(s) if s in qtxt else 10 ** 6
+    pos_of = lambda ev: ev.get("pos") if isinstance(ev.get("pos"), int) and not isinstance(ev.get("pos"), bool) \
+        else 10 ** 6
+    fixq = sorted((s for s, ev in st.items() if ev["phase"] == "fix_queued"), key=lambda s: str(st[s].get("ts", "")))
+    qd = sorted((s for s, ev in st.items() if ev["phase"] == "queued"),
+                key=lambda s: (pos_of(st[s]), qidx(s), str(st[s].get("ts", "")), s))
+    for i, s in enumerate(fixq + qd):
+        base = hdr(s).get("stacked_on") or ""
+        why = t("w_base_q", b=base) if base and phase(base) not in AT_LEAST_ACCEPTED else limits_reason(limits)
+        d = {"clash": clash_of(s)}
+        if s in fixq:
+            text = t("fix_queued", pos=i + 1)
+            row = (i, s, "!", ORANGE, "", text + (f" · {why}" if why else ""), tag(s), d)
+        else:
+            row = (i, s, "◌", DIM, "", t("queued", pos=i + 1) + (f" · {why}" if why else ""), tag(s), d)
+        lanes["queue"].append(row)
+
+    # 3. working (+ computed reported / still / gone; blocked goes to "needs you")
+    for s, ev in st.items():
+        if ev["phase"] != "working":
+            continue
+        pane = ev.get("pane") if isinstance(ev.get("pane"), str) else ""
+        a = agents.get(pane) if pane else None
+        wts = as_list(ev.get("wt"))
+        report = os.path.exists(os.path.join(herd, f"{s}.out.md"))
+        stj = read_status(os.path.join(herd, f"{s}.status.json"))
+        acts = procs_in(s, [str(w) for w in wts])
+        t_age = transcript_age(a["cwd"]) if a and a.get("cwd") else None
+        age = f"{int(t_age)}m" if t_age is not None and t_age >= 1 else ""
+        n, m = field(stj, "step", "schritt"), field(stj, "of", "von")
+        prog = f"{n}/{m}" if isinstance(n, int) and isinstance(m, int) else ""
+        since = ts_epoch(ev.get("since"))
+        fresh = since is not None and time.time() - since < START_GRACE_S
+        status = (a or {}).get("agent_status")
+        d = {"satz": field(stj, "sentence", "satz") or "", "fehlt": field(stj, "missing", "fehlt") or "", "n": n,
+             "m": m, "acts": acts, "jsonl": newest_jsonl(a["cwd"]) if a and a.get("cwd") else None,
+             "clash": clash_of(s)}
+        if status == "blocked":
+            lanes["needs"].append((1, s, "?", YEL, "", t("needs_answer"), tail(age, tag(s)), {"clash": d["clash"]}))
+            continue
+        if report and (not a or status in ("idle", "done")) and not acts:
+            pr = stj.get("pr") or ""
+            row = (1, s, "✓", GREEN, "", (f"{pr} · " if pr else "") + t("checking"), tail(age, tag(s)),
+                   dict(d, thin=True, satz="", fehlt="", n=None, m=None))
+        elif not a:
+            row = (2, s, "●", CYAN, prog, t("starting"), tag(s), d) if fresh else \
+                (0, s, "✕", RED, "", t("ended"), tag(s), d)
+        elif not acts and status != "working" and t_age is not None and t_age >= STILL_MIN:
+            row = (0, s, "⚠", RED, "", f"{t('still')} {age}", tag(s), d)
+        else:
+            busy = acts[0][0] if acts else ""
+            fix_round = "fix_queued" in ev.get("history", [])
+            icon, col = ("⧗", CYAN) if busy in LONG_RUNS else ("↺", ORANGE) if fix_round else ("●", CYAN)
+            row = (2, s, icon, col, prog, kurz(stj) or busy or t("working"), tail(age, tag(s)), d)
+        lanes["work"].append(row)
+
+    # 4. packages: one row per package with any member past `accepted`; reviewed on current heads -> "needs you"
+    done = set()
+    for s in sorted(st):
+        if phase(s) not in READYISH:
+            continue
+        try:
+            members = he.package(herd, s)
+        except (OSError, ValueError):
+            members = [s]
+        if s not in members:
+            members = sorted(set(members) | {s})
+        if tuple(members) in done:
+            continue
+        done.add(tuple(members))
+        name = "+".join(members)
+        ph = {m: phase(m) for m in members}
+        waiting = [m for m in members if ph[m] not in AT_LEAST_ACCEPTED]
+        wts = [w for m in members for w in as_list((lastwork.get(m) or {}).get("wt"))]
+        stale = {m: stale_of(st[m], wts, merged_evs, members) for m in members if ph[m] == "review_ok"}
+        refs = [r for m in members if ph[m] in ("review_ok", "review_befund", "accepted", "review_running")
+                for r in pr_refs(st[m])]
+        tags = tail(*dict.fromkeys(tag(m) for m in members if tag(m)))
+        d = {"clash": clash_of(*members)}
+        reviewed = [m for m in members if ph[m] == "review_ok"]
+        # herd-merge refuses while a stacked_on base outside the package is not merged: no merge word before that
+        ext_bases = sorted({hdr(m).get("stacked_on") for m in members if hdr(m).get("stacked_on")
+                            and hdr(m)["stacked_on"] not in members and phase(hdr(m)["stacked_on"]) != "merged"})
+        if not waiting and not ext_bases and reviewed and all(ph[m] in ("review_ok", "merged") for m in members) \
+                and not any(stale.values()):
+            word = f"merge {members[0]}"
+            text = t("word", w=word) + (" · " + " ".join(refs) if refs else "")
+            lanes["needs"].append((0, name, "✓✓", GREEN, "", text, tags, dict(d, bold=True)))
+            continue
+        if any(ph[m] == "review_befund" for m in members):
+            files = [os.path.basename(str(st[m].get("befunde_file") or "")) for m in members
+                     if ph[m] == "review_befund" and st[m].get("befunde_file")]
+            row = (0, name, "!", ORANGE, "", t("befund") + (": " + ", ".join(files) if files else ""), tags, d)
+        elif any(stale.values()):
+            why = next(v for v in stale.values() if v)
+            row = (1, name, "⟳", YEL, "", f"{t('stale')}: {why}", tags, d)
+        elif any(ph[m] == "review_running" for m in members):
+            rnd = next((st[m].get("round") for m in members if ph[m] == "review_running"), None)
+            rnd = rnd if isinstance(rnd, int) and not isinstance(rnd, bool) else \
+                int(rnd) if isinstance(rnd, str) and rnd.strip().isdigit() else "?"
+            row = (2, name, "…", MAG, "", t("review_round", n=rnd) + (" · " + " ".join(refs) if refs else ""), tags, d)
+        elif any(ph[m] == "accepted" for m in members):
+            bases = [hdr(m).get("stacked_on") for m in members if ph[m] == "accepted" and hdr(m).get("stacked_on")]
+            bases = [b for b in bases if b not in members and phase(b) not in ("review_ok", "merged")]
+            why = t("w_partner", x=", ".join(waiting)) if waiting else t("w_base", b=", ".join(bases)) if bases \
+                else limits_reason(limits) or t("review_due")
+            text = f"{t('accepted')} · {why}" + (" · " + " ".join(refs) if refs else "")
+            row = (3, name, "◇", DIM, "", text, tags, d)
+        else:  # reviewed, but a partner is not there yet or the base outside the package is not merged
+            why = t("w_partner", x=", ".join(waiting)) if waiting else t("w_base", b=", ".join(ext_bases))
+            row = (4, name, "✓", GREEN, "", f"{t('reviewed')} " + " ".join(refs) + " · " + why, tags, d)
+        lanes["ready"].append(row)
+    return st
+
+
+def merged_from_events(evs):
+    """{short repo: [n, ...]} of `merged` events with a local date of today."""
+    today, out = time.strftime("%Y-%m-%d"), {}
+    for ev in evs:
+        e = ts_epoch(ev.get("ts"))
+        if ev.get("phase") != "merged" or e is None or time.strftime("%Y-%m-%d", time.localtime(e)) != today:
+            continue
+        for ref in as_list(ev.get("prs")):
+            m = PR_REF.match(str(ref))
+            if m:
+                out.setdefault(short_repo(m[1]), []).append(int(m[2]))
+    return out
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# v1 herds (herd.map, no events): the pre-v2 board, kept only until herd-recover migrates the dir
+# ---------------------------------------------------------------------------------------------------------------
+
+def v1_signoffs(herd, s):
+    """v1 only: the orchestrator's sign-offs `<slice>.signoff`/`.freigabe`, lines "<repo> #<n> <sha>"."""
     out = {}
     for ext in ("signoff", "freigabe"):
         for l in read_list(os.path.join(herd, f"{s}.{ext}")):
@@ -345,81 +951,83 @@ def signoffs(herd, s):
     return out
 
 
-def ready_prs(herds, agents):
-    """Open PRs of workers that are done (report written, not working any more): (short repo, n, slice, review)."""
+def v1_ready_prs(herd, agents):
+    """v1 only: open PRs of workers that are done (report written, not working any more):
+    (short repo, n, slice, review)."""
     out = []
-    for herd in herds:
-        for s, pane in (l.split("=", 1) for l in read_list(os.path.join(herd, "herd.map")) if "=" in l):
-            rep = os.path.join(herd, f"{s}.out.md")
-            a = agents.get(pane)
-            if not os.path.exists(rep) or (a and a["agent_status"] == "working"):
+    for s, pane in (l.split("=", 1) for l in read_list(os.path.join(herd, "herd.map")) if "=" in l):
+        a = agents.get(pane)
+        if not os.path.exists(os.path.join(herd, f"{s}.out.md")) or (a and a.get("agent_status") == "working"):
+            continue
+        pr = read_status(os.path.join(herd, f"{s}.status.json")).get("pr") or ""
+        wts = glob.glob(os.path.expanduser(f"~/.herdr/worktrees/*/{s}"))
+        wt = a.get("cwd") if a else (wts[0] if wts else None)
+        home = os.path.basename(os.path.dirname(wt)) if wt else ""
+        refs = []  # (repo for gh — "" = the worker's own repo, name shown on the board, n)
+        for m in re.finditer(r"(?:\b([a-z][\w-]*)\s+)?(?:PR\s*)?#(\d+)", pr, re.I):
+            short = (m[1] or "").lower()
+            repo = REPOS.get(short) or (short if short in SHORT else "")
+            refs.append((repo, SHORT.get(repo.split("/")[-1], repo) or SHORT.get(home, home), int(m[2])))
+        for m in re.finditer(r"github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)", pr):
+            name = m[1].split("/")[1]
+            refs.append((m[1], SHORT.get(name, name), int(m[2])))
+        ok = v1_signoffs(herd, s)
+        for repo, shown, n in dict.fromkeys(refs):
+            state, head = pr_state(repo, n, wt)
+            if state not in (None, "OPEN"):
                 continue
-            pr = read_status(os.path.join(herd, f"{s}.status.json")).get("pr") or ""
-            wts = glob.glob(os.path.expanduser(f"~/.herdr/worktrees/*/{s}"))
-            wt = a["cwd"] if a else (wts[0] if wts else None)
-            home = os.path.basename(os.path.dirname(wt)) if wt else ""
-            refs = []  # (repo for gh — "" = the worker's own repo, name shown on the board, n)
-            for m in re.finditer(r"(?:\b([a-z][\w-]*)\s+)?(?:PR\s*)?#(\d+)", pr, re.I):
-                short = (m[1] or "").lower()
-                repo = REPOS.get(short) or (short if short in SHORT else "")
-                refs.append((repo, SHORT.get(repo, repo) or SHORT.get(home, home), int(m[2])))
-            for m in re.finditer(r"github\.com/([\w.-]+/[\w.-]+)/pull/(\d+)", pr):
-                name = m[1].split("/")[1]
-                refs.append((m[1], SHORT.get(name, name), int(m[2])))
-            rv = os.path.join(herd, f"{s}.review.md")
-            ok = signoffs(herd, s)
-            for repo, shown, n in dict.fromkeys(refs):
-                state, head = pr_state(repo, n, wt)
-                if state not in (None, "OPEN"):
-                    continue
-                signed = ok.get((shown.lower(), n)) or ok.get((repo.lower(), n)) or ok.get(("pr", n))
-                # sign-off on exactly this head beats any file-time guess; a newer push voids it
-                review = "ok" if signed and head and head.startswith(signed) else \
-                    "alt" if signed or os.path.exists(rv) else ""
-                out.append((shown, n, s, review))
+            signed = ok.get((shown.lower(), n)) or ok.get((repo.lower(), n)) or ok.get(("pr", n))
+            review = "ok" if signed and head and head.startswith(signed) else \
+                "alt" if signed or os.path.exists(os.path.join(herd, f"{s}.review.md")) else ""
+            out.append((shown, n, s, review))
     return out
 
 
-def herd_rows(herd, agents):
+def v1_rows(herd, agents, lanes):
     pairs = [l.split("=", 1) for l in read_list(os.path.join(herd, "herd.map")) if "=" in l]
     queue = read_list(os.path.join(herd, "queue.txt"))
-    rows = []
     for s, pane in pairs:
         a = agents.get(pane)
-        if not a and s not in queue and os.path.exists(os.path.join(herd, f"{s}.out.md")):
+        report = os.path.exists(os.path.join(herd, f"{s}.out.md"))
+        if not a and s not in queue and report:
             continue  # report written and window closed: finished, nothing left to look at
         st = read_status(os.path.join(herd, f"{s}.status.json"))
-        report = os.path.exists(os.path.join(herd, f"{s}.out.md"))
         acts = procs_in(s)
-        t_age = transcript_age(a["cwd"]) if a else None
+        t_age = transcript_age(a["cwd"]) if a and a.get("cwd") else None
         age = f"{int(t_age)}m" if t_age is not None and t_age >= 1 else ""
         n, m = field(st, "step", "schritt"), field(st, "of", "von")
         prog = f"{n}/{m}" if isinstance(n, int) and isinstance(m, int) else ""
-        text = kurz(st)
-        # (sort key, icon, colour, text) — what needs me first, then running, then waiting
-        if report and (not a or a["agent_status"] in ("idle", "done")) and not acts:
-            row = (1, "✓", GREEN, st.get("pr") or t("done"), t("check"))
-        elif a and a["agent_status"] == "blocked":
-            row = (0, "?", YEL, t("needs_answer"), "")
+        status = (a or {}).get("agent_status")
+        d = {"satz": field(st, "sentence", "satz") or "", "fehlt": field(st, "missing", "fehlt") or "", "n": n, "m": m,
+             "acts": acts, "jsonl": newest_jsonl(a["cwd"]) if a and a.get("cwd") else None}
+        if report and (not a or status in ("idle", "done")) and not acts:
+            lanes["work"].append((1, s, "✓", GREEN, "", st.get("pr") or t("done"), t("check"), d))
+        elif status == "blocked":
+            lanes["needs"].append((1, s, "?", YEL, "", t("needs_answer"), "", {}))
         elif s in queue:
             pos = queue.index(s) + 1
-            row = (4 + pos / 100, "◌", DIM, t("paused", pos=pos) if st else t("waiting", pos=pos), "")
+            lanes["queue"].append((100 + pos, s, "◌", DIM, "", t("paused", pos=pos) if st else t("waiting", pos=pos),
+                                   "", {}))
         elif not a:
-            row = (0, "✕", RED, t("ended"), "")
-        elif not acts and a["agent_status"] != "working" and t_age is not None and t_age >= STILL_MIN:
-            row = (0, "⚠", RED, f"{t('still')} {age}", "")
+            lanes["work"].append((0, s, "✕", RED, "", t("ended"), "", d))
+        elif not acts and status != "working" and t_age is not None and t_age >= STILL_MIN:
+            lanes["work"].append((0, s, "⚠", RED, "", f"{t('still')} {age}", "", d))
         else:
             busy = acts[0][0] if acts else ""
-            icon = "⧗" if busy in LONG_RUNS else "●"
-            row = (2, icon, CYAN, text or busy or t("working"), age)
-        detail = {"satz": field(st, "sentence", "satz") or "", "fehlt": field(st, "missing", "fehlt") or "", "n": n, "m": m, "acts": acts,
-                  "jsonl": newest_jsonl(a["cwd"]) if a else None}
-        rows.append((row[0], s, row[1], row[2], prog, row[3], row[4], detail))
-    return rows
+            lanes["work"].append((2, s, "⧗" if busy in LONG_RUNS else "●", CYAN, prog, kurz(st) or busy or t("working"),
+                                  age, d))
+    look = {"ok": ("✓", GREEN, t("signed")), "alt": ("…", YEL, t("in_review")), "": ("◇", DIM, t("no_review"))}
+    for repo, n, s, review in v1_ready_prs(herd, agents):
+        icon, col, words = look[review]
+        lanes["ready"].append((10, s, icon, col, "", f"{(repo + ' ') if repo else ''}#{n} {words}", "", {}))
 
+
+# ---------------------------------------------------------------------------------------------------------------
+# Drawing
+# ---------------------------------------------------------------------------------------------------------------
 
 def bar(n, m, width=10, col=""):
-    k = round(width * n / m) if m else 0
+    k = max(0, min(width, round(width * n / m))) if m else 0
     return f"{col}{'█' * k}{RST}{DIM}{'░' * (width - k)}{RST} {BLUE}{n}/{m}{RST}"
 
 
@@ -435,16 +1043,16 @@ def wrap(text, width, maxlines):
     lines = w(text)
     if maxlines <= 0 or len(lines) <= maxlines:
         return lines[:max(0, maxlines)]
-    cuts = [m.start() for m in re.finditer(r"[,;.:](?=\s)|\s[–—]\s", text)]
+    cuts = [m.start() for m in re.finditer(r"[,;.:·](?=\s)|\s[–—·]\s", text)]
     for c in reversed(cuts):
-        part = w(text[:c].rstrip(" ,;:–—"))
+        part = w(text[:c].rstrip(" ,;:–—·"))
         if part and len(part) <= maxlines:
             return part
     return lines[:maxlines]
 
 
 def first_sentence(text):
-    """A worker's reply shortened to its first sentence (or clause before a colon) — the feed shows the gist, not the prose."""
+    """A worker's reply shortened to its first sentence (or clause before a colon) — the feed shows the gist."""
     m = re.match(r"(.+?[.!?:])(\s|$)", text)
     return (m.group(1) if m else text).rstrip(":")
 
@@ -455,7 +1063,8 @@ def detail_lines(row, budget, w):
     tw = w - 2
     lines = []
     label = t("missing")
-    fehlt = (label + " " + re.sub(r"^(?:blocked|blockiert):\s*", t("blocked") + ", ", d["fehlt"])) if d.get("fehlt") else ""
+    fehlt = (label + " " + re.sub(r"^(?:blocked|blockiert):\s*", t("blocked") + ", ", d["fehlt"])) \
+        if d.get("fehlt") else ""
     # what is still missing is all yellow (label bold), so it never reads like the goal above it
     fehlt_paint = lambda l: (f"{BOLD}{YEL}{label}{RST}" + paint(l[len(label):], YEL)) if l.startswith(label + " ") \
         else paint(l, YEL)
@@ -488,7 +1097,7 @@ def detail_lines(row, budget, w):
             # then to its first clause, and is left out if even that is too long
             if text.startswith("› "):
                 full = [first_sentence(text[2:]), re.split(r"[,;–—(]", text[2:])[0]]
-                part = next((p for p in (wrap("› " + t, tw - 5, 3) for t in full) if len(p) <= 2), [])
+                part = next((p for p in (wrap("› " + x, tw - 5, 3) for x in full) if len(p) <= 2), [])
                 if not part:
                     continue
             else:
@@ -512,83 +1121,237 @@ def detail_lines(row, budget, w):
     return [f"  {l}" for l in lines]
 
 
+def head_lines(row, w, cont_max, show_prog=True):
+    """A row's heading: icon and name in the state colour (name bold unless `thin`), ⇄ clash, the state text in plain
+    text after it (continued on up to `cont_max` lines), and the dim tail (age, model·effort) at the end."""
+    _, s, icon, col, prog, text, tail, d = row
+    prog = prog if show_prog else ""
+    name = s[:max(8, w - 8)]  # full name; only an absurdly long label is clipped
+    mark = f"⇄ {d['clash']}" if d.get("clash") else ""
+    weight = "" if d.get("thin") else BOLD
+    left = f"{weight}{col}{icon}{RST} {weight}{col}{name}{RST} " + (f"{BLUE}{prog}{RST} " if prog else "") + \
+        (f"{YEL}{mark}{RST} " if mark else "")
+    room = w - len(icon) - len(name) - 2 - (len(prog) + 1 if prog else 0) - (len(mark) + 1 if mark else 0) - \
+        (len(tail) + 1 if tail else 0)
+    base = f"{BOLD}{col}" if d.get("bold") else ""
+    # the state text follows the name when it has room, otherwise it starts on its own line
+    first = (wrap(text, room, 1) or [""])[0] if room >= 14 and text else ""
+    first = first if len(first) <= room else ""
+    rest = " ".join(text.split()[len(first.split()):])
+    out = [left + paint(first, base) + (f" {DIM}{tail}{RST}" if tail else "")]
+    out += [f"  {paint(l, base)}" for l in (wrap(rest, w - 2, cont_max) if rest and cont_max > 0 else [])]
+    return out
+
+
+def fit(blocks, limit):
+    """Rows (each a list of lines) into at most `limit` lines; what does not fit becomes one "+N more" line."""
+    if sum(len(b) for b in blocks) <= limit:
+        return [l for b in blocks for l in b]
+    if limit < 1:
+        return []
+    out, shown = [], 0
+    for b in blocks:
+        if len(out) + len(b) > limit - 1:  # keep one line for the overflow count
+            break
+        out += b
+        shown += 1
+    return out + [f"{DIM}+{len(blocks) - shown} {t('more')}{RST}"]
+
+
 def herd_dirs(anchor, given):
     listed = read_list(os.path.join(CACHE, f"{anchor.replace(':', '_')}.herds")) if anchor else []
     return list(dict.fromkeys(given + listed))
 
 
-def render(anchor, given):
-    w = max(20, shutil.get_terminal_size((66, 40)).columns - 1)
-    agents = herdr_agents()
-    rows = [r for h in herd_dirs(anchor, given) for r in herd_rows(h, agents)]
-    rows += agent_rows(anchor) if anchor else []
-    l1 = float(open("/proc/loadavg").read().split()[0])
-    mem = next(int(x.split()[1]) / 1048576 for x in open("/proc/meminfo") if x.startswith("MemAvailable"))
-    cores = os.cpu_count() or 1
+_HUMAN_CACHE = {}
+
+
+def last_human_input(anchor, agents):
+    """Epoch of the last message a human typed into the anchor's Claude session (typed prompt or a message queued
+    mid-turn), or None. Task notifications, peer messages and scheduled wakeups do not count."""
+    sess = ((agents.get(anchor) or {}).get("agent_session") or {}).get("value")
+    paths = glob.glob(os.path.expanduser(f"~/.claude/projects/*/{sess}.jsonl")) if sess else []
+    if not paths:
+        return None
+    path = paths[0]
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return None
+    hit = _HUMAN_CACHE.get(path)
+    if hit and hit[0] == size:
+        return hit[1]
+    start = hit[0] if hit else max(0, size - 4_000_000)
+    found = hit[1] if hit else None
+    while True:
+        with open(path, "rb") as f:
+            f.seek(start)
+            chunk = f.read(size - start).decode("utf-8", "replace")
+        for line in chunk.split("\n")[1 if start else 0:]:
+            if '"human"' not in line:
+                continue
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            att = d.get("attachment") or {}
+            human = (d.get("type") == "user" and (d.get("origin") or {}).get("kind") == "human") or \
+                (att.get("type") == "queued_command" and (att.get("origin") or {}).get("kind") == "human")
+            if human and d.get("timestamp"):
+                e = ts_epoch(d["timestamp"])
+                if e:
+                    found = max(found or 0, e)
+        if found or start == 0 or hit:
+            break
+        start = 0  # nothing in the tail: read the whole transcript once
+    _HUMAN_CACHE[path] = (size, found)
+    return found
+
+
+def machine():
+    """(load1, free RAM GB, cores)."""
+    try:
+        l1 = float(open("/proc/loadavg").read().split()[0])
+        mem = next(int(x.split()[1]) / 1048576 for x in open("/proc/meminfo") if x.startswith("MemAvailable"))
+    except (OSError, ValueError, StopIteration):
+        l1, mem = 0.0, 99.0
+    return l1, mem, os.cpu_count() or 1
+
+
+def header(w, herds, needs, limits, reviews, quiet):
+    """One line, whatever the width: drop words until it fits."""
+    l1, mem, cores = machine()
     warn = mem < 2.5 or l1 > 2 * cores
     mcol = GREEN if mem >= 5 else YEL
-    head = f"{BOLD}{CYAN}{t('title')}{RST} {DIM}{time.strftime('%H:%M')}{RST}  " + \
-        (f"{RED}⚠ {t('load')} {l1:.0f} · {mem:.1f} {t('free')}{RST}" if warn else f"{mcol}{mem:.0f} {t('free')}{RST}")
+    path = os.environ.get("HERD_BOARD_DISK") or (herds[0] if herds and os.path.isdir(herds[0]) else os.getcwd())
+    try:
+        disk = shutil.disk_usage(path).free / 1e9
+    except OSError:
+        disk = None
+    dcol = RED if disk is not None and disk < 8 else YEL if disk is not None and disk < 15 else GREEN
+    k = limits.get("review") if limits and limits.get("review") is not None else reviews
+    # (RAM label, disk label, input label, separator, slots key, you key, space before the unit)
+    variants = ((t("ram"), t("disk"), t("input"), " · ", "slots", "you", " "),
+                (t("ram_s"), t("disk_s"), t("input"), " · ", "slots", "you", ""),
+                (t("ram_s"), t("disk_s"), t("input"), "·", "slots_s", "you_s", ""),
+                ("G", "G", "✎", "·", "slots_s", "you_s", ""))
+    head = ""
+    for ram_l, disk_l, quiet_l, sep, slots_k, you_k, sp in variants:
+        parts = [f"{BOLD}{CYAN}{t('title')}{RST} {DIM}{time.strftime('%H:%M')}{RST}"]
+        parts.append(f"{BOLD}{RED}{t(you_k, n=needs)}{RST}" if needs else f"{DIM}{t(you_k, n=needs)}{RST}")
+        if limits:
+            full = limits["used"] >= limits["max"] or not limits.get("ok", True)
+            parts.append(f"{YEL if full else BLUE}{t(slots_k, u=limits['used'], m=limits['max'], k=k)}{RST}")
+        ram = f"{RED}⚠{l1:.0f} {mem:.1f}{sp}{ram_l}{RST}" if warn else f"{mcol}{mem:.0f}{sp}{ram_l}{RST}"
+        tail = [ram] + ([f"{dcol}{disk:.0f}{sp}{disk_l}{RST}"] if disk is not None else []) + \
+            ([f"{YEL}{quiet_l}{quiet}{RST}"] if quiet else [])
+        head = " ".join(parts) + " " + f"{DIM}{sep}{RST}".join(tail)
+        if len(ANSI.sub("", head)) <= w:
+            break
+    return head
+
+
+def render(anchor, given):
+    w = max(20, shutil.get_terminal_size((66, 40)).columns - 1)
     height = shutil.get_terminal_size((66, 40)).lines - 1
-    rows = sorted(rows, key=lambda r: r[:2])
-    # footer: open PRs of finished workers, waiting for the merge word — one line each, at most 6
-    ready = ready_prs(herd_dirs(anchor, given), agents)[:6]
-    foot = []
-    if ready:
-        foot = ["", f"{BOLD}{GREEN}{t('ready')}{RST}"]
-        for repo, n, s, review in ready:
-            rv = f"{GREEN}{t('signed')}{RST}" if review == "ok" else \
-                f"{YEL}{t('in_review')}{RST}" if review == "alt" else f"{DIM}{t('no_review')}{RST}"
-            foot.append(f"  {MAG}{(repo + ' ') if repo else ''}#{n}{RST} {BOLD}{s}{RST} {rv}")
-    # below it: everything merged today, all repos in one list, numbers in green (wrapped at whole numbers)
-    merged = merged_today()
-    if merged:
-        # one compact line: the numbers start right after the label, wrapped lines continue under them
-        nums = " ".join(str(n) for n in sorted(n for v in merged.values() for n in v))  # no "#": saves a line
+    agents = herdr_agents()
+    herds = herd_dirs(anchor, given)
+    lanes = {"needs": [], "queue": [], "work": [], "ready": []}
+    notes = []
+    v2 = [h for h in herds if os.path.exists(os.path.join(h, "herd.events.jsonl"))]
+    v1 = [h for h in herds if h not in v2 and os.path.exists(os.path.join(h, "herd.map"))]
+    limits = herd_limits(v2[0], anchor) if v2 else None
+    all_evs, reviews = [], 0
+    if v2 and he is None:
+        notes.append(f"{RED}⚠ {t('no_core')}{RST}")
+    elif v2:
+        per = {h: he.read(h) for h in v2}
+        all_evs = [ev for evs in per.values() for ev in evs]
+        merged_evs = [ev for ev in all_evs if ev.get("phase") == "merged"]
+        for h in v2:
+            st = v2_rows(h, agents, limits, merged_evs, lanes)
+            reviews += sum(1 for ev in st.values() if ev["phase"] == "review_running")
+    for h in v1:
+        notes.append(f"{DIM}{os.path.basename(h.rstrip('/'))}: {t('v1')}{RST}")
+        v1_rows(h, agents, lanes)
+    lanes["work"] += agent_rows(anchor, agents) if anchor else []
+
+    last = last_human_input(anchor, agents) if anchor else None
+    quiet = time.strftime('%H:%M', time.localtime(last)) if last and time.time() - last > 30 * 60 else ""
+    top = [header(w, herds, len(lanes["needs"]), limits, reviews, quiet)] + notes
+    key = lambda r: (r[0], (r[7] or {}).get("sort", r[1]) if isinstance(r[7], dict) else r[1])
+    for k in lanes:
+        lanes[k].sort(key=key)
+
+    def compact(rows):
+        return [head_lines(r, w, 1) for r in rows]
+
+    def lane_title(k, col):
+        return f"{BOLD}{col}{t('lane_' + k)}{RST}"
+
+    # merged today: events + the GitHub search, numbers in green, wrapped at whole numbers
+    merged = merged_from_events(all_evs)
+    for k, v in merged_today().items():
+        merged.setdefault(k, []).extend(v)
+    merged_lines = []
+    nums = sorted({n for v in merged.values() for n in v})
+    if nums:
         label = t("merged")
-        parts = textwrap.wrap(nums, max(10, w - len(label)))
-        foot += [""] + [(f"{BOLD}{GREEN}{label}{RST}" if i == 0 else " " * len(label)) + f"{GREEN}{p}{RST}"
+        parts = textwrap.wrap(" ".join(map(str, nums)), max(10, w - len(label)))
+        merged_lines = [(f"{BOLD}{GREEN}{label}{RST}" if i == 0 else " " * len(label)) + f"{GREEN}{p}{RST}"
                         for i, p in enumerate(parts)]
-    # adaptive: the panel's height is shared evenly — one worker gets a full picture plus its step feed,
+
+    # fixed-size lanes first; the Working lane gets what is left. Over budget: queue gives way, then ready, then needs
+    avail = height - len(top)
+    blocks = {"needs": compact(lanes["needs"]), "queue": compact(lanes["queue"]), "ready": compact(lanes["ready"])}
+    work_min = 2 if lanes["work"] else 0
+    size = lambda k: (1 + sum(len(b) for b in blocks[k])) if blocks[k] else 0
+    foot_extra = (1 + len(merged_lines)) if merged_lines else 0
+    limit = {k: size(k) for k in blocks}
+    over = sum(limit.values()) + foot_extra + work_min + (1 if blocks["ready"] else 0) - avail
+    for k in ("queue", "ready", "needs"):
+        if over <= 0:
+            break
+        cut = min(over, max(0, limit[k] - 2))
+        limit[k] -= cut
+        over -= cut
+
+    def lane(k, col):
+        return [lane_title(k, col)] + fit(blocks[k], limit[k] - 1) if blocks[k] else []
+
+    body = lane("needs", RED) + lane("queue", YEL)
+    foot = ([""] + lane("ready", GREEN) if blocks["ready"] else []) + ([""] + merged_lines if merged_lines else [])
+
+    # Working lane, adaptive: the free height is shared evenly — one worker gets a full picture plus its step feed,
     # ten workers get one line each; a blank separator only when every worker has room to spare
-    free = height - 1 - len(foot)
-    sep = 1 if rows and free // len(rows) >= 4 else 0
-    shown = rows[:free] if len(rows) > free else rows
-    if len(shown) < len(rows):
-        shown = rows[:free - 1]
-    per, extra = (divmod(free - sep * (len(shown) - 1), len(shown)) if shown else (0, 0))
-    out = [head]
-    for i, row in enumerate(shown):
-        _, s, icon, col, prog, text, tail, detail = row
-        budget = per + (1 if i < extra else 0) - 1
-        has_bar = budget > 0 and isinstance(detail.get("n"), int) and detail.get("m")
-        prog = "" if has_bar else prog  # the bar line carries n/m when there is room for it
-        name = s[:max(8, w - 8)]  # full name; only an absurdly long label is clipped
-        # line 1 is the worker's heading: icon and the one-word name in its state colour (name bold), the goal in
-        # plain text after it — name and goal never share a colour, and "missing" below is yellow
-        goal = ""
-        left = f"{col}{icon}{RST} {BOLD}{col}{name}{RST} " + (f"{BLUE}{prog}{RST} " if prog else "")
-        room = w - len(name) - 3 - (len(prog) + 1 if prog else 0) - (len(tail) + 1 if tail else 0)
-        if sep and i:
-            out.append("")
-        words = text.split()
-        # the state text follows the name when it has room, otherwise it starts on its own line
-        first = (wrap(text, room, 1) or [""])[0] if room >= 14 and text else ""
-        first = first if len(first) <= room else ""
-        rest = " ".join(words[len(first.split()):])
-        out.append(left + paint(first, goal) + (f" {DIM}{tail}{RST}" if tail else ""))
-        cont = wrap(rest, w - 2, 2 if budget > 6 else 1 if budget > 2 else 0) if rest else []
-        out += [f"  {paint(l, goal)}" for l in cont]
-        out += detail_lines(row, budget - len(cont), w)
-    if len(shown) < len(rows):
-        out.append(f"{DIM}+{len(rows) - len(shown)} {t('more')}{RST}")
-    if not rows:
-        out.append(f"{DIM}{t('idle')}{RST}")
+    rows = lanes["work"]
+    free = avail - len(body) - len(foot) - (1 if rows else 0)
+    if rows:
+        body.append(lane_title("work", CYAN))
+        sep = 1 if free // len(rows) >= 4 else 0
+        shown = rows if len(rows) <= free else rows[:max(0, free - 1)]
+        per, extra = divmod(free - sep * (len(shown) - 1) - (1 if len(shown) < len(rows) else 0), len(shown)) \
+            if shown else (0, 0)
+        for i, row in enumerate(shown):
+            budget = per + (1 if i < extra else 0) - 1
+            d = row[7] if isinstance(row[7], dict) else {}
+            has_bar = budget > 0 and isinstance(d.get("n"), int) and d.get("m")
+            if sep and i:
+                body.append("")
+            hl = head_lines(row, w, 2 if budget > 6 else 1 if budget > 2 else 0, show_prog=not has_bar)
+            body += hl
+            body += detail_lines(row[:7] + (d,), budget - (len(hl) - 1), w)
+        if len(shown) < len(rows):
+            body.append(f"{DIM}+{len(rows) - len(shown)} {t('more')}{RST}")
+    busy = any(lanes.values()) or bool(merged_lines)
+    if not busy:
+        body.append(f"{DIM}{t('idle')}{RST}")
+    out = top + body
     if foot:
         # the footer always shows in full: when the body runs long, the body gives way, not the footer
         out = out[:max(1, height - len(foot))]
         out += [""] * max(0, height - len(out) - len(foot)) + foot  # pinned to the bottom of the panel
-    return out, bool(rows) or bool(foot)
+    return out, busy
 
 
 def frame(anchor, given):
@@ -598,7 +1361,7 @@ def frame(anchor, given):
         return render(anchor, given)
     except Exception as e:
         w = max(20, shutil.get_terminal_size((66, 40)).columns - 1)
-        msg = wrap(f"⚠ herd-board: {type(e).__name__}: {e}", w, 3) or ["⚠ herd-board"]
+        msg = wrap(f"⚠ {t('draw_err')}: {type(e).__name__}: {e}", w, 3) or ["⚠ herd-board"]
         return [f"{BOLD}{CYAN}{t('title')}{RST} {DIM}{time.strftime('%H:%M')}{RST}"] + \
             [f"{RED}{l}{RST}" for l in msg], True
 
@@ -648,6 +1411,7 @@ def open_panel(anchor, given):
     """Split the anchor's right third (anchor keeps 2/3) and run the board there."""
     if is_live(anchor) or board_in_tab(anchor):
         return
+
     def herdr(*a):
         r = subprocess.run(["herdr", *a], capture_output=True, text=True, timeout=20)
         try:
@@ -663,71 +1427,272 @@ def open_panel(anchor, given):
               "".join(" " + shlex.quote(g) for g in given))
 
 
+# ---------------------------------------------------------------------------------------------------------------
+# Self-test (offline: herdr, gh, herd-limits and herd-clash are stubbed in-process)
+# ---------------------------------------------------------------------------------------------------------------
+
 def selftest():
-    """Malformed status files render instead of crashing, and a failing repaint becomes an error line. Offline: no
-    herdr, no gh. Exit 0 = pass."""
+    """Synthetic events for every lane and computed state, the v1 fallback, malformed status/event files, overflow
+    and a failing repaint. Offline: no herdr, no gh, no ~/.cache writes. Exit 0 = pass."""
     import tempfile
     g = globals()
-    g.update(herdr_agents=lambda: {}, pr_state=lambda *a, **k: (None, None), merged_today=lambda: {})
-    strip = lambda ls: [re.sub(r"\033\[[0-9;?]*[A-Za-z]", "", l) for l in ls]
+    strip = lambda ls: [ANSI.sub("", l) for l in ls]
     fails = []
+
     def check(name, cond):
         print(("ok: " if cond else "FAIL: ") + name)
         cond or fails.append(name)
-    with tempfile.TemporaryDirectory() as herd:
+
+    if he is None:
+        print("FAIL: herd_events.py not importable next to herd-board")
+        return 1
+    now = time.time()
+    iso = lambda ago_s: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - ago_s))
+    sha = lambda c: (c * 40)[:40]
+    with tempfile.TemporaryDirectory() as tmp:
+        herd = os.path.join(tmp, "herde-v2")
+        os.makedirs(herd)
+        wt_root = os.path.join(tmp, "wt")
+        evs = []
+
+        def ev(slice_name, phases, ago=600, **last_fields):
+            """Append `phases` in order (validated against herd_events.TRANSITIONS); extra fields on the last one."""
+            frm = None
+            for i, ph in enumerate(phases):
+                assert ph in he.TRANSITIONS.get(frm, set()), f"{slice_name}: {frm} -> {ph}"
+                e = {"ts": iso(ago - i), "slice": slice_name, "phase": ph, "by": "orchestrator"}
+                if ph == "working":
+                    e.update(pane=f"w1:{slice_name}", model="claude-opus-5-5", effort="high",
+                             wt=[os.path.join(wt_root, "app", slice_name)])
+                if i == len(phases) - 1:
+                    e.update(last_fields)
+                evs.append(e)
+                frm = ph
+
+        W, A, RR, OK, BF = (["queued", "working"], ["queued", "working", "accepted"],
+                            ["queued", "working", "accepted", "review_running"],
+                            ["queued", "working", "accepted", "review_running", "review_ok"],
+                            ["queued", "working", "accepted", "review_running", "review_befund"])
+        ev("q-one", ["queued"], pos=2)
+        ev("q-two", ["queued"], pos=1)
+        ev("q-stack", ["queued"], pos=3)                       # stacked_on w-run (only working) -> base reason
+        ev("fx", BF + ["fix_queued"], befunde_file="fx.befunde-abc1234.md")
+        ev("w-run", W)                                         # agent working -> ● O·hi, clash with w-fix
+        ev("w-fix", BF + ["fix_queued", "working"])            # fix round -> ↺
+        ev("w-blk", W)                                         # agent blocked -> needs you ?
+        ev("w-rep", W)                                         # out.md + idle -> reported ✓
+        ev("w-gone", W, ago=3600)                              # pane gone, no report -> ✕
+        ev("w-new", W, ago=5)                                  # pane not listed yet, fresh -> starting
+        ev("w-still", W)                                       # idle, transcript old -> ⚠
+        ev("a-one", A, prs=["app#11@" + sha("a")[:7]])        # partner a-two still working -> waits for partner
+        ev("a-two", W)
+        ev("rr", RR, run_id="r1", round=2)
+        ev("ok-api", OK, prs=["app#20@" + sha("b")], main=["app@" + sha("c")], run_id="r2")
+        ev("ok-ui", OK, prs=["web#7@" + sha("d")], main=["web@" + sha("e")], run_id="r3")
+        ev("st-head", OK, prs=["app#30@" + sha("f")], main=["app@" + sha("c")])        # head moved -> stale
+        ev("st-main", OK, ago=7200, prs=["lib#40@" + sha("1")], main=["lib@" + sha("2")])  # merge landed after
+        ev("st-mv", OK, prs=["web#8@" + sha("8")], main=["web@" + sha("9")])          # web main moved on
+        ev("st-nm", OK, prs=["app#31@" + sha("b")], run_id="v1-freigabe")               # no main (migrated v1)
+        ev("bf", BF, befunde_file="bf.befunde-1234abc.md")
+        ev("ok-stk", OK, prs=["app#21@" + sha("b")], main=["app@" + sha("c")])  # stacked on rr -> no word yet
+        ev("m-done", OK + ["merged"], ago=60, prs=["lib#41@9f9f9f9"], go="merge m-done")
+        ev("pk", ["queued", "parked"], reason="not needed")
+        with open(he.path(herd), "w", encoding="utf-8") as f:
+            for e in evs:
+                f.write(json.dumps(e) + "\n")
+            f.write('{"slice": "torn", "phase": "work')          # a crash mid-write: skipped, not fatal
+        for s, hdr in {"a-one": "together_with: a-two", "ok-api": "together_with: ok-ui",
+                       "q-stack": "stacked_on: w-run", "ok-stk": "stacked_on: rr"}.items():
+            open(os.path.join(herd, f"{s}.task.md"), "w").write(f"{hdr}\nmodel: claude-opus-5-5\n\n# task\n")
+        for s in ("a-two", "ok-ui", "w-run"):
+            open(os.path.join(herd, f"{s}.task.md"), "w").write("tickets: 1\n\n# task\n")
+        open(os.path.join(herd, "w-rep.out.md"), "w").write("report\n")
+        open(os.path.join(herd, "w-rep.status.json"), "w").write('{"pr": "app #12"}')
+        open(os.path.join(herd, "w-run.status.json"), "w").write(
+            '{"short": "builds the lane view", "step": 2, "of": 5, "missing": ["tests", "docs"]}')
+        open(os.path.join(herd, "w-fix.status.json"), "w").write('{"kurz": "behebt Befunde"}')
+
+        # v1 herd: herd.map and malformed status files, no events
+        old = os.path.join(tmp, "herde-v1")
+        os.makedirs(old)
         cases = {  # slice -> status.json as written by a worker
             "hbst-liste": '{"satz": "Board liest Listen", "schritt": 2, "von": 4, "fehlt": ["Tests", "Doku"]}',
             "hbst-null": "null",
             "hbst-array": '[1, 2]',
             "hbst-typen": '{"sentence": 7, "step": "3", "of": "x", "missing": null, "pr": ["api #12", "ui #4"]}',
         }
-        open(os.path.join(herd, "herd.map"), "w").write("".join(f"{s}=w0:p{i}\n" for i, s in enumerate(cases)))
+        open(os.path.join(old, "herd.map"), "w").write("".join(f"{s}=w0:p{i}\n" for i, s in enumerate(cases)))
         for s, body in cases.items():
-            open(os.path.join(herd, f"{s}.status.json"), "w").write(body)
-        check("non-object status is {}", read_status(os.path.join(herd, "hbst-null.status.json")) == {}
-              and read_status(os.path.join(herd, "hbst-array.status.json")) == {})
-        st = read_status(os.path.join(herd, "hbst-typen.status.json"))
-        check("fields bent into the contract", st == {"sentence": "7", "step": 3, "of": None, "missing": "",
-                                                       "pr": "api #12, ui #4"})
+            open(os.path.join(old, f"{s}.status.json"), "w").write(body)
+
+        agents = {"w1:w-run": {"agent_status": "working", "cwd": wt_root},
+                  "w1:w-fix": {"agent_status": "working", "cwd": wt_root},
+                  "w1:w-blk": {"agent_status": "blocked", "cwd": wt_root},
+                  "w1:w-rep": {"agent_status": "idle", "cwd": wt_root},
+                  "w1:w-still": {"agent_status": "idle", "cwd": os.path.join(tmp, "still")},
+                  "w1:a-two": {"agent_status": "working", "cwd": wt_root},
+                  **{f"w0:p{i}": {"agent_status": "working", "cwd": wt_root} for i in range(len(cases))}}
+        heads = {("app", 20): sha("b"), ("app", 21): sha("b"),
+                 ("app", 30): sha("0"), ("web", 7): sha("d"), ("web", 8): sha("8"),
+                 ("lib", 40): sha("1")}
+        real = {k: g[k] for k in ("herdr_agents", "pr_state", "main_head", "merged_today", "find_tool",
+                                  "transcript_age", "procs_in", "LANG", "ORG", "ORGS")}
+        clash_json = json.dumps({"pairs": [{"repo": "app", "slices": ["w-run", "w-fix"], "files": ["src/x.py"]}]})
+        g.update(ORG="acme", ORGS=["acme"], herdr_agents=lambda: agents,
+                 pr_state=lambda repo, n, cwd=None: ("OPEN", heads.get((short_repo(repo), n))),
+                 main_head=lambda slug, cwd=None: {"app": sha("c"), "web": sha("e"), "lib": sha("2")}.get(
+                     short_repo(slug)),
+                 merged_today=lambda: {"app": [5]},
+                 transcript_age=lambda cwd: 30 if cwd.endswith("still") else 0.5,
+                 procs_in=lambda s, extra=(): [],
+                 find_tool=lambda name: "/nonexistent/" + name)  # answers come from TOOL_CACHE below
+        TOOL_CACHE.clear()
+        TOOL_CACHE[("limits", herd)] = (now + 3600, parse_limits(
+            "slots 4/6 (1 review), free 9100 MB (min 8000), load 3.20 (max 40)", 0))
+        TOOL_CACHE[("clash", herd)] = (now + 3600, parse_clash(json.loads(clash_json)))
+        os.environ.update(COLUMNS="100", LINES="90")
         try:
-            out, busy = render("", [herd])
-            text = "\n".join(strip(out))
-            check("render with malformed status files", busy and f"{t('missing')} Tests, Doku" in text)
-        except Exception as e:
-            check(f"render with malformed status files ({type(e).__name__}: {e})", False)
-        for s in cases:  # reports written: the footer reads every status file's "pr"
-            open(os.path.join(herd, f"{s}.out.md"), "w").write("done\n")
-        try:
-            check("ready-to-merge footer with malformed status files", isinstance(ready_prs([herd], {}), list))
-        except Exception as e:
-            check(f"ready-to-merge footer ({type(e).__name__}: {e})", False)
-        real = g["render"]
-        g["render"] = lambda *a: 1 / 0
-        try:
-            out, busy = frame("", [herd])
-            check("a failing repaint shows an error line", busy and any("ZeroDivisionError" in l for l in strip(out)))
-        except Exception as e:
-            check(f"a failing repaint shows an error line ({type(e).__name__})", False)
+            check("herd_events.state skips the torn line", "torn" not in he.state(herd) and
+                  he.state(herd)["fx"]["phase"] == "fix_queued")
+            check("non-object status is {}", read_status(os.path.join(old, "hbst-null.status.json")) == {}
+                  and read_status(os.path.join(old, "hbst-array.status.json")) == {})
+            check("fields bent into the contract",
+                  read_status(os.path.join(old, "hbst-typen.status.json")) ==
+                  {"sentence": "7", "step": 3, "of": None, "missing": "", "pr": "api #12, ui #4"})
+            check("model tag", model_tag("claude-opus-5-5", "high") == "O·hi" and model_tag("fable-5.1", "medium")
+                  == "F·md" and model_tag("claude-sonnet-5-5", "") == "S" and model_tag(None, None) == "")
+            lim_json = json.dumps({"ok": False, "used": 2, "max": 6, "review": 1, "free_mb": 100,
+                                   "min_free_mb": 8000, "load": 1.0, "max_load": 40,
+                                   "reasons": ["only 100 MB free (min 8000)"]})
+            check("limits json + text + unmeasurable",
+                  parse_limits(lim_json, 1) == {"used": 2, "max": 6, "review": 1, "ok": False, "reason": "memory"}
+                  and parse_limits("slots 6/6 (0 review), free 9000 MB (min 8000), load 1.00 (max 40)\n"
+                                   "no slot: all 6 slots used", 1)["reason"] == "slot"
+                  and parse_limits("slots 2/6 (0 review), free 9000 MB (min 8000), load 50.00 (max 40)", 1)["reason"]
+                  == "load" and parse_limits("nonsense", 0) is None and parse_limits(lim_json, 2) is None)
+            real_clash = {"pairs": [{"repo": "app", "slices": ["x", "y"], "files": ["a.py"], "relation": None}],
+                          "by_slice": {"x": [{"other": "y"}], "y": [{"other": "x"}]},
+                          "changed": {"app": {"x": ["a.py"], "y": ["a.py"], "z": ["b.py"]}}, "skipped": []}
+            check("clash shapes", parse_clash(real_clash) == {"x": {"y"}, "y": {"x"}}
+                  and parse_clash({"app": [{"slices": ["p", "q", "r"]}]})["p"] == {"q", "r"}
+                  and parse_clash({"clashes": [{"a": "x", "b": "y"}]}) == {"x": {"y"}, "y": {"x"}}
+                  and parse_clash("junk") == {})
+            for lang in ("de", "en"):
+                g["LANG"] = lang
+                out, busy = render("", [herd, old])
+                text = "\n".join(strip(out))
+                lines = strip(out)
+                row = lambda s: next((l for l in lines if re.match(rf"^\S+ {re.escape(s)}(\s|$)", l)), "")
+                order = [next((i for i, l in enumerate(lines) if l == t("lane_" + k)), -1)
+                         for k in ("needs", "queue", "work", "ready")]
+                check(f"[{lang}] all four lanes in order", busy and -1 not in order and order == sorted(order))
+                check(f"[{lang}] merge word for the clean package",
+                      "✓✓ ok-api+ok-ui" in text and t("word", w="merge ok-api") in text)
+                check(f"[{lang}] blocked slice needs you", "? w-blk" in row("w-blk") and order[0] < lines.index(
+                    row("w-blk")) < order[1])
+                check(f"[{lang}] header you + slots", t("you", n=2) in lines[0] and
+                      t("slots", u=4, m=6, k=1) in lines[0])
+                q = [l.split()[1] for l in lines[order[1] + 1:order[2]] if l[:1] in "!◌"]
+                check(f"[{lang}] queue: fix first, then by pos", q == ["fx", "q-two", "q-one", "q-stack"])
+                check(f"[{lang}] fix row + base reason", t("fix_queued", pos=1) in row("fx")
+                      and t("w_base_q", b="w-run") in row("q-stack"))
+                check(f"[{lang}] working ● with tag + clash", row("w-run").startswith("● w-run") and
+                      "O·hi" in row("w-run") and "⇄ w-fix" in row("w-run"))
+                check(f"[{lang}] fix round ↺", row("w-fix").startswith("↺ w-fix"))
+                check(f"[{lang}] reported ✓", row("w-rep").startswith("✓ w-rep") and t("checking") in row("w-rep"))
+                check(f"[{lang}] gone ✕ / starting / still ⚠", row("w-gone").startswith("✕") and
+                      t("starting") in row("w-new") and row("w-still").startswith("⚠"))
+                check(f"[{lang}] progress bar + missing", "█" in text and f"{t('missing')} tests, docs" in text)
+                check(f"[{lang}] accepted waits for partner", row("a-one+a-two").startswith("◇") and
+                      t("w_partner", x="a-two") in row("a-one+a-two"))
+                check(f"[{lang}] review running round 2/3", t("review_round", n=2) in row("rr"))
+                check(f"[{lang}] reviewed but base unmerged: no merge word", row("ok-stk").startswith("✓ ok-stk")
+                      and t("w_base", b="rr") in row("ok-stk") and order[3] < lines.index(row("ok-stk")))
+                check(f"[{lang}] stale by PR head", row("st-head").startswith("⟳") and
+                      t("stale_head", ref="app#30") in row("st-head"))
+                check(f"[{lang}] stale by a later merge", row("st-main").startswith("⟳") and
+                      t("stale_main", repo="lib") in row("st-main"))
+                check(f"[{lang}] stale by main moved", row("st-mv").startswith("⟳") and
+                      t("stale_main", repo="web") in row("st-mv"))
+                check(f"[{lang}] stale without a recorded main", row("st-nm").startswith("⟳") and
+                      t("stale_nomain", repo="app") in row("st-nm"))
+                check(f"[{lang}] findings !", row("bf").startswith("!") and "bf.befunde-1234abc.md" in row("bf"))
+                check(f"[{lang}] merged today from events + search", any(l.startswith(t("merged").strip()) and
+                      " 5 " in f" {l} " and " 41" in f" {l} " for l in lines))
+                check(f"[{lang}] parked and merged slices hidden", not row("pk") and not row("m-done"))
+                check(f"[{lang}] v1 fallback line + rows", t("v1") in text and "hbst-liste" in text and
+                      f"{t('missing')} Tests, Doku" in text)
+            g["LANG"] = "de"
+            os.environ.update(LINES="16")
+            out, busy = render("", [herd, old])
+            lines = strip(out)
+            check("small panel: within height, needs-you kept, overflow counted",
+                  len(out) <= 15 and any("✓✓" in l for l in lines) and any(f" {t('more')}" in l for l in lines))
+            check("small panel: footer pinned", any(l.startswith(t("merged").strip()) for l in lines[-2:]))
+            os.environ.update(LINES="90")
+            for s in cases:  # reports written: the v1 footer reads every status file's "pr"
+                open(os.path.join(old, f"{s}.out.md"), "w").write("done\n")
+            agents.update({f"w0:p{i}": {"agent_status": "idle", "cwd": wt_root} for i in range(len(cases))})
+            check("v1 ready-to-merge with malformed status files", isinstance(v1_ready_prs(old, agents), list))
+            # malformed event fields: must render, never crash
+            with open(he.path(herd), "a", encoding="utf-8") as f:
+                f.write("\n" + json.dumps({"ts": "junk", "slice": "odd", "phase": "review_ok", "prs": "app#x",
+                                           "main": 5, "round": "x"}) + "\n")
+                f.write(json.dumps({"ts": iso(1), "slice": "odd2", "phase": "review_running", "round": "zwei",
+                                    "prs": None}) + "\n")
+                f.write(json.dumps({"ts": iso(1), "slice": "odd3", "phase": "working", "pane": 7, "wt": "x"}) + "\n")
+            try:
+                out, busy = render("", [herd])
+                check("malformed event fields render", busy and "odd" in "\n".join(strip(out)))
+            except Exception as e:
+                check(f"malformed event fields render ({type(e).__name__}: {e})", False)
+            g["render"] = lambda *a: 1 / 0
+            try:
+                out, busy = frame("", [herd])
+                check("a failing repaint shows an error line",
+                      busy and any("ZeroDivisionError" in l for l in strip(out)))
+            finally:
+                g["render"] = render_impl
         finally:
-            g["render"] = real
-    print("herd-board selftest: " + ("FAILED" if fails else "OK"))
+            g.update(real)
+            TOOL_CACHE.clear()
+    print("herd-board selftest: " + (f"FAILED ({len(fails)})" if fails else "OK"))
     return 1 if fails else 0
+
+
+render_impl = render
 
 
 def main():
     args = sys.argv[1:]
+    if args[:1] in (["--help"], ["-h"]):
+        print(__doc__.strip())
+        return 0
     if args[:1] == ["--selftest"]:
-        sys.exit(selftest())
+        return selftest()
     anchor = os.environ.get("AGENT_PANE_ANCHOR", "")
     if "--anchor" in args:
         i = args.index("--anchor")
+        if i + 1 >= len(args):
+            print("herd-board: --anchor needs a pane id", file=sys.stderr)
+            return 2
         anchor = args[i + 1]
         del args[i:i + 2]
     if args[:1] == ["--open"]:
         if anchor:
             open_panel(anchor, args[1:])
-        return
+        return 0
+    once = "--once" in args
+    args = [a for a in args if a != "--once"]
+    unknown = [a for a in args if a.startswith("-")]
+    if unknown:
+        print(f"herd-board: unknown option {unknown[0]} (see --help)", file=sys.stderr)
+        return 2
     given = [os.path.abspath(a) for a in args]
+    if once:
+        out, _ = frame(anchor, given)
+        print("\n".join(out))
+        return 0
     me = os.environ.get("HERDR_PANE_ID")
     if not anchor and me:
         # started by hand without --anchor: the anchor is the pane at the tab's top left (the orchestrator),
@@ -752,13 +1717,14 @@ def main():
                 if anchor and os.path.exists(live_file(anchor)):
                     os.unlink(live_file(anchor))
                 subprocess.run(["herdr", "pane", "close", me], capture_output=True)
-                return
+                return 0
             time.sleep(5)
     except KeyboardInterrupt:
         pass
     finally:
         sys.stdout.write("\033[?25h\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
