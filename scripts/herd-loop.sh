@@ -331,9 +331,8 @@ submit_prompt() {
   [ -n "$pane" ] && [ "$pane" != "-" ] && [ "$pane" != "DRYRUN" ] || return 0
   is_self "$pane" && return 0
   if [ "$DRY_RUN" -eq 1 ]; then log "[dry-run] would send prompt pointer $pf to pane $pane"; return 0; fi
-  herdr agent send "$pane" "Read $pf and follow its instructions exactly." >/dev/null 2>&1 || true
-  sleep "$SUBMIT_SETTLE"
-  herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
+  prompt_agent "$pane" "Read $pf and follow its instructions exactly." \
+    || log "! prompt pointer to pane $pane not accepted (agent blocked or gone?) — the nudge retries next tick"
 }
 
 # Binding rule (mirrors m2herd-up.sh): the pane_id `agent start` returns can be off
@@ -354,6 +353,90 @@ resolve_pane_by_cwd() { # resolve_pane_by_cwd <cwd> [name] -> pane_id (retries; 
   printf '%s' "$pane"
 }
 
+# ---------- herdr 0.9 shims ------------------------------------------------------
+# herdr 0.9 changed both verbs this loop drives. `agent start` no longer makes a pane:
+# it needs an existing pane at a shell prompt (--pane), picks the binary itself from
+# --kind, and a binary path after `--` would become the agent's first prompt. `agent
+# send` is gone; `agent prompt` types AND submits. Older builds keep the old forms, so
+# detect once and branch. Names must match ^[a-z][a-z0-9_-]{0,31}$ on 0.9 — a name
+# outside it is rejected (a bare ticket number froze a router pane once).
+HERDR_V09=""
+herdr_v09() {
+  if [ -z "$HERDR_V09" ]; then
+    if herdr agent start --help 2>&1 | grep -q -- '--kind'; then HERDR_V09=1; else HERDR_V09=0; fi
+  fi
+  [ "$HERDR_V09" = 1 ]
+}
+agent_name() { # agent_name <raw> -> a name herdr accepts (lowercased, [a-z0-9_-], ≤32, hash-suffixed when cut)
+  local n; n="$(printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-')"
+  case "$n" in [a-z]*) ;; *) n="a-$n" ;; esac
+  [ "${#n}" -le 32 ] || n="${n:0:27}-$(printf '%s' "$1" | cksum | cut -c1-4)"
+  printf '%s' "$n"
+}
+agent_kind() { # agent_kind <bin> -> herdr --kind, or empty when herdr has no such kind
+  local k; k="$(basename "$1")"; [ "$k" = cursor-agent ] && k=cursor
+  herdr agent start --help 2>&1 | grep -o 'possible values: [^]]*' | head -1 \
+    | sed 's/possible values: //' | tr -d ' ' | tr ',' '\n' | grep -qx "$k" && printf '%s' "$k" || true
+}
+# start_agent <pane> <name> <bin> [flag] — 0.9 only: bring the agent up in an existing pane.
+# A kind herdr does not know is run as a plain command; detection still lists it.
+start_agent() {
+  local pane="$1" name="$2" bin="$3" flag="${4:-}" kind
+  kind="$(agent_kind "$bin")"
+  if [ -n "$kind" ]; then
+    # shellcheck disable=SC2086  # $flag is a flag list, split on purpose
+    herdr agent start "$name" --kind "$kind" --pane "$pane" -- $flag >/dev/null 2>&1
+  else
+    herdr pane run "$pane" "$(command -v "$bin")${flag:+ $flag}" >/dev/null 2>&1
+  fi
+}
+# prompt_agent <pane> <text> — submit one line. `agent prompt` submits by itself; the
+# pre-0.9 `agent send` only types, so that path still settles and presses Enter.
+prompt_agent() {
+  herdr agent prompt "$1" "$2" >/dev/null 2>&1 && return 0
+  herdr agent send "$1" "$2" >/dev/null 2>&1 || return 1
+  sleep "$SUBMIT_SETTLE"
+  herdr pane send-keys "$1" Enter >/dev/null 2>&1 || true
+}
+# worker_pane <cwd> -> a fresh pane for a worker (0.9). Inside herdr: the herd view
+# (SKILL.md §16.7) — the tab "$HERD_TAB" of our own workspace, created on first use,
+# then split down under its last pane; the orchestrator's tab keeps only the
+# orchestrator and its board. Outside herdr: a workspace of its own, which is where
+# the pre-0.9 `agent start --cwd` put it.
+HERD_TAB="${HERD_TAB:-herde}"
+worker_pane() {
+  local cwd="$1" label="$2" self ws tab last
+  self="$(cat "$(SELF_FILE)" 2>/dev/null || true)"
+  if [ -z "$self" ]; then
+    herdr workspace create --cwd "$cwd" --label "$label" --no-focus 2>/dev/null | jq -r '.result.root_pane.pane_id // empty'
+    return
+  fi
+  ws="${self%%:*}"
+  tab="$(herdr tab list 2>/dev/null | jq -r --arg ws "$ws" --arg l "$HERD_TAB" \
+    '[.result.tabs[] | select(.workspace_id==$ws and .label==$l)] | first | .tab_id // empty' || true)"
+  last=""
+  [ -z "$tab" ] || last="$(herdr pane list 2>/dev/null | jq -r --arg t "$tab" \
+    '[.result.panes[] | select(.tab_id==$t)] | last | .pane_id // empty' || true)"
+  if [ -n "$last" ]; then
+    herdr pane split --pane "$last" --direction down --cwd "$cwd" --no-focus 2>/dev/null | jq -r '.result.pane.pane_id // empty'
+  else
+    herdr tab create --workspace "$ws" --cwd "$cwd" --label "$HERD_TAB" 2>/dev/null | jq -r '.result.root_pane.pane_id // empty'
+  fi
+}
+# close_stray_ws <ws_id>... — close workspaces a 0.9 `worktree create` opened as a side
+# effect (the git worktree stays on disk). Never our own workspace; one already gone
+# is fine.
+close_stray_ws() {
+  local w self; self="$(cat "$(SELF_FILE)" 2>/dev/null || true)"
+  for w in "$@"; do
+    [ -n "$w" ] || continue
+    { [ "$w" = "${HERDR_WORKSPACE_ID:-}" ] || [ "$w" = "${self%%:*}" ]; } && continue
+    herdr workspace list 2>/dev/null | jq -e --arg w "$w" 'any(.result.workspaces[]?; .workspace_id==$w)' >/dev/null 2>&1 || continue
+    herdr workspace close "$w" >/dev/null 2>&1 && log "closed stray workspace $w (worktree kept on disk)" \
+      || log "! could not close stray workspace $w — close it by hand"
+  done
+}
+
 spawn_slice() {
   local stage="$1" slice="$2" worker="$3"
   worker="${worker:-$WORKER_DEFAULT}"
@@ -366,16 +449,49 @@ spawn_slice() {
     log "[dry-run] would spawn $worker for $slice (branch $branch: worktree + prompt + ledger row + send)"
     ledger_add "$slice" "$worker" "DRYRUN" "$branch" "" "working" "no"; return   # shadow ledger only
   fi
-  wt="$(herdr worktree create --cwd "$REPO" --branch "$branch" --base "$BASE" --label "$slice" --json 2>/dev/null | jq -r '.result.worktree.path')"
-  [ -n "$wt" ] && [ "$wt" != "null" ] || { log "! $slice: worktree create failed"; ledger_add "$slice" "$worker" "" "$branch" "" "error" "no"; return; }
   # herdr requires a UNIQUE agent name; the integration is detected from the binary,
   # so a "<worker>-<slice>" label coexists with other workers of the same type.
-  local reported pane
-  reported="$(herdr agent start "$worker-$slice" --cwd "$wt" --no-focus -- "$(command -v "$bin")" $flag 2>/dev/null | jq -r '.result.agent.pane_id // empty')"
-  pane="$(resolve_pane_by_cwd "$wt" "$worker-$slice")"
-  if [ -z "$pane" ]; then
-    pane="$reported"
-    [ -n "$pane" ] && [ "$pane" != "null" ] && log "! $slice: could not re-resolve pane by cwd — falling back to reported id $pane"
+  local reported pane name; name="$(agent_name "$worker-$slice")"
+  if herdr_v09; then
+    # 0.9: `worktree create` also opens a workspace (tab + root pane) for the new
+    # worktree, and one for the repo when none has it open. Inside herdr the worker
+    # goes to the herde tab and both are closed (the worktree stays on disk); outside,
+    # the worktree's own workspace IS the worker's place.
+    local wt_json ws_before wt_ws src_ws
+    ws_before="$(herdr workspace list 2>/dev/null | jq -r '[.result.workspaces[]?.workspace_id] | join(" ")' || true)"
+    wt_json="$(herdr worktree create --cwd "$REPO" --branch "$branch" --base "$BASE" --label "$slice" --no-focus --json 2>/dev/null || true)"
+    wt="$(printf '%s' "$wt_json" | jq -r '.result.worktree.path // empty' 2>/dev/null || true)"
+    [ -n "$wt" ] || { log "! $slice: worktree create failed"; ledger_add "$slice" "$worker" "" "$branch" "" "error" "no"; return; }
+    wt_ws="$(printf '%s' "$wt_json" | jq -r '.result.workspace.workspace_id // empty' 2>/dev/null || true)"
+    src_ws="$(herdr workspace list 2>/dev/null | jq -r --arg before " $ws_before " --arg wt "$wt_ws" --arg r "$REPO" \
+      '[.result.workspaces[]? | .workspace_id as $id | select($id != $wt
+          and (($before | contains(" " + $id + " ")) | not)
+          and ((.worktree.is_linked_worktree // false) | not)
+          and ((.worktree.repo_root // "") == $r))] | .[].workspace_id' 2>/dev/null | tr '\n' ' ' || true)"
+    if [ -s "$(SELF_FILE)" ]; then
+      pane="$(worker_pane "$wt" "$name" || true)"
+      # shellcheck disable=SC2086  # src_ws is a space-separated id list
+      close_stray_ws "$wt_ws" $src_ws
+    else
+      pane="$(printf '%s' "$wt_json" | jq -r '.result.root_pane.pane_id // empty' 2>/dev/null || true)"
+      # shellcheck disable=SC2086
+      close_stray_ws $src_ws
+    fi
+    [ -n "$pane" ] || { log "! $slice: no pane for the worker (tab/split failed)"; ledger_add "$slice" "$worker" "" "$branch" "$wt" "error" "no"; return; }
+    if ! start_agent "$pane" "$name" "$bin" "$flag"; then
+      log "! $slice: agent start failed in pane $pane — closing it"
+      herdr pane close "$pane" >/dev/null 2>&1 || true
+      ledger_add "$slice" "$worker" "" "$branch" "$wt" "error" "no"; return
+    fi
+  else
+    wt="$(herdr worktree create --cwd "$REPO" --branch "$branch" --base "$BASE" --label "$slice" --json 2>/dev/null | jq -r '.result.worktree.path')"
+    [ -n "$wt" ] && [ "$wt" != "null" ] || { log "! $slice: worktree create failed"; ledger_add "$slice" "$worker" "" "$branch" "" "error" "no"; return; }
+    reported="$(herdr agent start "$name" --cwd "$wt" --no-focus -- "$(command -v "$bin")" $flag 2>/dev/null | jq -r '.result.agent.pane_id // empty')"
+    pane="$(resolve_pane_by_cwd "$wt" "$name")"
+    if [ -z "$pane" ]; then
+      pane="$reported"
+      [ -n "$pane" ] && [ "$pane" != "null" ] && log "! $slice: could not re-resolve pane by cwd — falling back to reported id $pane"
+    fi
   fi
   [ -n "$pane" ] && [ "$pane" != "null" ] || { log "! $slice: agent start failed"; ledger_add "$slice" "$worker" "" "$branch" "$wt" "error" "no"; return; }
   local prompt; prompt="$(gen_prompt "$stage" "$slice" "$wt")"
@@ -682,17 +798,21 @@ rotate() {
   # unique herdr agent name per rotation: <agent>-r2, <agent>-r3, ...
   local rc name; rc="$(cat "$WS/_fleet/rotation_count" 2>/dev/null || echo 1)"
   case "$rc" in ''|*[!0-9]*) rc=1 ;; esac
-  name="$agent-r$((rc+1))"
+  name="$(agent_name "$agent-r$((rc+1))")"
 
   log "rotate plan:"
   log "  old orchestrator pane : $old"
   log "  repo                  : ${REPO:-<unset>}"
-  log "  start new             : herdr agent start $name --cwd \"$REPO\" --no-focus -- $bin${flag:+ $flag}"
+  if herdr_v09; then
+    log "  start new             : herdr pane split $old --direction right --cwd \"$REPO\", then herdr agent start $name --kind $(agent_kind "$bin") --pane <new>${flag:+ -- $flag}"
+  else
+    log "  start new             : herdr agent start $name --cwd \"$REPO\" --no-focus -- $bin${flag:+ $flag}"
+  fi
   log "  resume pointer        : $WS/_fleet/context_pointer.md + $WS/_fleet/digest.md"
 
   if [ "$DRY_RUN" -eq 1 ]; then
     log "  [dry-run] would send the resume pointer to the new pane"
-    log "  [dry-run] would re-resolve the new pane by cwd from 'herdr agent list'"
+    herdr_v09 || log "  [dry-run] would re-resolve the new pane by cwd from 'herdr agent list'"
     log "  [dry-run] would poll (a few tries) until the new pane is listed"
     log "  [dry-run] would: herdr pane close $old"
     log "  [dry-run] would record the new pane, bump rotation_count, clear $WS/_fleet/.needs_rotation"
@@ -701,12 +821,22 @@ rotate() {
   fi
 
   local reported new
-  reported="$(herdr agent start "$name" --cwd "$REPO" --no-focus -- "$(command -v "$bin")" $flag 2>/dev/null | jq -r '.result.agent.pane_id // empty')"
-  # binding rule: agent start's pane_id can be off by one — re-resolve by cwd.
-  new="$(resolve_pane_by_cwd "$REPO" "$name")"
-  if [ -z "$new" ]; then
-    new="$reported"
-    [ -n "$new" ] && log "! could not re-resolve new pane by cwd — falling back to reported id $new"
+  if herdr_v09; then
+    # 0.9: open the successor beside the old pane, so it inherits its place once the
+    # old one closes; the id we made is authoritative.
+    new="$(herdr pane split --pane "$old" --direction right --cwd "$REPO" --no-focus 2>/dev/null | jq -r '.result.pane.pane_id // empty' || true)"
+    if [ -n "$new" ] && ! start_agent "$new" "$name" "$bin" "$flag"; then
+      herdr pane close "$new" >/dev/null 2>&1 || true
+      new=""
+    fi
+  else
+    reported="$(herdr agent start "$name" --cwd "$REPO" --no-focus -- "$(command -v "$bin")" $flag 2>/dev/null | jq -r '.result.agent.pane_id // empty')"
+    # binding rule: agent start's pane_id can be off by one — re-resolve by cwd.
+    new="$(resolve_pane_by_cwd "$REPO" "$name")"
+    if [ -z "$new" ]; then
+      new="$reported"
+      [ -n "$new" ] && log "! could not re-resolve new pane by cwd — falling back to reported id $new"
+    fi
   fi
   if [ -z "$new" ] || [ "$new" = "null" ]; then echo "rotate: agent start failed" >&2; exit 1; fi
   if [ "$new" = "$old" ]; then
@@ -714,7 +844,8 @@ rotate() {
     exit 1
   fi
   log "started new orchestrator (pane $new, $name)"
-  herdr agent send "$new" "You are the herd orchestrator; resume from $WS/_fleet/context_pointer.md and $WS/_fleet/digest.md and continue the loop." >/dev/null 2>&1 || true
+  prompt_agent "$new" "You are the herd orchestrator; resume from $WS/_fleet/context_pointer.md and $WS/_fleet/digest.md and continue the loop." \
+    || log "! resume pointer not accepted by pane $new — send it by hand"
 
   # poll (a few tries) until the new pane is actually listed before retiring the old one.
   local listed=0

@@ -12,6 +12,94 @@ adheres to [Semantic Versioning](https://semver.org/).
   `m2herd loop run|status|promote` runs isolated scored attempts, records
   per-round artifacts, and promotes only the best patch into a clean checkout.
 
+## [2.9.0] - 2026-10-21
+
+### Added
+- **The herd view (SKILL.md §16.7)** — what a human watching the orchestrator's tab sees,
+  grown over two weeks of daily herds on a production fleet:
+  - `scripts/herd-board`: ONE panel in the right third of the orchestrator tab for herd
+    workers AND the orchestrator's own subagents. Needs-me first, then running, then
+    queued; the pane height is shared evenly (one worker → progress bar, sentence, live
+    processes in plain words and its step feed; ten workers → one line each); never cuts a
+    line with an ellipsis. Footer: *Ready to merge* (open PRs of finished workers, with
+    the orchestrator's sign-off pinned to the PR head sha) and *Merged today*. 16 theme
+    colours with one meaning each, `NO_COLOR` respected. `HERD_BOARD_LANG=de|en`,
+    `HERD_BOARD_ORG`, `HERD_BOARD_REPOS`. Closes itself after 5 idle minutes. A status file
+    that breaks the contract (`null`, a list in `missing`, a number as text) is bent into it,
+    and a failing repaint shows an error line instead of ending the board — a dead board pane
+    made every hook open another one. `herd-board --selftest` checks both (in `make test`/CI).
+  - `scripts/herd-spawn.sh`: starts a worker TUI in the tab `herde` (never as a split
+    beside the orchestrator), hands focus back, writes `herd.map`/`active.txt`, registers
+    the herd with the board. The prompt goes in as argv, so no `agent prompt` can race the
+    TUI; `--permission-mode auto` instead of `--dangerously-skip-permissions`.
+  - `hooks/herd-board-subagents.py`: Claude Code PreToolUse hook (`Agent|Task`) that puts
+    every main-thread subagent on the board; detached, never blocks the call. Silent in a
+    herd worker's pane (listed in a registered `herd.map`), so workers open no boards of their own.
+  - `templates/herd/COMMON.md`: worker rules + the `<slice>.status.json` contract.
+  - `install.sh` links `herd-board`/`herd-spawn` into `~/.local/bin` and registers the
+    hook (skipped with `--no-m2herd-hooks` or without python3).
+- Gotchas from the same fleet: stale `ANTHROPIC_API_KEY` shadowing a working login (silent
+  401 workers), `Connection refused` retry loops reported as `working`, the Codex update
+  prompt blocking workers, memory as the real worker cap (~1.4 GB RSS per Claude TUI),
+  herdr server restart recovery, `herdr update` refusing to run inside a pane, the auto-mode
+  merge gate, reviewer subagents kept off credentials.
+
+### Changed
+- §3/§4 and `reference.md` document the herdr ≥ 0.9 surface: `agent start` needs
+  `--kind` + an existing `--pane` and takes flags only (the binary path became the first
+  prompt), the agent-name pattern `^[a-z][a-z0-9_-]{0,31}$`, and `agent prompt` replacing
+  `agent send`.
+- `install.sh` moves a real file found where a bin symlink goes to `<file>.bak-<ts>`
+  instead of deleting it.
+
+### Fixed
+- `herd-loop.sh` and `fleet-loop.sh` work on herdr 0.9. Both still called the removed
+  `agent start --cwd … -- <binary>` (which on 0.9 fails, or sends the binary path as
+  the first prompt) and `agent send` (gone, failure swallowed by `|| true`, so every
+  pointer was logged as sent and never arrived). They now detect the version once and,
+  on 0.9, open the pane themselves and run `agent start <name> --kind <k> --pane <p>
+  -- <flags>`, then submit with `agent prompt`; older herdr keeps the old calls.
+  Placement follows the herd view: herd-loop workers go to the `herde` tab of the
+  loop's own workspace (a workspace of their own when the loop runs outside herdr),
+  and the workspaces 0.9's `worktree create` opens on the side are closed (the
+  worktree stays on disk); `rotate` opens the successor orchestrator beside the old
+  one; fleet-loop opens each mission orchestrator in a workspace labelled with the
+  mission. Agent names are normalised to `^[a-z][a-z0-9_-]{0,31}$` (hash suffix when
+  cut). `rotate` also never submitted its resume pointer (it sent no Enter) — fixed
+  by the same `agent prompt` path.
+- m2herd dispatch no longer leaves one herdr workspace per worker. herdr 0.9's
+  `worktree create` always opens a workspace (tab + root pane) for the new
+  worktree, and also opens the source repo as a workspace when none has it open.
+  Dispatch now passes `--no-focus`, captures both, and:
+  - pane runner: MOVES the worktree's root pane into the orchestrator tab
+    (`herdr pane move --tab --target-pane --split right|down`), which auto-closes
+    the emptied workspace; workers stay sub-panes of the orchestrator tab
+    (1st → right 50%, then each splits DOWN under the last worker). If the move
+    fails it falls back to the old `pane split` and closes the worktree workspace.
+  - headless runner: closes the worktree workspace right after creation.
+  - orchestrator-unresolved fallback: moves the root pane beside the repo
+    workspace's anchor pane (or splits + closes), and closes the worktree
+    workspace after the last-resort `agent start` too.
+  - a repo workspace that the create call opened as a side effect is closed
+    (except in the fallback, where it is the placement target).
+  Closing a workspace keeps the git worktree on disk; workspaces that existed
+  before the create call, `$HERDR_WORKSPACE_ID`, and any workspace holding
+  `$SELF` are never closed.
+- Pane workers no longer quit at Claude Code's workspace-trust dialog. A fresh
+  worktree is an unseen folder, so Claude opens with "No, exit" preselected; the
+  fixed `sleep 2` let the pointer's Enter pick it, the agent exited, and the retry
+  typed the task line into the bare shell (`bash: syntax error near unexpected
+  token`). Dispatch now waits (≤`M2HERD_BOOT_TIMEOUT`, default 30 s) for the agent
+  to register in its pane, answers the trust prompt only for worktrees it created
+  under `~/.herdr/worktrees`, and records `state=spawned-no-agent` without typing
+  anything when no agent comes up. `submit_pointer` refuses to inject into a pane
+  with no registered agent (except prime, which has no herdr integration).
+- Pane collect works on herdr 0.9: `agent wait --status` was renamed to
+  `--until` (the old flag exits 2 at once, so every pane collect reported a
+  timeout and marked a finished worker failed). Collect now waits
+  `--until idle --until done`, falling back to `--status idle` on older herdr.
+  SKILL.md / reference.md examples updated.
+
 ## [2.8.2] - 2026-09-15
 
 ### Fixed

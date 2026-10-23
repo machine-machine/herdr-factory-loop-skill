@@ -76,6 +76,7 @@ lint:
 test:
 	bash scripts/m2herd.sh selftest
 	bash scripts/m2herd-up.sh selftest
+	python3 scripts/herd-board --selftest
 
 # ci — the documented pre-commit check: the same steps CI runs
 # (.github/workflows/ci.yml). Go steps run only when go is on PATH.
@@ -91,6 +92,7 @@ ci:
 	fi
 	bash scripts/lint.sh
 	bash scripts/m2herd.sh selftest
+	python3 scripts/herd-board --selftest
 	bash hooks/smoke.sh
 	@if command -v go >/dev/null 2>&1; then \
 		echo "+ go build ./... && go vet ./... && go test ./... (tui/)"; \

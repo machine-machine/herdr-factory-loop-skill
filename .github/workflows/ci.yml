@@ -29,6 +29,7 @@ jobs:
         run: |
           bash scripts/m2herd.sh selftest
           bash scripts/m2herd-up.sh selftest
+          python3 scripts/herd-board --selftest
 
       - name: hook contract smokes
         run: bash hooks/smoke.sh

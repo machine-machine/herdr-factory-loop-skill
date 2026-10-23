@@ -10,7 +10,7 @@
 #   ./scripts/install.sh --pi            # ~/.pi/agent/skills/herdr (+ herdr integration + orchestrator extension)
 #   ./scripts/install.sh --local         # install from the local repo (no clone)
 #   ./scripts/install.sh --no-nudge-hook # skip the UserPromptSubmit/pre_llm_call nudge hook
-#   ./scripts/install.sh --no-m2herd-hooks # skip the m2herd SessionStart/PreCompact/PostToolUse hooks (and the pi orchestrator extension)
+#   ./scripts/install.sh --no-m2herd-hooks # skip the m2herd SessionStart/PreCompact/PostToolUse hooks, the herd-board PreToolUse hook (and the pi orchestrator extension)
 #   ./scripts/install.sh --no-statusline # skip the ctx-bridge statusline registration (claude)
 #   ./scripts/install.sh --uninstall
 #
@@ -256,13 +256,16 @@ M2HERD_SESSION_HOOK="m2herd-session.sh"
 M2HERD_PRECOMPACT_HOOK="m2herd-precompact.sh"
 M2HERD_BUDGET_HOOK="m2herd-budget.js"
 M2HERD_BUDGET_MATCHER="Bash|Edit|Write|MultiEdit|Agent|Task"
+# §16.7 herd view: puts the orchestrator's subagents on its herd-board
+HERD_BOARD_HOOK="herd-board-subagents.py"
+HERD_BOARD_MATCHER="Agent|Task"
 
 register_m2herd_hooks() {
   local hooks_dir="$HOME/.claude/hooks"
   local settings="$HOME/.claude/settings.json"
 
   if [ "$uninstall" -eq 1 ]; then
-    for h in "$M2HERD_SESSION_HOOK" "$M2HERD_PRECOMPACT_HOOK" "$M2HERD_BUDGET_HOOK"; do
+    for h in "$M2HERD_SESSION_HOOK" "$M2HERD_PRECOMPACT_HOOK" "$M2HERD_BUDGET_HOOK" "$HERD_BOARD_HOOK"; do
       install_hook_file "$hooks_dir" "claude" "$h"
     done
     [ -f "$settings" ] || return 0
@@ -277,7 +280,8 @@ register_m2herd_hooks() {
     # Strip only OUR command from each matcher group; drop a group only when
     # that leaves it empty — foreign hooks a user consolidated into the same
     # group keep theirs.
-    jq --arg ss "$M2HERD_SESSION_HOOK" --arg pc "$M2HERD_PRECOMPACT_HOOK" --arg bj "$M2HERD_BUDGET_HOOK" '
+    jq --arg ss "$M2HERD_SESSION_HOOK" --arg pc "$M2HERD_PRECOMPACT_HOOK" --arg bj "$M2HERD_BUDGET_HOOK" \
+       --arg hb "$HERD_BOARD_HOOK" '
       def strip($ev; $name):
         if .hooks[$ev] then
           .hooks[$ev] = [ .hooks[$ev][]
@@ -288,12 +292,13 @@ register_m2herd_hooks() {
       | strip("SessionStart"; $ss)
       | strip("PreCompact"; $pc)
       | strip("PostToolUse"; $bj)
+      | strip("PreToolUse"; $hb)
     ' "$settings" > "$tmp" && mv "$tmp" "$settings"
     echo "[claude] removed m2herd hook entries from $settings"
     return 0
   fi
 
-  for h in "$M2HERD_SESSION_HOOK" "$M2HERD_PRECOMPACT_HOOK" "$M2HERD_BUDGET_HOOK"; do
+  for h in "$M2HERD_SESSION_HOOK" "$M2HERD_PRECOMPACT_HOOK" "$M2HERD_BUDGET_HOOK" "$HERD_BOARD_HOOK"; do
     install_hook_file "$hooks_dir" "claude" "$h"
   done
   [ "$m2herd_hooks" -eq 1 ] || return 0
@@ -306,6 +311,11 @@ register_m2herd_hooks() {
     echo "[claude] warn: node not found — skipping the $M2HERD_BUDGET_HOOK PostToolUse hook (SessionStart/PreCompact still registered)" >&2
     budget_ok=0
   fi
+  local board_ok=1
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "[claude] warn: python3 not found — skipping the $HERD_BOARD_HOOK PreToolUse hook (herd view, §16.7)" >&2
+    board_ok=0
+  fi
   settings_json_ok "$settings" claude || return 0
   [ -f "$settings" ] || echo '{}' > "$settings"
   backup_file "$settings"
@@ -316,7 +326,9 @@ register_m2herd_hooks() {
      --arg pccmd "bash \"$hooks_dir/$M2HERD_PRECOMPACT_HOOK\"" \
      --arg bjcmd "node \"$hooks_dir/$M2HERD_BUDGET_HOOK\"" \
      --arg matcher "$M2HERD_BUDGET_MATCHER" \
-     --argjson budget "$budget_ok" '
+     --arg hb "$HERD_BOARD_HOOK" --arg hbcmd "python3 \"$hooks_dir/$HERD_BOARD_HOOK\"" \
+     --arg hbmatcher "$HERD_BOARD_MATCHER" \
+     --argjson budget "$budget_ok" --argjson board "$board_ok" '
     def have($ev; $name): [ .hooks[$ev][]?.hooks[]?.command // "" ] | map(contains($name)) | any;
     .hooks = (.hooks // {})
     | (if have("SessionStart"; $ss) then . else
@@ -328,8 +340,11 @@ register_m2herd_hooks() {
     | (if $budget == 0 or have("PostToolUse"; $bj) then . else
          .hooks.PostToolUse = ((.hooks.PostToolUse // [])
            + [{"matcher":$matcher,"hooks":[{"type":"command","command":$bjcmd,"timeout":10}]}]) end)
+    | (if $board == 0 or have("PreToolUse"; $hb) then . else
+         .hooks.PreToolUse = ((.hooks.PreToolUse // [])
+           + [{"matcher":$hbmatcher,"hooks":[{"type":"command","command":$hbcmd,"timeout":5}]}]) end)
   ' "$settings" > "$tmp" && mv "$tmp" "$settings"
-  echo "[claude] registered m2herd hooks in $settings (SessionStart, PreCompact$([ "$budget_ok" -eq 1 ] && echo ", PostToolUse"))"
+  echo "[claude] registered m2herd hooks in $settings (SessionStart, PreCompact$([ "$budget_ok" -eq 1 ] && echo ", PostToolUse")$([ "$board_ok" -eq 1 ] && echo ", PreToolUse herd-board"))"
 }
 
 # --- Claude Code statusline: ctx-bridge.sh (the context-budget bridge WRITER).
@@ -398,7 +413,7 @@ register_claude_statusline() {
 install_m2herd_bins() {
   local bin_dir="$HOME/.local/bin"
   local pair
-  for pair in "m2herd.sh=m2herd" "m2herd-up.sh=m2herd-up"; do
+  for pair in "m2herd.sh=m2herd" "m2herd-up.sh=m2herd-up" "herd-board=herd-board" "herd-spawn.sh=herd-spawn"; do
     local src_name="${pair%%=*}" bin_name="${pair#*=}"
     local src="$SCRIPTS_SRC_DIR/$src_name"
     local link="$bin_dir/$bin_name"
@@ -411,7 +426,13 @@ install_m2herd_bins() {
       continue
     fi
     mkdir -p "$bin_dir"
-    [ -L "$link" ] || [ -e "$link" ] && rm -f "$link"
+    if [ -L "$link" ]; then
+      rm -f "$link"
+    elif [ -e "$link" ]; then
+      # a hand-placed copy (e.g. a locally grown herd-board) is kept, never silently deleted
+      mv "$link" "$link.bak-$BACKUP_TS"
+      echo "[claude] WARNING: $link was a real file — moved to $link.bak-$BACKUP_TS" >&2
+    fi
     ln -s "$src" "$link"
     chmod +x "$src" 2>/dev/null || true
     echo "[claude] linked $link -> $src"
