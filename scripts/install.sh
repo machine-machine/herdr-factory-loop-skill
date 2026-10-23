@@ -409,16 +409,30 @@ register_claude_statusline() {
 }
 
 # PATH wiring: any repo can run the m2herd engine, and the hooks find it via
-# `command -v m2herd` (degrading silently when absent).
+# `command -v m2herd` (degrading silently when absent). The herd flow v2 tools
+# (docs/herd-flow-v2.md §4) import herd_events.py from their realpath dir, so
+# they are linked, never copied.
+M2HERD_BINS=(
+  "m2herd.sh=m2herd" "m2herd-up.sh=m2herd-up" "m2herd-migrate=m2herd-migrate"
+  "herd-board=herd-board" "herd-spawn.sh=herd-spawn"
+  "herd-phase=herd-phase" "herd-watch=herd-watch" "herd-limits=herd-limits" "herd-recover=herd-recover"
+  "herd-clash=herd-clash" "herd-merge=herd-merge" "herd-context=herd-context"
+)
 install_m2herd_bins() {
   local bin_dir="$HOME/.local/bin"
   local pair
-  for pair in "m2herd.sh=m2herd" "m2herd-up.sh=m2herd-up" "herd-board=herd-board" "herd-spawn.sh=herd-spawn"; do
+  for pair in "${M2HERD_BINS[@]}"; do
     local src_name="${pair%%=*}" bin_name="${pair#*=}"
     local src="$SCRIPTS_SRC_DIR/$src_name"
     local link="$bin_dir/$bin_name"
     if [ "$uninstall" -eq 1 ]; then
-      [ -L "$link" ] && rm "$link" && echo "[claude] removed bin symlink $link"
+      # only links this installer made (target …/scripts/<src_name> of some checkout); a link of your own stays
+      if [ -L "$link" ]; then
+        case "$(readlink "$link")" in
+          */scripts/"$src_name") rm "$link" && echo "[claude] removed bin symlink $link" ;;
+          *) echo "[claude] kept $link — not linked by this installer" ;;
+        esac
+      fi
       continue
     fi
     if [ ! -f "$src" ]; then
@@ -438,6 +452,9 @@ install_m2herd_bins() {
     echo "[claude] linked $link -> $src"
   done
 
+  if [ "$uninstall" -eq 0 ] && [ -e "$bin_dir/herd-review-mark" ]; then
+    echo "[claude] note: $bin_dir/herd-review-mark is retired by the v2 herd flow (review_ok events; herd-recover reads its marks once) — left in place"
+  fi
   if [ "$uninstall" -eq 0 ]; then
     case ":$PATH:" in
       *":$bin_dir:"*) ;;

@@ -4,6 +4,73 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.10.0] - 2026-10-23
+
+### Added
+- **Herd flow v2** (`docs/herd-flow-v2.md`, the build contract; SKILL.md §16.7): triage → plan +
+  queue → worker reports → orchestrator accepts → review loop → clean ✓ or findings back to the
+  top of the queue → merge only on the human's go. One schema for every piece:
+  - `<herd>/herd.events.jsonl` — append-only phase events (`queued`, `working`, `accepted`,
+    `review_running`, `review_ok`, `review_befund`, `fix_queued`, `merged`, `parked`) with
+    validated transitions, written only through `scripts/herd-phase` (flock); importable core
+    `scripts/herd_events.py`. Live facts (PR heads, panes, overlaps, `reported`, `stale`) are
+    computed, never stored.
+  - Slice declaration: a `key: value` header in `<slice>.task.md` (`tickets`, `together_with`,
+    `stacked_on`, `model`, `effort`, `needs_memory`, `keywords`) and a required base column in
+    `<slice>.repos`. Template `templates/herd/task.md.example`.
+  - `scripts/herd-watch` (long-running starter: fix rounds before new starts, `stacked_on`
+    respected, failed starts stay queued, wakes only `HERD_ORCH_PANE`), `scripts/herd-limits`
+    (one budget for workers and review agents: slots, free MB, load), `scripts/herd-clash`
+    (overlapping files between live slices), `scripts/herd-context` (the one context file per
+    agent and role, with register excerpt via `scripts/register-excerpt.py`),
+    `scripts/herd-merge` (package merge on the human's verbatim go: stacked order, API before
+    UI, restack with `rebase --onto` + `range-diff`, stops at the first failure),
+    `scripts/herd-recover` (reconcile events with panes, sessions and GitHub after a crash;
+    one-time migration of v1 herd files; empty git object check).
+  - `templates/herd/workflows/` — `review-fix-loop.js` + `review-open-prs.js` moved into the
+    skill: they write the review events themselves, pin a `<slice>--review` worktree to the
+    accepted sha, run the integration probe again, pick the reviewer model the worker did not
+    use, and send findings back to the worker's own session by default.
+  - `templates/herd/rules/WORKER.md`, `REVIEWER.md`, `FIXER.md` — role rules generalised from
+    two weeks of per-herd COMMON chains (no project names; per-herd values are `{{placeholders}}`
+    that `herd-context` fills from `<herd>/ctx.env`). `MODELS.md` — which model and effort for
+    which task, with the reason for each row.
+  - `scripts/m2herd-migrate` — moves a `.m2herd` fabric into the v2 layout (herd dirs →
+    `herden/`, old dispatch → `archives/dispatch/<YYYY-MM>/`, run data → `~/.cache/m2herd/<project>/`,
+    runtime state → `~/.m2herd/state/<project>/`, older NOTES months → `archives/notes/`, the
+    RESUME tail → `archives/<date>/`). Dry run by default with sizes and every script that still
+    names an old path (`--readers` roots plus the fabric's own scripts); `--apply` refuses while
+    such readers exist unless `--force-readers`, keeps live herds and files a process holds open
+    in place, writes `archives/<date>/INDEX.md`, deletes nothing but `__pycache__`, and checks
+    the readers again. `--selftest`; `tests/docs/test_m2herd_migrate_mirror.py` applies it to an
+    emptied mirror of a real fabric and proves no file and no NOTES/RESUME line is lost.
+
+### Changed
+- `herd-board` follows the v2 lanes (Needs you, Queue, Working, Ready to merge, Merged today),
+  shows `slots n/m (k review)`, model·effort per row and ⇄ clash marks; v1 herd dirs are still
+  drawn the old way until `herd-recover` migrates them.
+- `herd-spawn` takes `<herd> <slice> [--resume]`: worktrees from `.repos`, model/effort from the
+  task header, a recorded session id, no start without a free slot.
+- `templates/herd/COMMON.md` is now a short pointer to `templates/herd/rules/` and the `ctx.env`
+  keys.
+- `install.sh` links `herd-phase`, `herd-watch`, `herd-limits`, `herd-recover`, `herd-clash`,
+  `herd-merge`, `herd-context` and `m2herd-migrate` into `~/.local/bin` (idempotent);
+  `--uninstall` now removes only links that point at a `scripts/` file of this skill and keeps
+  links of your own. A leftover `herd-review-mark` is noted, never touched.
+- `herd-spawn` regenerates `<slice>.ctx.worker.md` with `herd-context` before each start when the
+  herd uses it (`ctx.env` or an earlier ctx file), so a fix round started by `herd-watch` carries
+  the befunde file; `HERD_SPAWN_CONTEXT=0` turns it off. The review loop's Start step writes
+  `ctx.reviewer.md` (and `ctx.fixer.md` with `fixBy=fixer`) the same way.
+- A `review_ok` without a recorded `main` sha for one of its repos (a migrated v1 sign-off) shows
+  as stale on the board, never with a merge word — `herd-merge` refuses it.
+- `make test` runs the new offline suites (`make test-herd`); CI runs them too.
+- `__pycache__/` and `*.pyc` are ignored; the tracked bytecode files were removed.
+
+### Removed
+- Retired by v2 (read once by `herd-recover`, never written again): `herd.map`, `active.txt`,
+  `done.txt`, `<slice>.started`, `<slice>.freigabe`, `~/.cache/herd-board/review-state.json`,
+  `herd-review-mark`, hand-written sign-offs.
+
 ## [2.9.0] - 2026-10-21
 
 ### Added

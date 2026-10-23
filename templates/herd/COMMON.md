@@ -1,32 +1,33 @@
-# Herd <name> — rules for every worker
+# Herd rules moved to `rules/`
 
-Copy this file into the herd directory (next to `<slice>.task.md`) and fill in the blanks.
-`herd-spawn` points each worker at this file first, then at its own task file.
+Since 2.10.0 the rules for herd agents are role files, not a per-herd COMMON chain:
 
-## Where you work
+- `templates/herd/rules/WORKER.md`, `REVIEWER.md`, `FIXER.md` — the rules per role.
+- `templates/herd/rules/MODELS.md` — which model and effort for which task.
 
-- Your worktree is the only place you change files. Branch, base and repo are in your task file.
-- Herd directory: `<absolute path>` — your status file and your report go here, not into the worktree.
+`herd-context <role> <herd> <slice>` writes `<herd>/<slice>.ctx.<role>.md`: the role's rules with the
+herd's values filled in, then the task, report, findings, clash list, memory and register excerpt.
+`herd-spawn` points a worker at that file. It looks for the rules in `$HERD_RULES_DIR`, then
+`<project>/.m2herd/rules/` (project overrides), then these templates.
 
-## Keep the board current — `<slice>.status.json`
+Per-herd values are never typed into the rules. Put them into `<herd>/ctx.env` (`KEY=value` lines,
+or `HERD_CTX_<KEY>` in the environment); each becomes the placeholder of the lower-cased key:
 
-The orchestrator and the human watch `herd-board`; it reads this file every 5 seconds.
-Rewrite the whole file whenever your state changes (start, each step, blocked, done):
+    ORCHESTRATOR=orchestrator-1
+    LANGUAGE=English
+    PORTS=api 8061-8069, ui 3161-3169 (slice n uses the n-th)
+    TEST_CMDS=api: .venv/bin/python -m pytest -q; ui: npx tsc --noEmit && npm run lint
+    UNAVAILABLE=nothing
+    TICKET_CMD=lage card <id>
+    REGISTER_LINT=python3 .m2herd/register-lint.py
 
-    {"sentence": "<what you are doing now, one plain sentence>",
-     "step": 2, "of": 5,
-     "missing": "<what is still open; start with 'blocked:' when you are stuck>",
-     "short": "<3-6 words: your goal>",
-     "pr": "<PR #12 | api #12 + ui #4 | PR URL, once it exists>"}
+No inline comments: everything after `=` is the value. `ORCHESTRATOR` is the `SendMessage` target for
+reports (`HERD_ORCH_NAME` sets it too); `LANGUAGE` covers commits, PR texts, user-facing strings and
+review findings.
 
-Plain words, no jargon: the human reads it at a glance.
+Filled by `herd-context` itself: `herd`, `slice`, `role`, `report`, `status`, `worktrees`,
+`base_shas`, `orch_pane`. Anything left unfilled is listed in the head of the context file.
 
-## When you are done
-
-1. Commit, push, open the PR; put the PR into `pr`.
-2. Write your report to `<herd dir>/<slice>.out.md`: what changed, how you verified it
-   (commands + results), what is left.
-3. Set `step` = `of` and `missing` to what the orchestrator still has to do (review, merge).
-4. Report back to the orchestrator (`SendMessage` to `<orchestrator name>`, or print `TASK_DONE_<slice>`).
-
-Stay in the pane after reporting — the PR may need rework. The orchestrator closes the pane after the merge.
+A herd directory without `<slice>.ctx.worker.md` still works: `herd-spawn` then points the worker
+at `<herd>/COMMON.md` if one exists. For a new herd, write `ctx.env` and run `herd-context` instead.
+Task file format: `templates/herd/task.md.example`.

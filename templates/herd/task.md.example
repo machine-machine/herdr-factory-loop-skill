@@ -1,0 +1,46 @@
+tickets: 1111111111, 2222222222
+together_with: invoice-export-ui
+stacked_on: pdf-layout
+model: claude-opus-5-5
+effort: high
+needs_memory: stacked-pr-merge.md, worktree-setup.md
+keywords: invoice, export, CSV
+
+# invoice-export — invoices as CSV from the list view
+
+<!--
+Copy to <herd>/<slice>.task.md. The header is `key: value` lines up to the FIRST BLANK LINE
+(docs/herd-flow-v2.md §2); a line that is not `key: value` also ends it. Every key is optional:
+  tickets        ticket ids; herd-context pulls register entries and `lage` hits for them,
+                 herd-phase mirrors phase changes with `lage log <ticket> herd-<phase>`
+  together_with  partner slices merged as ONE package with this one (transitive)
+  stacked_on     base slice whose PRs must merge first; herd-watch starts this slice only once the
+                 base is at least `accepted`, and <slice>.repos then names the base's branch as base
+  model, effort  defaults claude-opus-5-5 / high — see rules/MODELS.md
+  needs_memory   memory files herd-context copies into the worker's context in full
+  keywords       search words for the register excerpt and `lage search` (default: slice name + title)
+Next to it, <slice>.repos — one line per repo, all three columns required:
+  acme-api  feat/invoice-export  origin/main
+  acme-ui   feat/invoice-export  feat/pdf-layout
+Delete this comment in the real task file.
+-->
+
+## Goal
+
+One or two sentences: what a user can do after this slice that they cannot do today.
+
+## Acceptance
+
+- Observable result 1 (how to check it: click path or call, expected outcome).
+- Observable result 2.
+- Tests: which suite proves it, and that its count goes up.
+
+## Context
+
+- Why now: the request or feedback this comes from, with the date and where it is written down.
+- Recorded decisions that bind this slice (register ids).
+- Files and modules you expect to touch; shared files other slices touch too.
+
+## Out of scope
+
+- What this slice must not do, and which slice does it instead.

@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 2.9.0
+version: 2.10.0
 description: 'Orchestrate a fleet of parallel AI coding agents with herdr, the terminal workspace manager (workspaces/tabs/panes) on this machine: spawn agents (claude/codex/cursor/opencode/etc.), dispatch work, watch lifecycle (idle/working/blocked), unblock approvals, fan out and converge herds; manage agent integrations. Triggers: herdr, "the fleet", orchestrate agents, spawn an agent, "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or driving agents in herdr panes. Also triggers: chat-channel intents (Mattermost/Discord/Slack) needing parallel workers, report back on the same channel; SDD/factory loop (spec-kit, /speckit.*, onboard the factory, spec→plan→tasks→implement); meta-orchestration (meta-orchestrator, fleet-loop/fleet-control, multi-mission /goal portfolios); m2herd — the Claude main-orchestrator context fabric (.m2herd dir; the folder holds the context, the orchestrator holds pointers; refile/notes/areas, fleet-memory gists, RESUME.md).'
 ---
 
@@ -1102,65 +1102,102 @@ the read-only dashboard doctrine: it edits **the config file only** (`.m2herd/se
 validated, atomic tmp+rename), never `overview.json` or any other state. Steering still goes
 through `inbox/STEER.md`; state stays orchestrator-only.
 
-#### 16.7 The herd view — `herd-board`, `herd-spawn`, the subagent hook
+#### 16.7 The herd view and the v2 herd flow
 
-The human watches the **orchestrator's tab**. Full agent TUIs squeezed into small splits show
-nothing but their status bar, and in-process subagents (Claude Code's Agent/Task tool) are
-invisible there. The herd view fixes both with one rule: **the orchestrator's tab holds exactly
-the orchestrator (left 2/3) and ONE board (right 1/3); worker TUIs live in their own tab
-`herde`**, where the human drops in only to talk to a worker.
+The human watches the **orchestrator's tab**: the orchestrator (left 2/3) and ONE `herd-board`
+(right 1/3). Worker TUIs live in their own tab `herde`, where the human drops in only to talk to a
+worker. Since 2.10.0 a herd runs on one schema, `docs/herd-flow-v2.md` (the build contract; it
+wins over this summary):
 
-```
-herd-spawn <herd-dir> <slice> <worktree> [model]   # worker TUI → tab "herde" (created on first use, then split down), focus back to $SELF,
-                                                   # herd.map + active.txt updated, herd dir registered with the board, board opened
-herd-board [--anchor <pane>] [<herd-dir> …]        # the panel; repaints every 5 s, never sends keys, closes itself after 5 idle min
-herd-board --open --anchor <pane>                  # split the anchor's right third and run the board there, unless one is live in that tab
-```
+    triage → plan + queue (no clashing goals, overlaps visible) → worker reports → orchestrator
+    accepts → review loop → ✓ clean (or ! findings → back to the TOP of the queue) → merge on the
+    human's go
 
-**What the board shows.** One block per agent, sorted *needs-me first* (`?` blocked, `⚠`
-still/stalled, `✕` ended without report, `✓` done → check), then running (`●`, `⧗` while
-tests/builds run), then queued (`◌`). Line 1 is the heading: icon and slice name in the state
-colour, `n/m`, the worker's short goal, age. The height is shared evenly, so one worker gets
-the full picture and ten get a line each: progress bar with what is **missing** (yellow), the
-worker's own sentence, live processes in its worktree in plain words ("runs the tests since
-6m"), then its last steps from the transcript (tool descriptions dim, replies `›` italic).
-Lines are never cut with an ellipsis; whole clauses are kept. Footer, pinned to the bottom:
-**Ready to merge** (open PRs of finished workers, with sign-off state) and **Merged today**
-(one line of green PR numbers across the org). Colours are the 16 theme colours with one
-meaning each and the icons carry the meaning without colour; `NO_COLOR` turns colour off.
+**One source of state.** `<herd>/herd.events.jsonl`, append-only, written only through
+`herd-phase` (flock). A slice's state is its last `phase` event: `queued → working → accepted →
+review_running → review_ok | review_befund → fix_queued → working …`, `merged`, `parked`. Every
+live fact (PR open, head sha, pane alive, file overlap, `reported`, `stale`) is computed, never
+stored. Retired: `herd.map`, `active.txt`, `done.txt`, `<slice>.started`, `<slice>.freigabe`,
+`review-state.json`, `herd-review-mark` — `herd-recover` reads them once.
 
-**The worker contract** (put it in the herd's `COMMON.md`, template in
-`templates/herd/COMMON.md`): each worker keeps `<herd-dir>/<slice>.status.json` current —
-`sentence` (what it is doing, plain words), `step`/`of` (progress), `missing` (what is still
-open; start with `blocked:` when it is stuck), `short` (3–6 words for the heading), `pr`
-(`PR #12`, `api #12 + ui #4` or a PR URL) — and writes its report to `<slice>.out.md` when
-done. German keys (`satz`, `schritt`, `von`, `fehlt`, `kurz`) are read too.
+**Declaring a slice.** `<slice>.task.md` starts with a `key: value` header (`tickets`,
+`together_with` = merged as one package, `stacked_on` = base slice, `model`, `effort`,
+`needs_memory`, `keywords`) — template `templates/herd/task.md.example`. `<slice>.repos` has one
+line `repo branch base` per repo; the base column is required.
 
-**Sign-off, not guesswork.** When the orchestrator accepts a PR after review, it writes
-`<herd-dir>/<slice>.signoff` with a line `<repo> #<n> <head-sha>` (`gh pr view N --json
-headRefOid`). The footer says *signed off, waiting for merge* only while the PR head still
-equals that sha; any newer push turns it back to *in review*. File times are never used as a
-review signal: after a rework round they reported stale reviews as current.
+**Rules per role, not per herd.** `templates/herd/rules/WORKER.md`, `REVIEWER.md`, `FIXER.md`
+replace the per-herd COMMON chains; `MODELS.md` says which model and effort for which task. A
+project overrides them in `.m2herd/rules/`. Per-herd values (orchestrator name, ports, test
+commands, what is unreachable) go into `<herd>/ctx.env`; `herd-context <role> <herd> <slice>`
+fills them in and writes `<slice>.ctx.<role>.md` with the rules, task, report, findings, clash
+list, memory files and a register excerpt — the one file an agent starts from.
 
-**Subagents on the board.** `hooks/herd-board-subagents.py` is a PreToolUse hook (matcher
-`Agent|Task`). For every main-thread subagent it waits in the background for the subagent's
-transcript, registers it in `~/.cache/herd-board/<anchor>.agents/` and opens the board if it is
-not live. The subagent then shows as a magenta `◆` line with its last action, `✓ done` for
-two minutes after it finishes. It never blocks the tool call and does nothing outside herdr.
+    herd-phase <herd> <slice> <phase> [--field k=v …] [--note …]   # the only writer; --state [--json] reads
+    herd-spawn <herd> <slice> [--resume]     # worker TUI → tab herde; model/effort from the header; refuses without a slot
+    herd-watch <herd>                        # long-running: starts fix_queued before queued, respects stacked_on, wakes $HERD_ORCH_PANE
+    herd-limits [<herd>]                     # one budget for workers AND review agents (slots, free MB, load)
+    herd-clash <herd> [--json]               # files two live slices both touch → ⇄ on the board
+    herd-context <role> <herd> <slice>       # the agent's context file
+    herd-merge <herd> <package> --go "<the human's words>"   # squash-merge in stacked_on order, restack children
+    herd-recover <herd>                      # after a crash: reconcile events with panes, sessions, GitHub
+    herd-board [--anchor <pane>] [<herd> …]  # the panel; --open splits the anchor's right third
+    m2herd-migrate <.m2herd> [--readers d,d] # dry run of the .m2herd v2 layout; --apply moves, never deletes
 
-**Lifecycle.** Keep a worker pane while its PR may still need rework; right after the merge,
-`herdr pane close` it (the emptied `herde` tab closes itself) and remove the worktree. The
-board drops a slice whose pane is gone and whose report exists. Moving a running pane needs no
-restart (`herdr pane move <p> --tab <t> --target-pane <q> --split down`, or `--new-tab`); pane
-ids survive, and a move steals focus, so focus `$SELF` again.
+**The worker's side.** Keep `<herd>/<slice>.status.json` current (`sentence`, `step`/`of`,
+`missing` — `blocked:` when stuck —, `short`, `pr`; German keys are read too), stop its own
+processes, write `<slice>.out.md`, report to the orchestrator. It never writes events: the board
+shows it as *reported* (✓ "checking") once the report exists, the agent is idle and no process is
+left in its worktrees.
 
-**Settings.** `HERD_BOARD_LANG=de` for German labels; `HERD_BOARD_ORG=<github owner>` enables
-the merged-today line and bare short repo names; `HERD_BOARD_REPOS="api=my-api,ui=my-ui"`
-maps the short names workers write into `pr`. Without them, `#n` means the worker's own repo
-(resolved by `gh` in its worktree). `herd-spawn` reads `HERD_SPAWN_TAB`,
-`HERD_SPAWN_UNSET_KEYS=1` (see Gotchas) and `HERD_SPAWN_ENV` (e.g. git author exports).
-Installed by `scripts/install.sh` for Claude (`~/.local/bin/herd-board`, `herd-spawn`, the
-hook in `settings.json`; skipped with `--no-m2herd-hooks`).
+**The orchestrator's side.** Reads the report, then `herd-phase … accepted --field prs=… --field
+checks=…` (or sends it back: `accepted → working`). When every slice of a package is accepted it
+picks the moment for the review loop (`templates/herd/workflows/review-fix-loop.js`, Workflow
+tool). The loop writes `review_running`, then `review_ok` with every PR and main sha, or
+`review_befund` + `fix_queued` with `<slice>.befunde-<sha7>.md`; by default (loop arg `fixBy: "worker"`)
+the findings go back to the original worker's session (`herd-spawn --resume`). The main reviewer
+is the model the worker did not use. Low findings go to `<herd>/NACH-MERGE.md`.
+
+**Merging.** Only on the human's go, only with `herd-merge`: it refuses unless every slice of the
+package is `review_ok`, not stale and MERGEABLE against `main` (re-read just before), merges API
+before UI (`HERD_MERGE_ORDER`), restacks each stacked child (`rebase --onto`, `range-diff` only
+`=` lines, retarget via REST, only then delete the parent branch), records the go verbatim, and
+stops at the first failure. Any merge on a repo's main makes every other `review_ok` package of
+that repo *stale* (yellow) until it is re-probed. In auto mode the merge needs the human's merge
+instruction in the current turn — a reviewer's ✓ is not one.
+
+**What the board shows.** Lanes, each only when non-empty: **Needs you** (✓✓ package ready → the
+exact merge word; ? blocked), **Queue** (! fix rounds first, then ◌ queued with why it waits),
+**Working** (● working, ⧗ tests running, ↺ fix round, ✓ reported, ⚠ still, ✕ gone, ◆ the
+orchestrator's own subagents), **Ready to merge** (◇ accepted + why the review waits, … review
+round n/3, ✓ reviewed @sha7, ⟳ stale, ! findings), **Merged today**. Header: `slots n/m (k
+review)`, `you: n`, free RAM and disk. Each row ends with model·effort (`O·hi`, `F·hi`, `S·md`).
+The icon carries the meaning, colour only reinforces it (`NO_COLOR`); lines are never cut with
+an ellipsis and overflow says `+N more`. A herd dir without events is drawn the v1 way until
+`herd-recover` migrates it.
+
+**Subagents on the board.** `hooks/herd-board-subagents.py` (PreToolUse, matcher `Agent|Task`)
+registers every main-thread subagent in `~/.cache/herd-board/<anchor>.agents/` and opens the board
+if it is not live; silent in a herd worker's pane. It never blocks the tool call.
+
+**Lifecycle.** Keep a worker pane while its PR may still need rework; right after the merge
+`herdr pane close` it (the emptied `herde` tab closes itself) and remove the worktree. Moving a
+running pane needs no restart (`herdr pane move <p> --tab <t> --target-pane <q> --split down`);
+pane ids survive, and a move steals focus, so focus `$SELF` again.
+
+**Settings.** `HERD_BOARD_LANG=de|en`, `HERD_BOARD_ORG`, `HERD_BOARD_REPOS` (board);
+`HERD_MAX_SLOTS` (6), `HERD_MIN_FREE_MB` (8000), `HERD_MAX_LOAD` (cores×2.5) in the environment or
+`<herd>/limits.env`; `HERD_ORCH_PANE` / `HERD_ORCH_NAME` (who gets woken and reported to);
+`HERD_SPAWN_TAB`, `HERD_SPAWN_UNSET_KEYS`, `HERD_SPAWN_ENV`, `HERD_SPAWN_CONTEXT=0` (no ctx
+regeneration), `HERD_GIT_NAME`/`HERD_GIT_EMAIL` (spawn); the review loop's args `fixBy` (`worker`|`fixer`), `reviewModel` (`other`|`same`),
+`stale` (`delta`|`full`) — the spec's `HERD_FIX_BY`, `HERD_REVIEW_MODEL`, `HERD_STALE`. `scripts/install.sh` links every tool above into `~/.local/bin` (`--uninstall`
+removes only the links it made) and registers the hook (skipped with `--no-m2herd-hooks`).
+
+**Moving an existing fabric.** `m2herd-migrate <project>/.m2herd --readers ~/.local/bin,~/.claude/hooks,~/.claude/skills`
+prints every move (herd dirs → `herden/`, old dispatch → `archives/dispatch/<YYYY-MM>/`, run data
+→ `~/.cache/m2herd/<project>/`, runtime state → `~/.m2herd/state/<project>/`, older NOTES months →
+`archives/notes/`, the RESUME tail → `archives/<date>/`) and every script that still names an old
+path. `--apply` refuses while such readers exist (`--force-readers` overrides), keeps live herds
+in place, writes `archives/<date>/INDEX.md` and deletes nothing but `__pycache__`.
 
 ### 17. evolve — the factory learns
 

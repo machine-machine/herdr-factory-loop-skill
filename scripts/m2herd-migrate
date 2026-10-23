@@ -1,0 +1,847 @@
+#!/usr/bin/env python3
+"""m2herd-migrate — move a project's .m2herd fabric into the v2 layout (docs/herd-flow-v2.md §7).
+
+  m2herd-migrate <m2herd-dir> [--readers DIR,DIR…] [--apply] [--force-readers] [--date YYYY-MM-DD]
+                 [--age DAYS] [--live-hours H] [--move-live] [--project NAME]
+                 [--cache-root DIR] [--state-root DIR] [--verbose]
+  m2herd-migrate --selftest
+
+Dry run by default: prints every planned move with its size, then every reader — a file under the
+--readers roots that still names an old path (`grep -rlIF`, symlinks followed) — and changes nothing.
+--apply refuses (exit 3) while any reader is unresolved, unless --force-readers; it then performs the
+moves, writes archives/<date>/INDEX.md (one line per moved entry) and runs the reader check again.
+Nothing is ever deleted except `__pycache__` directories. A destination that already exists is never
+overwritten: that entry is skipped and reported.
+
+What moves (paths relative to <m2herd-dir>; <date> = --date, default today):
+  dispatch/<herd>/            -> herden/<herd>/              a herd dir: has herd.events.jsonl, herd.map,
+                                                               queue.txt or active.txt. Kept in place while
+                                                               live (v2: a slice not merged/parked; v1: a file
+                                                               changed within --live-hours, default 48) unless
+                                                               --move-live.
+  dispatch/screens/           -> <cache-root>/<project>/screens/   run data (cache-root ~/.cache/m2herd)
+  backups/, runs/             -> <cache-root>/<project>/…
+  dispatch/<other>            -> archives/dispatch/<YYYY-MM>/<other>   when its newest file is older than
+                                                               --age days (default 21); YYYY-MM of that file
+  PHASE-NEXT-<d>.md           -> archives/<date>/              every one but the newest
+  <NAME>-<YYYY-MM-DD>.md      -> archives/<date>/              other dated top-level plans older than --age
+  RESUME.md                   tail from the first "Vorheriger Stand" / "Previous state" heading after the
+                              header -> archives/<date>/RESUME-previous.md (appended)
+  NOTES.md                    entries of months before <date>'s month -> archives/notes/<YYYY-MM>.md
+                              (appended, order kept; under NOTES.md.lock)
+  *.sqlite3/*.db (+-wal/-shm/-journal), *state.json, .sync-stamp, .sync-seen/ at top level
+                              -> <state-root>/<project>/      (state-root ~/.m2herd/state); a `<file>.lock`
+                              or `<file>.<x>.lock` moves with its file, every other lock stays
+  __pycache__/ anywhere       deleted
+Everything else stays and is listed as kept. Any entry a running process holds open (or has as its
+cwd, read from /proc) is skipped. <project> = --project, else the name of the dir holding .m2herd.
+
+Readers are found by fixed strings `.m2herd/<old path>`; a reader that builds the path from variables
+is not found — check those by hand. Exit: 0 ok, 1 a move failed (stops there), 2 usage, 3 refused.
+"""
+import argparse
+import datetime
+import errno
+import fcntl
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+try:
+    import herd_events as he  # noqa: E402
+except ImportError:  # the migration still works without the event core; v2 liveness falls back to mtimes
+    he = None
+
+HOME = os.path.expanduser("~")
+HERD_MARKERS = ("herd.events.jsonl", "herd.map", "queue.txt", "active.txt")
+STATE_RE = re.compile(r"(\.(sqlite3?|db)(-wal|-shm|-journal)?|state\.json)$")
+STATE_NAMES = (".sync-stamp", ".sync-seen")
+SQLITE_SIDE = re.compile(r"-(wal|shm|journal)$")
+DATED_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")
+PHASE_RE = re.compile(r"^PHASE-NEXT-(\d{4}-\d{2}-\d{2})\.md$")
+RESUME_SPLIT_RE = re.compile(r"^#{1,6}\s*(Vorheriger Stand|Previous state|Prior state)\b", re.I)
+NOTES_MARKER = "<!-- === M2HERD:LIVE === -->"
+NOTES_ENTRY_RE = re.compile(r"^(?:- \[|#{2,3} )(\d{4})-(\d{2})-\d{2}")
+PATH_TAIL = re.compile(r"[A-Za-z0-9_.-]")
+KEEP_TOP = {"RESUME.md", "NOTES.md", "rules", "herden", "dispatch", "archives"}
+
+
+# ---------------------------------------------------------------------------------------- helpers
+
+def human(n):
+    for unit in ("B", "KiB", "MiB", "GiB"):
+        if n < 1024 or unit == "GiB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024.0
+    return f"{n:.1f} GiB"
+
+
+def plural(n, one, many):
+    return f"{n} {one if n == 1 else many}"
+
+
+def tilde(p):
+    return "~" + p[len(HOME):] if HOME and HOME != "/" and (p == HOME or p.startswith(HOME + "/")) else p
+
+
+def measure(path):
+    """(bytes, files, newest mtime) without following symlinks."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return 0, 0, 0
+    if not stat.S_ISDIR(st.st_mode):
+        return st.st_size, 1, st.st_mtime
+    size, files, newest = 0, 0, st.st_mtime
+    for root, dirs, fnames in os.walk(path):
+        for d in dirs:
+            try:
+                newest = max(newest, os.lstat(os.path.join(root, d)).st_mtime)
+            except OSError:
+                pass
+        for f in fnames:
+            try:
+                s = os.lstat(os.path.join(root, f))
+            except OSError:
+                continue
+            size += s.st_size
+            files += 1
+            newest = max(newest, s.st_mtime)
+    return size, files, newest
+
+
+def open_paths():
+    """realpath -> 'pid comm' for every cwd and open fd readable in /proc (other users' are skipped)."""
+    out = {}
+    try:
+        pids = [p for p in os.listdir("/proc") if p.isdigit()]
+    except OSError:
+        return out
+    me = str(os.getpid())
+    for pid in pids:
+        if pid == me:
+            continue
+        try:
+            with open(f"/proc/{pid}/comm", encoding="utf-8", errors="replace") as f:
+                comm = f.read().strip()
+        except OSError:
+            continue
+        links = [f"/proc/{pid}/cwd"]
+        try:
+            links += [f"/proc/{pid}/fd/{fd}" for fd in os.listdir(f"/proc/{pid}/fd")]
+        except OSError:
+            pass
+        for ln in links:
+            try:
+                target = os.readlink(ln)
+            except OSError:
+                continue
+            if target.startswith("/"):
+                out.setdefault(target.replace(" (deleted)", ""), f"pid {pid} ({comm})")
+    return out
+
+
+def holder(path, opened):
+    rp = os.path.realpath(path)
+    for p, who in opened.items():
+        if p == rp or p.startswith(rp + "/"):
+            return who
+    return None
+
+
+# ---------------------------------------------------------------------------------------- plan
+
+class Plan:
+    def __init__(self, root, a):
+        self.root = os.path.abspath(root)
+        self.a = a
+        self.date = a.date
+        self.month = a.date[:7]
+        self.project = a.project or os.path.basename(os.path.dirname(self.root)) or "project"
+        self.cache = os.path.join(os.path.expanduser(a.cache_root), self.project)
+        self.state = os.path.join(os.path.expanduser(a.state_root), self.project)
+        self.archive = os.path.join(self.root, "archives", self.date)
+        self.actions = []      # dicts: kind, op (move|split|delete), src, dst, size, files, note, …
+        self.skipped = []      # (rel, reason)
+        self.kept = []         # rel names at top level outside the v2 layout
+        self.opened = open_paths() if a.check_open else {}
+        self.cutoff = time.time() - a.age * 86400
+        self.live_cut = time.time() - a.live_hours * 3600
+
+    def rel(self, p):
+        return os.path.relpath(p, self.root) if p == self.root or p.startswith(self.root + "/") else tilde(p)
+
+    def move(self, kind, src, dst, note=""):
+        if os.path.lexists(dst):
+            self.skipped.append((self.rel(src), f"destination {self.rel(dst)} exists"))
+            return
+        who = holder(src, self.opened)
+        if who:
+            self.skipped.append((self.rel(src), f"in use by {who}"))
+            return
+        size, files, _ = measure(src)
+        self.actions.append({"kind": kind, "op": "move", "src": src, "dst": dst, "size": size, "files": files,
+                             "dir": os.path.isdir(src) and not os.path.islink(src), "note": note})
+
+    # -- herd dirs ---------------------------------------------------------------------------------
+    def herd_live(self, d):
+        if os.path.exists(os.path.join(d, "herd.events.jsonl")) and he is not None:
+            open_ = sorted(s for s, ev in he.state(d).items() if ev["phase"] not in ("merged", "parked"))
+            return f"slices not merged/parked: {', '.join(open_)}" if open_ else None
+        _, _, newest = measure(d)
+        if newest >= self.live_cut:
+            return f"changed {datetime.datetime.fromtimestamp(newest).strftime('%Y-%m-%d %H:%M')} (< {self.a.live_hours} h)"
+        return None
+
+    def build(self):
+        root = self.root
+        # __pycache__ anywhere (never inside a moved tree twice: the delete runs first)
+        for r, dirs, _ in os.walk(root):
+            for d in list(dirs):
+                if d == "__pycache__":
+                    p = os.path.join(r, d)
+                    size, files, _ = measure(p)
+                    self.actions.append({"kind": "pycache", "op": "delete", "src": p, "dst": None, "size": size,
+                                         "files": files, "dir": True, "note": ""})
+                    dirs.remove(d)
+                elif d in (".git", "node_modules", ".venv"):
+                    dirs.remove(d)
+        names = sorted(os.listdir(root))
+        # dispatch/
+        disp = os.path.join(root, "dispatch")
+        if os.path.isdir(disp):
+            for n in sorted(os.listdir(disp)):
+                p = os.path.join(disp, n)
+                if n == "__pycache__":
+                    continue
+                if os.path.isdir(p) and not os.path.islink(p) and any(
+                        os.path.exists(os.path.join(p, m)) for m in HERD_MARKERS):
+                    live = self.herd_live(p)
+                    if live and not self.a.move_live:
+                        self.skipped.append((self.rel(p), f"live herd ({live}); --move-live moves it"))
+                        continue
+                    self.move("herd", p, os.path.join(root, "herden", n), live or "")
+                    continue
+                if n == "screens":
+                    self.move("cache", p, os.path.join(self.cache, "screens"))
+                    continue
+                _, _, newest = measure(p)
+                if newest and newest < self.cutoff:
+                    ym = datetime.datetime.fromtimestamp(newest).strftime("%Y-%m")
+                    self.move("dispatch-old", p, os.path.join(root, "archives", "dispatch", ym, n),
+                              f"newest file {datetime.datetime.fromtimestamp(newest).strftime('%Y-%m-%d')}")
+        # run data
+        for n in ("backups", "runs"):
+            p = os.path.join(root, n)
+            if os.path.isdir(p):
+                self.move("cache", p, os.path.join(self.cache, n))
+        # PHASE-NEXT: keep the newest
+        phases = sorted((m.group(1), n) for n in names for m in [PHASE_RE.match(n)] if m)
+        for _, n in phases[:-1]:
+            self.move("phase-next", os.path.join(root, n), os.path.join(self.archive, n), f"newest is {phases[-1][1]}")
+        # other dated plans
+        cut_date = (datetime.date.fromisoformat(self.date) - datetime.timedelta(days=self.a.age)).isoformat()
+        for n in names:
+            if not n.endswith(".md") or n in KEEP_TOP or PHASE_RE.match(n):
+                continue
+            m = DATED_RE.search(n)
+            if m and m.group(1) < cut_date and os.path.isfile(os.path.join(root, n)):
+                self.move("old-plan", os.path.join(root, n), os.path.join(self.archive, n), f"dated {m.group(1)}")
+        # runtime state
+        state_owners = [n for n in names if (STATE_RE.search(n) and not SQLITE_SIDE.search(n)) or n in STATE_NAMES]
+        grouped = set()
+        for owner in state_owners:
+            group = [owner] + [n for n in names if n != owner and (
+                n in (owner + "-wal", owner + "-shm", owner + "-journal")
+                or (n.startswith(owner + ".") and n.endswith(".lock")))]
+            grouped.update(group)
+            who = next((w for w in (holder(os.path.join(root, g), self.opened) for g in group) if w), None)
+            if who:
+                for g in group:
+                    self.skipped.append((g, f"in use by {who} (state group of {owner})"))
+                continue
+            for g in group:
+                self.move("state", os.path.join(root, g), os.path.join(self.state, g))
+        # RESUME tail
+        self.plan_resume()
+        # NOTES months
+        self.plan_notes()
+        # what stays
+        moved_top = {os.path.relpath(x["src"], root).split("/")[0] for x in self.actions if x["op"] == "move"}
+        skipped_top = {s.split("/")[0] for s, _ in self.skipped}
+        for n in names:
+            if n in KEEP_TOP or n in moved_top or n in grouped or n in skipped_top or n == "__pycache__":
+                continue
+            if PHASE_RE.match(n):
+                continue
+            self.kept.append(n)
+
+    def plan_resume(self):
+        p = os.path.join(self.root, "RESUME.md")
+        if not os.path.isfile(p):
+            return
+        with open(p, encoding="utf-8") as f:
+            lines = f.readlines()
+        cut = next((i for i, ln in enumerate(lines) if i >= 20 and RESUME_SPLIT_RE.match(ln)), None)
+        if cut is None:
+            return
+        tail = "".join(lines[cut:])
+        self.actions.append({"kind": "resume-tail", "op": "split", "src": p,
+                             "dst": os.path.join(self.archive, "RESUME-previous.md"),
+                             "size": len(tail.encode("utf-8")), "files": 1, "dir": False,
+                             "note": f"lines {cut + 1}-{len(lines)}", "cut": cut})
+
+    def plan_notes(self):
+        p = os.path.join(self.root, "NOTES.md")
+        if not os.path.isfile(p):
+            return
+        keep, months = notes_split(p, self.month)
+        for ym in sorted(months):
+            text = "".join(months[ym])
+            self.actions.append({"kind": "notes-month", "op": "split", "src": p,
+                                 "dst": os.path.join(self.root, "archives", "notes", f"{ym}.md"),
+                                 "size": len(text.encode("utf-8")), "files": 1, "dir": False,
+                                 "note": plural(sum(1 for ln in months[ym] if NOTES_ENTRY_RE.match(ln)), "entry", "entries"),
+                                 "month": ym})
+
+    # -- readers -----------------------------------------------------------------------------------
+    def patterns(self):
+        pats = {}
+        for x in self.actions:
+            if x["op"] != "move":
+                continue
+            rel = os.path.relpath(x["src"], self.root)
+            pats[f".m2herd/{rel}"] = x
+        return pats
+
+    def readers(self, pats=None):
+        """[(reader file, [old paths it names])]: the --readers roots plus the scripts inside the fabric."""
+        pats = self.patterns() if pats is None else pats
+        if not pats:
+            return []
+        regs = [(pat, re.compile(re.escape(pat) + r"(?![A-Za-z0-9_.-])")) for pat in sorted(pats)]
+        out = []
+        roots = [r for r in (os.path.expanduser(x) for x in self.a.readers) if os.path.exists(r)]
+        files = []
+        if roots:
+            with tempfile.NamedTemporaryFile("w", delete=False, prefix="m2herd-migrate-pat-") as f:
+                f.write("\n".join(sorted(pats)) + "\n")
+                patfile = f.name
+            try:
+                cmd = ["grep", "-RlIsF", "--exclude-dir=.git", "--exclude-dir=node_modules",
+                       "--exclude-dir=__pycache__", "--exclude-dir=.venv", "-f", patfile, "--"] + roots
+                files = [ln for ln in subprocess.run(cmd, capture_output=True, text=True).stdout.splitlines() if ln]
+            finally:
+                os.unlink(patfile)
+        for fp in sorted(set(files)):
+            if os.path.realpath(fp).startswith(self.root + "/"):
+                continue  # the fabric's own files are checked below, with its own rules
+            hit = [pat for pat, rg in regs if rg.search(read_text(fp))]
+            if hit:
+                out.append((fp, hit))
+        # scripts inside the fabric: a kept script may name a moved path relative to the fabric
+        # (`$(dirname "$0")/.sync-stamp`); a script inside a moved dir may name its own old absolute path
+        bare = [(pat, re.compile(r"(?<![A-Za-z0-9_.-])" + re.escape(pat[len(".m2herd/"):]) + r"(?![A-Za-z0-9_.-])"))
+                for pat in sorted(pats)]
+        moved = [x["src"] for x in self.actions if x["op"] == "move"]
+        for fp in fabric_scripts(self.root):
+            text = read_text(fp)
+            inside = any(fp == s or fp.startswith(s + "/") for s in moved)
+            hit = [pat for pat, rg in (regs if inside else bare) if rg.search(text)
+                   and not (fp == os.path.join(self.root, pat[len(".m2herd/"):]))]
+            if hit:
+                out.append((fp, hit))
+        return out
+
+
+SCRIPT_EXT = (".sh", ".bash", ".py", ".js", ".mjs", ".cjs", ".ts", ".pl", ".rb")
+SECRET_NAME = re.compile(r"(env|credential|secret|token|passw)", re.I)
+
+
+def fabric_scripts(root):
+    """Scripts under the fabric (by extension or exec bit). Files readable only by their owner and names that
+    look like secrets are never opened — they are where tokens live, not readers."""
+    for r, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in ("__pycache__", ".git", "node_modules", ".venv", "archives")]
+        for n in files:
+            fp = os.path.join(r, n)
+            try:
+                st = os.lstat(fp)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or st.st_size > 2 * 1024 * 1024:
+                continue
+            if not (n.endswith(SCRIPT_EXT) or st.st_mode & 0o111):
+                continue
+            if SECRET_NAME.search(n) or not st.st_mode & 0o044:
+                continue
+            yield fp
+
+
+def read_text(fp):
+    try:
+        with open(fp, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def notes_split(path, month):
+    """(lines kept, {YYYY-MM: lines moved}) — entries of months before `month` move, order kept."""
+    with open(path, encoding="utf-8") as f:
+        lines = f.readlines()
+    start = next((i + 1 for i, ln in enumerate(lines) if ln.strip() == NOTES_MARKER), 0)
+    keep, months, cur = lines[:start], {}, None
+    for ln in lines[start:]:
+        m = NOTES_ENTRY_RE.match(ln)
+        if m:
+            ym = f"{m.group(1)}-{m.group(2)}"
+            cur = ym if ym < month else None
+        if cur:
+            months.setdefault(cur, []).append(ln)
+        else:
+            keep.append(ln)
+    return keep, months
+
+
+# ---------------------------------------------------------------------------------------- report
+
+def print_plan(plan, readers, out=sys.stdout):
+    a = plan.a
+    w = out.write
+    w(f"m2herd-migrate: {plan.root} ({'apply' if a.apply else 'dry run'}) — date {plan.date}, age {a.age} d, "
+      f"project {plan.project}\n")
+    w(f"  cache {tilde(plan.cache)}, state {tilde(plan.state)}\n\n")
+    total = 0
+    for x in plan.actions:
+        total += x["size"] if x["op"] != "delete" else 0
+        cnt = f", {plural(x['files'], 'file', 'files')}" if x.get("dir") else ""
+        src = plan.rel(x["src"]) + ("/" if x.get("dir") else "")
+        note = f"  [{x['kind']}{': ' + x['note'] if x['note'] else ''}]"
+        if x["op"] == "move":
+            w(f"MOVE   {src} -> {plan.rel(x['dst'])}{'/' if x.get('dir') else ''}  ({human(x['size'])}{cnt}){note}\n")
+        elif x["op"] == "split":
+            w(f"SPLIT  {src} -> {plan.rel(x['dst'])}  ({human(x['size'])}){note}\n")
+        else:
+            w(f"DELETE {src}  ({human(x['size'])}{cnt}){note}\n")
+    for rel, why in plan.skipped:
+        w(f"SKIP   {rel} — {why}\n")
+    if plan.kept:
+        w(f"KEEP   {len(plan.kept)} top-level entries outside the v2 layout: {', '.join(plan.kept)}\n")
+    if not os.path.isdir(os.path.join(plan.root, "rules")):
+        w("NOTE   no rules/ — herd-context uses the skill's templates/herd/rules/ (copy them here to override)\n")
+    roots = ", ".join(tilde(os.path.expanduser(r)) for r in a.readers) or "(none given: --readers)"
+    w(f"\nREADERS (grep -RlIF over {roots}):\n")
+    if not readers:
+        w("  none\n")
+    for fp, hit in readers:
+        w(f"  {tilde(fp)}: {', '.join(hit)}\n")
+    n = {k: sum(1 for x in plan.actions if x["op"] == k) for k in ("move", "split", "delete")}
+    w(f"\nsummary: {n['move']} moves, {n['split']} splits ({human(total)}), {n['delete']} deletions (__pycache__), "
+      f"{len(plan.skipped)} skipped, {len(readers)} readers unresolved\n")
+    if readers and not a.apply:
+        w("apply would refuse until every reader is updated (or pass --force-readers)\n")
+
+
+# ---------------------------------------------------------------------------------------- apply
+
+def move_entry(src, dst):
+    """rename; across filesystems copy, verify size and count, then remove the source."""
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    try:
+        os.rename(src, dst)
+        return
+    except OSError as e:
+        if e.errno != errno.EXDEV:
+            raise
+    before = measure(src)[:2]
+    if os.path.isdir(src) and not os.path.islink(src):
+        shutil.copytree(src, dst, symlinks=True)
+    else:
+        shutil.copy2(src, dst, follow_symlinks=False)
+    if measure(dst)[:2] != before:
+        raise OSError(f"copy of {src} to {dst} does not match the source (size/count); source kept")
+    if os.path.isdir(src) and not os.path.islink(src):
+        shutil.rmtree(src)
+    else:
+        os.unlink(src)
+
+
+def append_text(dst, text, header):
+    os.makedirs(os.path.dirname(dst), exist_ok=True)
+    with open(dst, "a", encoding="utf-8") as f:
+        if f.tell() == 0:
+            f.write(header + "\n\n")
+        f.write(text if text.endswith("\n") else text + "\n")
+
+
+def rewrite(path, lines):
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    tmp = path + ".m2herd-migrate.tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+
+
+def locked(path):
+    """flock the `<file>.lock` the m2herd engine uses when it exists, else the file itself (creates nothing)."""
+    lk = open(path + ".lock", "a") if os.path.exists(path + ".lock") else open(path, encoding="utf-8")
+    fcntl.flock(lk, fcntl.LOCK_EX)
+    return lk
+
+
+def apply(plan, out=sys.stdout):
+    done = []
+    rc = 0
+    os.makedirs(plan.archive, exist_ok=True)
+    for x in plan.actions:
+        try:
+            if x["op"] == "delete":
+                shutil.rmtree(x["src"])
+            elif x["op"] == "move":
+                if os.path.lexists(x["dst"]):
+                    raise OSError(f"destination {x['dst']} appeared meanwhile")
+                if x["kind"] == "state":
+                    os.makedirs(plan.state, mode=0o700, exist_ok=True)
+                move_entry(x["src"], x["dst"])
+            elif x["kind"] == "resume-tail":
+                with locked(x["src"]):
+                    with open(x["src"], encoding="utf-8") as f:
+                        lines = f.readlines()
+                    cut = next((i for i, ln in enumerate(lines) if i >= 20 and RESUME_SPLIT_RE.match(ln)), None)
+                    if cut is not None:
+                        append_text(x["dst"], "".join(lines[cut:]), f"# RESUME.md — previous states (moved {plan.date})")
+                        rewrite(x["src"], lines[:cut])
+            elif x["kind"] == "notes-month":
+                with locked(x["src"]):
+                    moved = notes_split(x["src"], plan.month)[1].get(x["month"])
+                    if moved:
+                        append_text(x["dst"], "".join(moved), f"# NOTES {x['month']} (moved from NOTES.md {plan.date})")
+                        # only this month leaves; other old months stay until their own action runs
+                        rewrite(x["src"], _without(x["src"], plan.month, x["month"]))
+            done.append(x)
+        except OSError as e:
+            out.write(f"FAILED {plan.rel(x['src'])}: {e}\n")
+            rc = 1
+            break
+    write_index(plan, done)
+    out.write(f"\napplied {len(done)} of {len(plan.actions)} actions; index {plan.rel(os.path.join(plan.archive, 'INDEX.md'))}\n")
+    return rc, done
+
+
+def _lines(path):
+    with open(path, encoding="utf-8") as f:
+        return f.readlines()
+
+
+def _without(path, month, ym):
+    """NOTES.md lines minus the entries of month `ym` (other old months stay for their own action)."""
+    lines = _lines(path)
+    start = next((i + 1 for i, ln in enumerate(lines) if ln.strip() == NOTES_MARKER), 0)
+    out, cur = lines[:start], None
+    for ln in lines[start:]:
+        m = NOTES_ENTRY_RE.match(ln)
+        if m:
+            e = f"{m.group(1)}-{m.group(2)}"
+            cur = e if (e < month and e == ym) else None
+        if not cur:
+            out.append(ln)
+    return out
+
+
+def write_index(plan, done):
+    p = os.path.join(plan.archive, "INDEX.md")
+    new = not os.path.exists(p)
+    with open(p, "a", encoding="utf-8") as f:
+        if new:
+            f.write(f"# Archive {plan.date} — m2herd-migrate\n\n"
+                    f"One line per entry moved out of `{tilde(plan.root)}` by `m2herd-migrate --apply`. "
+                    "Nothing was deleted except `__pycache__`.\n\n")
+        else:
+            f.write(f"\n<!-- run {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} -->\n")
+        for x in done:
+            src = plan.rel(x["src"]) + ("/" if x.get("dir") else "")
+            cnt = f", {plural(x['files'], 'file', 'files')}" if x.get("dir") else ""
+            if x["op"] == "delete":
+                f.write(f"- deleted {src} ({human(x['size'])}{cnt})\n")
+            elif x["op"] == "split":
+                f.write(f"- {x['kind']}: {src} -> {plan.rel(x['dst'])} ({human(x['size'])}; {x['note']})\n")
+            else:
+                f.write(f"- {x['kind']}: {src} -> {plan.rel(x['dst'])}{'/' if x.get('dir') else ''} "
+                        f"({human(x['size'])}{cnt})\n")
+
+
+# ---------------------------------------------------------------------------------------- main
+
+def parse(argv):
+    ap = argparse.ArgumentParser(prog="m2herd-migrate", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__.split("\n\n", 1)[1])
+    ap.add_argument("m2herd", nargs="?", help="the project's .m2herd directory")
+    ap.add_argument("--readers", default="", help="comma-separated roots to grep for old paths")
+    ap.add_argument("--apply", action="store_true", help="perform the moves (default: dry run)")
+    ap.add_argument("--force-readers", action="store_true", help="apply although readers still name old paths")
+    ap.add_argument("--date", default=datetime.date.today().isoformat(), help="archive date (default today)")
+    ap.add_argument("--age", type=int, default=21, help="dispatch/plan age in days before archiving (21)")
+    ap.add_argument("--live-hours", type=int, default=48, help="a v1 herd changed this recently is live (48)")
+    ap.add_argument("--move-live", action="store_true", help="also move live herd dirs")
+    ap.add_argument("--project", help="project name for cache/state dirs")
+    ap.add_argument("--cache-root", default=os.environ.get("M2HERD_CACHE_ROOT", "~/.cache/m2herd"))
+    ap.add_argument("--state-root", default=os.environ.get("M2HERD_STATE_ROOT", "~/.m2herd/state"))
+    ap.add_argument("--no-open-check", dest="check_open", action="store_false",
+                    help="do not skip entries held open by a process (tests)")
+    ap.add_argument("--selftest", action="store_true", help="run the offline selftest in a temp dir")
+    a = ap.parse_args(argv)
+    a.readers = [r for r in a.readers.split(",") if r.strip()]
+    return ap, a
+
+
+def main(argv=None, out=sys.stdout):
+    ap, a = parse(sys.argv[1:] if argv is None else argv)
+    if a.selftest:
+        return selftest()
+    if not a.m2herd:
+        ap.print_usage(sys.stderr)
+        return 2
+    try:
+        datetime.date.fromisoformat(a.date)
+    except ValueError:
+        print(f"m2herd-migrate: --date {a.date!r} is not YYYY-MM-DD", file=sys.stderr)
+        return 2
+    if not os.path.isdir(a.m2herd):
+        print(f"m2herd-migrate: no directory {a.m2herd}", file=sys.stderr)
+        return 2
+    plan = Plan(a.m2herd, a)
+    plan.build()
+    pats = plan.patterns()
+    readers = plan.readers(pats)
+    print_plan(plan, readers, out)
+    if not a.apply:
+        return 0
+    if readers and not a.force_readers:
+        out.write("REFUSED: readers still name old paths — update them, or pass --force-readers\n")
+        return 3
+    if not plan.actions:
+        out.write("nothing to apply\n")
+        return 0
+    rc, _ = apply(plan, out)
+    again = plan.readers(pats)
+    out.write(f"\nreader check after apply: {len(again)} unresolved\n")
+    for fp, hit in again:
+        out.write(f"  {tilde(fp)}: {', '.join(hit)}\n")
+    return rc
+
+
+# ---------------------------------------------------------------------------------------- selftest
+
+def selftest():
+    import contextlib
+    import io
+    ok = fail = 0
+
+    def check(name, cond, detail=""):
+        nonlocal ok, fail
+        if cond:
+            ok += 1
+        else:
+            fail += 1
+            print(f"FAIL {name} {detail}")
+
+    tmp = tempfile.mkdtemp(prefix="m2herd-migrate-selftest-")
+    try:
+        proj = os.path.join(tmp, "proj")
+        m = os.path.join(proj, ".m2herd")
+        old = time.time() - 40 * 86400
+
+        def w(rel, text="x\n", mtime=None):
+            p = os.path.join(m, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text)
+            if mtime:
+                os.utime(p, (mtime, mtime))
+            return p
+
+        w("checks.sh", "#!/bin/sh\n")
+        w("PHASE-NEXT-2026-09-01.md")
+        w("PHASE-NEXT-2026-10-20.md")
+        w("PLAN-OLD-2026-08-01.md")
+        w("PLAN-NEW-2026-10-15.md")
+        w("RESUME.md", "".join(f"head {i}\n" for i in range(20)) + "## Stand now\nline\n"
+          "### Vorheriger Stand (old)\nold a\n### Vorheriger Stand (older)\nold b\n")
+        w("NOTES.md", "<!--\nheader\n-->\n\n" + NOTES_MARKER + "\n- [2026-08-04T09:00:00Z] aug one\n"
+          "## 2026-09-02 — sep head\nsep body\n- [2026-10-01T10:00:00Z] oct one\n- [2026-08-30T10:00:00Z] aug two\n")
+        w("NOTES.md.lock", "")
+        w("queue.sqlite3", "db")
+        w("queue.sqlite3-wal", "wal")
+        w("queue.sqlite3.triage.lock", "")
+        w("poll-state.json", "{}")
+        w("__pycache__/x.pyc", "c")
+        w("tools/__pycache__/y.pyc", "c")
+        w("backups/b1/f.txt")
+        w("runs/r1/run.json", "{}")
+        w("dispatch/screens/a/1.png", "png")
+        w("dispatch/herde-0101/herd.map", "x\n", old)
+        w("dispatch/herde-0101/a.task.md", "t\n", old)
+        w("dispatch/herde-0202/herd.map", "x\n")                 # fresh v1 -> live
+        w("dispatch/herde-0303/a.task.md", "t\n")                # v2, merged -> moves
+        w("dispatch/herde-0303/herd.events.jsonl",
+          '{"ts":"2026-10-01T00:00:00Z","slice":"a","phase":"merged","by":"merge"}\n')
+        w("dispatch/herde-0404/a.task.md", "t\n", old)           # v2, still working -> live
+        w("dispatch/herde-0404/herd.events.jsonl",
+          '{"ts":"2026-10-01T00:00:00Z","slice":"a","phase":"working","by":"watch"}\n', old)
+        for d in ("herde-0101", "herde-0404"):
+            os.utime(os.path.join(m, "dispatch", d), (old, old))
+        w("dispatch/herde-0101/spawn.sh", f"D={m}/dispatch/herde-0101\n", old)   # names its own old path
+        for d in ("herde-0101",):
+            os.utime(os.path.join(m, "dispatch", d), (old, old))
+        w(".sync-stamp", "1\n")
+        w("sync.sh", 'cat "$(dirname "$0")/.sync-stamp"\n')                  # kept script, relative reference
+        w("tool-env.sh", "cat .sync-stamp\n")                                 # secret-looking name: never read
+        os.chmod(w("private.sh", "cat .sync-stamp\n"), 0o600)                  # owner-only: never read
+        w("dispatch/old-recon.out.md", "r\n", old)
+        w("dispatch/new-recon.out.md", "r\n")
+        w("dispatch/olddir/x.md", "r\n", old)
+        os.utime(os.path.join(m, "dispatch/olddir"), (old, old))
+        os.makedirs(os.path.join(m, "archives/dispatch", datetime.datetime.fromtimestamp(old).strftime("%Y-%m"),
+                                 "clash.md"), exist_ok=True)
+        w("dispatch/clash.md", "c\n", old)                       # destination exists -> skipped
+        readers = os.path.join(tmp, "bin")
+        os.makedirs(readers)
+        with open(os.path.join(readers, "tool"), "w") as f:
+            f.write("D=$HOME/proj/.m2herd/dispatch/herde-0101\ncat .m2herd/dispatch/herde-0101x/no\n"
+                    'local runs="$REPO/.m2herd/runs" cur\n')
+        with open(os.path.join(readers, "other"), "w") as f:
+            f.write("cat .m2herd/dispatch/herde-0202/herd.map\n")   # live herd stays -> not a reader
+        base = [m, "--readers", readers, "--date", "2026-10-23", "--cache-root", os.path.join(tmp, "cache"),
+                "--state-root", os.path.join(tmp, "state")]
+
+        def run(extra):
+            buf = io.StringIO()
+            rc = main(base + extra, out=buf)
+            return rc, buf.getvalue()
+
+        rc, txt = run([])
+        check("dry run exit 0", rc == 0, txt)
+        check("herd v1 old moves", "MOVE   dispatch/herde-0101/ -> herden/herde-0101/" in txt, txt)
+        check("herd v1 fresh is live", "SKIP   dispatch/herde-0202 — live herd" in txt, txt)
+        check("herd v2 merged moves", "dispatch/herde-0303/ -> herden/herde-0303/" in txt, txt)
+        check("herd v2 working is live", "dispatch/herde-0404 — live herd (slices not merged/parked: a)" in txt, txt)
+        check("screens to cache", "dispatch/screens/ -> " in txt and "cache/proj/screens/" in txt, txt)
+        check("backups to cache", "MOVE   backups/ ->" in txt, txt)
+        check("old dispatch file archived", "dispatch/old-recon.out.md -> archives/dispatch/" in txt, txt)
+        check("old dispatch dir archived", "dispatch/olddir/ -> archives/dispatch/" in txt, txt)
+        check("new dispatch file stays", "new-recon" not in txt, txt)
+        check("existing destination skipped", "SKIP   dispatch/clash.md — destination" in txt, txt)
+        check("old phase-next archived", "PHASE-NEXT-2026-09-01.md -> archives/2026-10-23/" in txt, txt)
+        check("newest phase-next stays", "PHASE-NEXT-2026-10-20.md ->" not in txt, txt)
+        check("old plan archived", "PLAN-OLD-2026-08-01.md -> archives/2026-10-23/" in txt, txt)
+        check("new plan kept", "PLAN-NEW-2026-10-15.md" in txt.split("KEEP")[1], txt)
+        check("sqlite group to state", "queue.sqlite3-wal ->" in txt and "queue.sqlite3.triage.lock ->" in txt, txt)
+        check("notes lock stays", "NOTES.md.lock ->" not in txt, txt)
+        check("resume split", "SPLIT  RESUME.md -> archives/2026-10-23/RESUME-previous.md" in txt, txt)
+        check("notes split per month", "archives/notes/2026-08.md" in txt and "archives/notes/2026-09.md" in txt
+              and "2026-10.md" not in txt, txt)
+        check("pycache deleted twice", txt.count("DELETE ") == 2, txt)
+        check("reader found with boundary", "tool: .m2herd/dispatch/herde-0101" in txt and "herde-0101x" not in txt, txt)
+        check("live herd reader ignored", "other:" not in txt, txt)
+        check("runs/ to cache, engine flagged as reader", "MOVE   runs/ ->" in txt
+              and re.search(r"tool: .*\.m2herd/runs", txt), txt)
+        check("moved script naming its own old path", "herde-0101/spawn.sh: .m2herd/dispatch/herde-0101" in txt, txt)
+        check("kept fabric script, relative path", "sync.sh: .m2herd/.sync-stamp" in txt, txt)
+        check("secret-looking files never read", "tool-env.sh" not in txt.split("READERS")[1]
+              and "private.sh" not in txt.split("READERS")[1], txt)
+        check("dry run changed nothing", os.path.isdir(os.path.join(m, "dispatch/herde-0101"))
+              and not os.path.exists(os.path.join(m, "archives/2026-10-23")), txt)
+
+        rc, txt = run(["--apply"])
+        check("apply refused with readers", rc == 3 and "REFUSED" in txt, txt)
+        check("refusal changed nothing", os.path.isdir(os.path.join(m, "dispatch/herde-0101")))
+
+        rc, txt = run(["--apply", "--force-readers"])
+        check("forced apply exit 0", rc == 0, txt)
+        check("herd moved", os.path.isfile(os.path.join(m, "herden/herde-0101/herd.map")))
+        check("live herd kept", os.path.isfile(os.path.join(m, "dispatch/herde-0202/herd.map")))
+        check("screens in cache", os.path.isfile(os.path.join(tmp, "cache/proj/screens/a/1.png")))
+        check("state moved with side files", all(os.path.exists(os.path.join(tmp, "state/proj", n)) for n in
+                                                 ("queue.sqlite3", "queue.sqlite3-wal", "queue.sqlite3.triage.lock",
+                                                  "poll-state.json")))
+        check("state dir private", stat.S_IMODE(os.stat(os.path.join(tmp, "state/proj")).st_mode) == 0o700)
+        check("pycache gone", not os.path.exists(os.path.join(m, "__pycache__"))
+              and not os.path.exists(os.path.join(m, "tools/__pycache__")))
+        check("other files never deleted", os.path.isfile(os.path.join(m, "checks.sh"))
+              and os.path.isfile(os.path.join(m, "NOTES.md.lock")))
+        with open(os.path.join(m, "RESUME.md")) as f:
+            res = f.read()
+        check("resume keeps window", res.endswith("## Stand now\nline\n") and "Vorheriger" not in res, res)
+        with open(os.path.join(m, "archives/2026-10-23/RESUME-previous.md")) as f:
+            check("resume tail archived", "old a" in f.read())
+        with open(os.path.join(m, "NOTES.md")) as f:
+            notes = f.read()
+        check("notes keep current month + header", "oct one" in notes and "aug" not in notes and "sep" not in notes
+              and notes.startswith("<!--\nheader"), notes)
+        with open(os.path.join(m, "archives/notes/2026-08.md")) as f:
+            aug = f.read()
+        check("notes august archived in order", aug.index("aug one") < aug.index("aug two"), aug)
+        with open(os.path.join(m, "archives/notes/2026-09.md")) as f:
+            check("notes continuation lines move", "sep body" in f.read())
+        with open(os.path.join(m, "archives/2026-10-23/INDEX.md")) as f:
+            idx = f.read()
+        check("index one line per entry", idx.count("\n- ") == sum(1 for ln in txt.splitlines()
+                                                                      if ln.startswith(("MOVE", "SPLIT", "DELETE"))), idx)
+        check("index lists the herd", "herd: dispatch/herde-0101/ -> herden/herde-0101/" in idx, idx)
+        check("reader check rerun", "reader check after apply: 3 unresolved" in txt
+              and "herden/herde-0101/spawn.sh" in txt.split("after apply")[1], txt)
+
+        rc, txt = run([])
+        check("second dry run is idempotent", "MOVE" not in txt and "SPLIT" not in txt and "DELETE" not in txt, txt)
+
+        # open-file guard: a child process holds a state file open
+        w("busy.sqlite3", "db")
+        child = subprocess.Popen([sys.executable, "-c", "import sys,time; f=open(sys.argv[1]); time.sleep(30)",
+                                  os.path.join(m, "busy.sqlite3")])
+        try:
+            for _ in range(50):
+                if any(os.path.realpath(os.path.join(m, "busy.sqlite3")) == os.path.realpath(os.readlink(
+                        f"/proc/{child.pid}/fd/{fd}")) for fd in os.listdir(f"/proc/{child.pid}/fd")
+                        if os.path.exists(f"/proc/{child.pid}/fd/{fd}")):
+                    break
+                time.sleep(0.05)
+            rc, txt = run([])
+            check("held file skipped", "SKIP   busy.sqlite3 — in use by pid" in txt, txt)
+        finally:
+            child.kill()
+            child.wait()
+
+        # cross-device fallback copies, verifies, then removes the source
+        src = w("xdev/f.txt", "abc")
+        real_rename = os.rename
+
+        def no_rename(a_, b_):
+            raise OSError(errno.EXDEV, "cross-device")
+        os.rename = no_rename
+        try:
+            move_entry(os.path.join(m, "xdev"), os.path.join(tmp, "xdev-dst"))
+        finally:
+            os.rename = real_rename
+        check("exdev copy+verify", os.path.isfile(os.path.join(tmp, "xdev-dst/f.txt")) and not os.path.exists(src))
+
+        with contextlib.redirect_stderr(io.StringIO()):
+            rc = main(["--date", "23.10.2026", m], out=io.StringIO())
+        check("bad date is usage error", rc == 2)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"m2herd-migrate selftest: {ok} passed, {fail} failed")
+    return 0 if fail == 0 else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
