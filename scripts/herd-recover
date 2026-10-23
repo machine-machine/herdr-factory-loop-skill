@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+"""herd-recover — bring a herd back after a crash, reboot or herdr restart (docs/herd-flow-v2.md §4).
+
+  herd-recover <herd> [--dry-run] [--anchor PANE] [--open-board] [--no-gh]
+  herd-recover --selftest
+
+Steps, in this order; every correcting event is written with `by: recover` through herd_events:
+
+1. Migration (only while <herd>/herd.events.jsonl holds no event): reads the retired v1 files once —
+   herd.map (slice=pane, last wins), active.txt, done.txt, queue.txt, <slice>.started (epoch),
+   <slice>.freigabe (`org/repo #n sha` = the orchestrator's sign-off on that exact head after review),
+   <slice>.status.json `pr`, and ~/.cache/herd-board/review-state.json (post-merge review marks) — and writes:
+     queued only (never started)            -> queued pos=n
+     started (map/active/done/.started)     -> working (pane, session_id from the pane's live agent or the
+                                               newest transcript of its first worktree, model, effort, wt,
+                                               started_at from .started, else the older of task.md/out.md)
+     started and back in queue.txt          -> + parked + queued (herd-watch resumes it)
+     .freigabe                              -> + review_ok (forced; prs repo#n@sha40, `main` unknown -> the
+                                               board must treat it as stale and re-probe)
+     every PR MERGED on GitHub              -> + merged (prs repo#n@merge_sha7, go not recorded)
+   review-state.json marks of the slice's PRs are kept as `v1_review` on the last migrated event.
+   The v1 files are left in place (never deleted); after the migration nothing reads them again.
+2. Reconcile events with live facts:
+     working, pane and agent gone (or only a bare shell left), no fresh report
+                                            -> parked + queued (session known: herd-watch resumes it),
+                                               parked only when no session_id is recorded
+     working, pane alive with another Claude session than recorded -> reported, no event
+     any phase with prs, every PR MERGED   -> merged (forced unless from review_ok)
+     a PR CLOSED without merge             -> reported, no event
+     review_running                        -> reported (the loop may have died with the session)
+3. Empty git objects (`find .git/objects -type f -empty`) in every repo of every <slice>.repos, found via
+   the worktrees in HERD_WT_ROOT (default ~/.herdr/worktrees), else HERD_REPO_ROOT/<repo> when set; the
+   repair recipe is printed with them.
+4. Board: says whether a herd-board runs for the anchor and prints the restart command; --open-board also
+   registers the herd and runs `herd-board --open --anchor <anchor>` (a no-op when one is live). It never
+   kills a process.
+
+--dry-run prints the events instead of writing them. --no-gh (or HERD_RECOVER_NO_GH=1) skips GitHub.
+GitHub repos: `org/repo` as written, else HERD_BOARD_REPOS short names (e.g. api=acme-api) and HERD_BOARD_ORG,
+else gh resolves the repo from the slice's worktree remote. Exit 1 when empty git objects were found.
+"""
+import calendar
+import glob
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import herd_events as he  # noqa: E402
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+CACHE = os.path.expanduser("~/.cache/herd-board")
+ORG = os.environ.get("HERD_BOARD_ORG", "")
+SHORTS = dict(p.split("=", 1) for p in os.environ.get("HERD_BOARD_REPOS", "").split(",") if "=" in p)
+
+
+def wt_root():
+    return os.path.expanduser(os.environ.get("HERD_WT_ROOT") or "~/.herdr/worktrees")
+
+
+def read_list(p):
+    try:
+        with open(p, encoding="utf-8") as f:
+            return [l.strip() for l in f if l.strip() and not l.startswith("#")]
+    except OSError:
+        return []
+
+
+def herdr_result(*args):
+    r = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip()[:200])
+    return json.loads(r.stdout)["result"]
+
+
+def live_view():
+    try:
+        agents = {a["pane_id"]: a for a in herdr_result("agent", "list")["agents"]}
+        panes = {p["pane_id"] for p in herdr_result("pane", "list")["panes"]}
+        return agents, panes
+    except (RuntimeError, ValueError, KeyError, OSError, subprocess.TimeoutExpired):
+        return None, None
+
+
+class GH:
+    """`gh pr view` with a cache; returns None when GitHub is off or the call fails (never guesses)."""
+
+    def __init__(self, off):
+        self.off, self.cache = off, {}
+
+    def pr(self, slug, n, cwd=None):
+        if self.off:
+            return None
+        key = (slug or cwd, n)
+        if key not in self.cache:
+            cmd = ["gh", "pr", "view", str(n), "--json", "state,headRefOid,mergeCommit,baseRefName"]
+            if slug:
+                cmd += ["-R", slug]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=20,
+                                   cwd=cwd if cwd and os.path.isdir(cwd) else None)
+                self.cache[key] = json.loads(r.stdout) if r.returncode == 0 else None
+            except (OSError, ValueError, subprocess.TimeoutExpired):
+                self.cache[key] = None
+        return self.cache[key]
+
+
+def slug_of(repo):
+    """`org/repo` for gh, or "" when gh must resolve it from a worktree."""
+    repo = SHORTS.get(repo, repo)
+    repo = SHORTS.get(repo, repo)   # short -> repo -> org/repo (an org learned from a v1 .freigabe)
+    if "/" in repo:
+        return repo
+    return f"{ORG}/{repo}" if ORG else ""
+
+
+def parse_pr_ref(ref):
+    """`repo#n@sha` (repo may be org/repo or a short name) -> (repo, n, sha)."""
+    m = re.match(r"^\s*([\w./-]+)#(\d+)(?:@([0-9a-f]{7,40}))?\s*$", str(ref))
+    return (m[1], int(m[2]), m[3] or "") if m else None
+
+
+class Recover:
+    def __init__(self, herd, dry, gh, anchor):
+        self.herd, self.dry, self.gh, self.anchor = os.path.abspath(herd), dry, gh, anchor
+        self.lines, self.written, self.warned = [], [], set()
+        self.agents, self.panes = live_view()
+        # dry runs track the would-be state so later steps see what earlier ones would have written
+        self.shadow = {s: ev["phase"] for s, ev in he.state(self.herd).items()}
+
+    def say(self, msg):
+        self.lines.append(msg)
+
+    def emit(self, s, phase, note, **fields):
+        frm = self.shadow.get(s)
+        force = phase not in he.TRANSITIONS.get(frm, set())
+        if self.dry:
+            ev = dict(slice=s, phase=phase, by="recover", note=note, **{k: v for k, v in fields.items() if v is not None})
+            if force:
+                ev["forced_from"] = frm
+        else:
+            ev = he.append(self.herd, s, phase, by="recover", note=note, force=force, **fields)
+        self.shadow[s] = phase
+        self.written.append(ev)
+        self.say(f"  {'would write' if self.dry else 'wrote'} {s}: {frm or '-'} -> {phase}{' (forced)' if force else ''} — {note}")
+        return ev
+
+    # --- shared facts ----------------------------------------------------------------------------------------
+    def slices(self):
+        return sorted({f[:-len(".task.md")] for f in os.listdir(self.herd) if f.endswith(".task.md")})
+
+    def repos(self, s):
+        """he.repos, tolerant of v1 lines without the base column (base was optional in v1, origin/main)."""
+        try:
+            return he.repos(self.herd, s)
+        except ValueError:
+            out = []
+            for line in read_list(os.path.join(self.herd, f"{s}.repos")):
+                parts = line.split("#", 1)[0].split()
+                if len(parts) >= 2:
+                    out.append({"repo": parts[0], "branch": parts[1], "base": parts[2] if len(parts) > 2 else "origin/main"})
+            if s not in self.warned:
+                self.warned.add(s)
+                self.say(f"  {s}.repos: v1 lines without base column — read with base origin/main; add the base "
+                         "column before herd-spawn (it refuses without)")
+            return out
+
+    def worktrees(self, s):
+        return [os.path.join(wt_root(), r["repo"], s) for r in self.repos(s)]
+
+    def repo_cwd(self, s, repo):
+        """The slice's worktree for `repo`, so gh can resolve an org-less repo from its remote."""
+        base = repo.split("/")[-1]
+        base = SHORTS.get(base, base)
+        p = os.path.join(wt_root(), base, s)
+        return p if os.path.isdir(p) else None
+
+    def session_of(self, pane, wts):
+        a = (self.agents or {}).get(pane) if pane else None
+        sid = ((a or {}).get("agent_session") or {}).get("value")
+        if sid:
+            return sid
+        for wt in wts[:1]:
+            d = os.path.expanduser("~/.claude/projects/" + re.sub(r"[/.]", "-", os.path.abspath(wt)))
+            files = glob.glob(os.path.join(d, "*.jsonl"))
+            if files:
+                return os.path.basename(max(files, key=os.path.getmtime))[:-len(".jsonl")]
+        return None
+
+    def merged_refs(self, s, prs):
+        """[repo#n@merge_sha7] when GitHub says every PR merged; 'closed' when one closed unmerged; None unknown."""
+        out = []
+        for ref in prs:
+            p = parse_pr_ref(ref)
+            if not p:
+                return None
+            repo, n, _ = p
+            info = self.gh.pr(slug_of(repo), n, self.repo_cwd(s, repo))
+            if not info:
+                return None
+            if info.get("state") == "CLOSED":
+                return "closed"
+            if info.get("state") != "MERGED":
+                return None
+            sha = ((info.get("mergeCommit") or {}).get("oid") or "")[:7]
+            out.append(f"{repo.split('/')[-1]}#{n}@{sha}")
+        return out or None
+
+    # --- 1. migration ----------------------------------------------------------------------------------------
+    def v1_present(self):
+        names = ("herd.map", "active.txt", "done.txt")
+        return any(os.path.exists(os.path.join(self.herd, n)) for n in names) or \
+            bool(glob.glob(os.path.join(self.herd, "*.started")) + glob.glob(os.path.join(self.herd, "*.freigabe")))
+
+    def migrate(self):
+        if he.read(self.herd):
+            self.say("migration: herd.events.jsonl already holds events — v1 files are not read again")
+            return
+        if not self.v1_present():
+            self.say("migration: no v1 files (herd.map, active.txt, done.txt, .started, .freigabe) — nothing to migrate")
+            return
+        self.say("migration: v1 herd found, writing events")
+        h = self.herd
+        pane_of = {}
+        for l in read_list(os.path.join(h, "herd.map")):
+            if "=" in l:
+                k, v = l.split("=", 1)
+                pane_of[k.strip()] = v.strip()
+        active, done = read_list(os.path.join(h, "active.txt")), read_list(os.path.join(h, "done.txt"))
+        queue = read_list(os.path.join(h, "queue.txt"))
+        started_files = {os.path.basename(p)[:-len(".started")] for p in glob.glob(os.path.join(h, "*.started"))}
+        try:
+            review = json.load(open(os.path.join(CACHE, "review-state.json"), encoding="utf-8"))
+            review = review if isinstance(review, dict) else {}
+        except (OSError, ValueError):
+            review = {}
+        everyone = set(self.slices()) | set(pane_of) | set(active) | set(done) | set(queue) | started_files
+        for s in sorted(everyone):
+            if not he.SLICE_RE.match(s):
+                self.say(f"  {s}: not a valid slice name, skipped")
+                continue
+            started = s in pane_of or s in active or s in done or s in started_files
+            if not started:
+                if s in queue:
+                    self.emit(s, "queued", "migrated from v1 queue.txt", pos=queue.index(s) + 1)
+                else:
+                    self.say(f"  {s}: task only, never queued or started — left without events")
+                continue
+            hdr = he.task_header(h, s)
+            wts = self.worktrees(s)
+            pane = pane_of.get(s, "")
+            started_at = self.v1_start(s)
+            prs = [] if s in queue else self.freigabe_prs(s)
+            refs = prs or ([] if s in queue else self.status_prs(s))
+            merged = self.merged_refs(s, refs) if refs else None
+            marks = self.review_marks(review, refs)
+            steps = [("working", "migrated from v1" + (" (done.txt: reported)" if s in done else ""),
+                      dict(pane=pane or None, session_id=self.session_of(pane, wts),
+                           model=hdr.get("model") or "claude-opus-5-5", effort=hdr.get("effort") or "high",
+                           wt=wts, started_at=started_at))]
+            if s in queue:
+                steps += [("parked", "v1 paused it back into queue.txt", dict(reason="v1 queue.txt after start")),
+                          ("queued", "migrated from v1 queue.txt (resume)", dict(pos=queue.index(s) + 1))]
+            if prs:
+                steps.append(("review_ok", "migrated from v1 .freigabe (sign-off on these heads); main unknown, "
+                              "re-probe before merge", dict(prs=prs, run_id="v1-freigabe", lows=[])))
+            if isinstance(merged, list):
+                steps.append(("merged", "migrated: every PR is merged on GitHub",
+                              dict(prs=merged, go="(v1: go words not recorded)")))
+            elif merged == "closed":
+                self.say(f"  {s}: a PR of {', '.join(refs)} is CLOSED without merge — decide by hand")
+            if marks:
+                steps[-1][2]["v1_review"] = marks
+            for phase, note, fields in steps:
+                self.emit(s, phase, note, **fields)
+
+    def v1_start(self, s):
+        """When the v1 round began: <slice>.started, else the older of task.md and out.md (a v1 report always
+        belongs to its round, so herd-watch and the board must see it as written after the start)."""
+        try:
+            t = int(open(os.path.join(self.herd, f"{s}.started")).read().split()[0])
+        except (OSError, ValueError, IndexError):
+            ts = [os.path.getmtime(p) for p in (os.path.join(self.herd, f"{s}.task.md"), os.path.join(self.herd, f"{s}.out.md"))
+                  if os.path.exists(p)]
+            if not ts:
+                return None
+            t = int(min(ts))
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+    def review_marks(self, review, refs):
+        """v1 review-state.json marks (keys short#n or repo#n) of these PR refs."""
+        back = {v.split("/")[-1]: k for k, v in SHORTS.items()}
+        marks = {}
+        for ref in refs:
+            p = parse_pr_ref(ref)
+            if not p:
+                continue
+            repo = p[0].split("/")[-1]
+            for key in (f"{repo}#{p[1]}", f"{back.get(repo, repo)}#{p[1]}"):
+                if isinstance(review.get(key), str):
+                    marks[f"{repo}#{p[1]}"] = review[key]
+        return marks
+
+    def freigabe_prs(self, s):
+        out = []
+        for l in read_list(os.path.join(self.herd, f"{s}.freigabe")):
+            m = re.match(r"(\S+)\s+#(\d+)\s+([0-9a-f]{7,40})", l)
+            if m:
+                out.append(f"{m[1].split('/')[-1]}#{m[2]}@{m[3]}")
+                if "/" in m[1]:
+                    SHORTS.setdefault(m[1].split("/")[-1], m[1])   # keep the org for gh
+        return out
+
+    def status_prs(self, s):
+        try:
+            pr = str(json.load(open(os.path.join(self.herd, f"{s}.status.json"), encoding="utf-8")).get("pr") or "")
+        except (OSError, ValueError, AttributeError):
+            return []
+        refs = []
+        for m in re.finditer(r"github\.com/([\w-]+/[\w.-]+)/pull/(\d+)", pr):
+            refs.append(f"{m[1].split('/')[-1]}#{m[2]}")
+            SHORTS.setdefault(m[1].split("/")[-1], m[1])
+        if refs:
+            return refs
+        home = (self.repos(s) or [{}])[0].get("repo")
+        for m in re.finditer(r"(?:\b([A-Za-z][\w-]*)\s*)?#(\d+)", pr):
+            repo = m[1] if m[1] and m[1].lower() not in ("pr",) else home
+            if repo:
+                refs.append(f"{SHORTS.get(repo, repo).split('/')[-1]}#{m[2]}")
+        return refs
+
+    # --- 2. reconcile ----------------------------------------------------------------------------------------
+    def reconcile(self):
+        st = he.state(self.herd)
+        if self.dry:   # include what a dry migration would have written
+            for ev in self.written:
+                st[ev["slice"]] = dict(st.get(ev["slice"], {}), **ev)
+        self.say("reconcile: events against herdr and GitHub" +
+                 ("" if self.agents is not None else " (herdr unreadable: panes NOT judged)") +
+                 (" (GitHub skipped)" if self.gh.off else ""))
+        for s, ev in sorted(st.items()):
+            phase = ev["phase"]
+            if phase == "working" and self.agents is not None:
+                self.check_worker(s, ev)
+            elif phase == "review_running":
+                self.say(f"  {s}: review_running since {ev.get('since') or ev.get('ts', '?')} (run {ev.get('run_id', '?')}) — "
+                         "the loop may have died with the session; re-run it, or herd-phase ... --force with a note")
+            if phase in ("accepted", "review_running", "review_ok", "review_befund", "fix_queued") and ev.get("prs"):
+                merged = self.merged_refs(s, ev["prs"])
+                if isinstance(merged, list):
+                    self.emit(s, "merged", "recover: every PR is merged on GitHub (outside herd-merge)",
+                              prs=merged, go="(not recorded: merged outside herd-merge)")
+                elif merged == "closed":
+                    self.say(f"  {s}: a PR of {', '.join(ev['prs'])} is CLOSED without merge — park or re-open by hand")
+
+    def check_worker(self, s, ev):
+        pane, sid = ev.get("pane", ""), ev.get("session_id", "")
+        a = self.agents.get(pane)
+        out = os.path.join(self.herd, f"{s}.out.md")
+        start = ev.get("started_at") or ev.get("ts")
+        try:
+            t0 = calendar.timegm(time.strptime(start, "%Y-%m-%dT%H:%M:%SZ"))
+        except (TypeError, ValueError):
+            t0 = 0
+        reported = os.path.exists(out) and os.path.getmtime(out) >= t0
+        if a:
+            live = ((a.get("agent_session") or {}).get("value")) or ""
+            if sid and live and live != sid:
+                self.say(f"  {s}: pane {pane} runs session {live}, events record {sid} — check by hand")
+            else:
+                self.say(f"  {s}: working in {pane} ({a.get('agent_status', '?')})")
+            return
+        if reported:
+            self.say(f"  {s}: reported and its pane {pane or '-'} is closed — nothing to recover")
+            return
+        where = "only a bare shell is left in" if pane in self.panes else "pane gone:"
+        self.emit(s, "parked", f"recover: {where} {pane or '-'} without a report", reason="pane gone after crash/restart")
+        if sid:
+            self.emit(s, "queued", f"recover: herd-watch resumes session {sid}", pos=0)
+        else:
+            self.say(f"  {s}: no session_id recorded — re-queue it by hand for a fresh start")
+
+    # --- 3. empty git objects --------------------------------------------------------------------------------
+    def git_objects(self):
+        self.say("git: empty objects per repo")
+        seen, bad = {}, 0
+        for s in self.slices():
+            for r in self.repos(s):
+                wt = os.path.join(wt_root(), r["repo"], s)
+                if not os.path.isdir(wt) and os.environ.get("HERD_REPO_ROOT"):
+                    wt = os.path.join(os.path.expanduser(os.environ["HERD_REPO_ROOT"]), r["repo"])   # the main checkout
+                if not os.path.isdir(wt):
+                    seen.setdefault(f"{r['repo']} (no worktree)", None)
+                    continue
+                g = subprocess.run(["git", "-C", wt, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                   capture_output=True, text=True)
+                if g.returncode == 0 and g.stdout.strip():
+                    seen.setdefault(g.stdout.strip(), (r["repo"], wt))
+        if not seen:
+            self.say("  no repo listed in any <slice>.repos")
+        for common, val in sorted(seen.items()):
+            if val is None:
+                self.say(f"  {common}: skipped")
+                continue
+            repo, wt = val
+            empty = []
+            for root, _, files in os.walk(os.path.join(common, "objects")):
+                empty += [os.path.join(root, f) for f in files if os.path.getsize(os.path.join(root, f)) == 0]
+            bad += len(empty)
+            if empty:
+                self.say(f"  {repo}: {len(empty)} EMPTY object file(s) in {common}/objects:")
+                self.say("\n".join(f"    {p}" for p in sorted(empty)))
+                self.say(f"    repair: move them aside, `git hash-object -w <files>` in {wt} for the staged files, "
+                         "then `git fsck --connectivity-only`")
+            else:
+                self.say(f"  {repo}: ok ({common})")
+        return bad
+
+    # --- 4. board --------------------------------------------------------------------------------------------
+    def board(self, open_it):
+        if not self.anchor:
+            self.say("board: no anchor (HERD_ORCH_PANE/HERDR_PANE_ID) — start it with `herd-board --open --anchor <your pane>`")
+            return
+        pid = None
+        try:
+            pid = open(os.path.join(CACHE, "live", self.anchor.replace(":", "_"))).read().split()[0]
+            if b"herd-board" not in open(f"/proc/{pid}/cmdline", "rb").read():
+                pid = None
+        except (OSError, IndexError):
+            pid = None
+        if pid:
+            self.say(f"board: live for {self.anchor} (pid {pid}). A board restarted by herdr without --anchor shows "
+                     f"no subagents: stop it by pid (never pkill -f), then `herd-board --open --anchor {self.anchor}`")
+        else:
+            self.say(f"board: none registered for {self.anchor} — `herd-board --open --anchor {self.anchor}`"
+                     + (" (opening now)" if open_it else ""))
+        if open_it and not self.dry:
+            reg = os.path.join(CACHE, f"{self.anchor.replace(':', '_')}.herds")
+            os.makedirs(CACHE, exist_ok=True)
+            if self.herd not in read_list(reg):
+                with open(reg, "a", encoding="utf-8") as f:
+                    f.write(self.herd + "\n")
+            subprocess.run(["herd-board", "--open", "--anchor", self.anchor], capture_output=True, timeout=30)
+
+
+def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    if argv[:1] == ["--selftest"]:
+        return subprocess.call([sys.executable, os.path.join(HERE, "..", "tests", "spawnwatch", "test_spawnwatch.py"),
+                                "-k", "Recover"])
+    herd, dry, open_board = None, False, False
+    no_gh = os.environ.get("HERD_RECOVER_NO_GH") == "1"
+    anchor = os.environ.get("HERD_ORCH_PANE") or os.environ.get("HERD_ANCHOR") or os.environ.get("HERDR_PANE_ID") or ""
+    rest = list(argv)
+    while rest:
+        a = rest.pop(0)
+        if a == "--dry-run":
+            dry = True
+        elif a == "--no-gh":
+            no_gh = True
+        elif a == "--open-board":
+            open_board = True
+        elif a == "--anchor" and rest:
+            anchor = rest.pop(0)
+        elif not a.startswith("-") and herd is None:
+            herd = a
+        else:
+            print(f"herd-recover: unknown argument {a!r} (see --help)", file=sys.stderr)
+            return 2
+    if not herd or not os.path.isdir(herd):
+        print("herd-recover: usage: herd-recover <herd> [--dry-run] [--anchor PANE] [--open-board] [--no-gh]",
+              file=sys.stderr)
+        return 2
+    rc = Recover(herd, dry, GH(no_gh), anchor)
+    rc.say(f"herd-recover {rc.herd}{' (dry run)' if dry else ''}")
+    rc.migrate()
+    rc.reconcile()
+    bad = rc.git_objects()
+    rc.board(open_board)
+    rc.say(f"done: {len(rc.written)} event(s) {'proposed' if dry else 'written'}, {bad} empty git object(s)")
+    print("\n".join(rc.lines))
+    return 1 if bad else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
