@@ -260,6 +260,8 @@ c. **Run data found inside the fabric** goes to the cache first, the way migrate
    `dispatch/screens` → `screens/`, `<herd>/…` → `herden/<herd>/…`, any other path keeps its path.
    After the move it falls under (a). An entry that (a) would delete straight away is deleted in
    place, so it is never copied first. Entries newer than the grace time stay, and so do live herds.
+   Exception: the fabric's own top-level `runs/` is the engine's run store (`m2herd evolve --run`
+   resolves `.m2herd/runs/r-*`, m2herd-up writes slice status there) and is never moved.
 
 `archives/` is never touched, and nothing a process holds open is moved or deleted. Settings come
 from the command line, then the environment, then `<fabric>/rules/purge.env` (`KEY=VALUE` lines),

@@ -342,6 +342,7 @@ def main():
     usage_and_templates()
     not_a_fabric()
     flock_only_locks()
+    engine_run_store()
     print(f"m2herd-purge tests: {ok} passed, {fail} failed")
     return 0 if fail == 0 else 1
 
@@ -398,6 +399,25 @@ def flock_only_locks():
                       for r in ("inbox/STEER.md", "inbox/steer.ledger.jsonl", "NOTES.md")), txt)
         check("orphaned old lock is deleted", "DELETE  inbox/gone.json.lock" in plan
               and not os.path.exists(os.path.join(m, "inbox/gone.json.lock")), txt)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def engine_run_store():
+    """The fabric's top-level runs/ is the engine's run store: `m2herd evolve --run <id>` globs
+    .m2herd/runs/r-* and m2herd-up writes slice status there, so purge never moves it (review PR #28)."""
+    tmp = tempfile.mkdtemp(prefix="m2herd-purge-test-")
+    try:
+        home = os.path.join(tmp, "home")
+        os.makedirs(home)
+        m = small_fabric(tmp, "p7")
+        w(m, "runs/CURRENT", "r-B\n", OLD)
+        w(m, "runs/r-A/run.json", "{}\n", OLD)
+        w(m, "runs/r-B/run.json", "{}\n", OLD)
+        rc, txt = cli([m, "--readers", "", "--date", TODAY, "--apply"], home)
+        plan = txt.split("totals")[0]
+        check("engine run store stays in the fabric", rc == 0 and "runs/r-A" not in plan
+              and os.path.isfile(os.path.join(m, "runs/r-A/run.json")), txt)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

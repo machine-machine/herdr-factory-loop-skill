@@ -438,6 +438,11 @@ class Purge:
                     continue
                 dirs.remove(d)
                 p = os.path.join(r, d)
+                if r == self.root and d == "runs":
+                    # the engine's run store: `m2herd evolve` resolves --run against .m2herd/runs/r-*
+                    # and m2herd-up writes slice status there — moving it would break both
+                    self.kept.append((p, "engine run store (m2herd evolve reads .m2herd/runs)"))
+                    continue
                 if os.path.islink(p):
                     continue
                 dest, herd = self.run_dest(p)
