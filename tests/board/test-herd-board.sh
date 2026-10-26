@@ -76,7 +76,7 @@ ln -s "$T/fake/herdr" "$T/notools/herdr"; ln -s "$T/fake/gh" "$T/notools/gh"
 export HOME="$T/home" NO_COLOR=1 COLUMNS=110 LINES=60 HERD_BOARD_LANG=de HERD_BOARD_ORG=acme \
   HERD_BOARD_REPOS="api=acme-api"
 BASEPATH="$(dirname "$PY"):/usr/bin:/bin"
-board() { PATH="$T/fake:$BASEPATH" "$T/board/herd-board" "$@"; }
+board() { HERD_BOARD_DETAIL=1 PATH="$T/fake:$BASEPATH" "$T/board/herd-board" "$@"; }  # detailed rows; --selftest covers the simple view
 phase() { PATH="$T/fake:$BASEPATH" "$T/board/herd-phase" "$@" >/dev/null; }
 
 # --- a v2 herd written through herd-phase ----------------------------------------------------------------------

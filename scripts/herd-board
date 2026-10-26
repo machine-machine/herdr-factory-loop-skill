@@ -35,6 +35,8 @@ Worker status contract (<slice>.status.json, written by the worker, English or G
 
 Environment:
   HERD_BOARD_LANG   en (default) | de
+  HERD_BOARD_DETAIL 1 = also model·effort tags, ⇄ overlaps, PR refs @sha7, merge word, Workflow runs
+                    (default: simple — name, state, progress, sentence)
   HERD_BOARD_ORG    GitHub owner(s), comma-separated, for bare repo names and the "merged today" search
                     (unset: no search; gh resolves repos from the slice's worktree)
   HERD_BOARD_REPOS  short names used in refs, e.g. "api=my-api,ui=my-ui,ma=other-owner/agent"
@@ -60,6 +62,9 @@ REPOS = dict(p.strip().split("=", 1) for p in os.environ.get("HERD_BOARD_REPOS",
 SHORT = {v.split("/")[-1]: k for k, v in REPOS.items()}
 
 LANG = "de" if os.environ.get("HERD_BOARD_LANG", "").lower().startswith("de") else "en"
+# Simple by default: name, state, progress, the worker's sentence. HERD_BOARD_DETAIL=1 adds model·effort tags,
+# ⇄ file overlaps, PR refs @sha7, the merge word and one line per Workflow run (operator 26.10.: too crowded).
+DETAIL = os.environ.get("HERD_BOARD_DETAIL", "").lower() in ("1", "true", "yes", "ja")
 STRINGS = {
     "en": {"title": "Herd", "load": "load", "done": "done", "check": "check", "working": "working",
            "still": "still", "needs_answer": "needs an answer", "ended": "ended without a report", "missing": "missing:",
@@ -429,7 +434,8 @@ def agent_rows(anchor, agents=None):
             label, jsonl = open(reg, encoding="utf-8").read().split("\n", 1)
             jsonl = jsonl.strip()
             if os.path.isdir(jsonl):
-                rows += workflow_rows(reg, label, jsonl)
+                if DETAIL:  # simple view: a review run already shows as "Review läuft" under Ready to merge
+                    rows += workflow_rows(reg, label, jsonl)
                 continue
             meta = json.load(open(jsonl[:-6] + ".meta.json")) if os.path.exists(jsonl[:-6] + ".meta.json") else {}
             meta = meta if isinstance(meta, dict) else {}
@@ -815,6 +821,8 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
         return hdrs[s]
 
     def tag(s):
+        if not DETAIL:
+            return ""
         w = lastwork.get(s) or {}
         return model_tag(w.get("model") or hdr(s).get("model"), w.get("effort") or hdr(s).get("effort"))
 
@@ -824,7 +832,7 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
     def phase(s):
         return (st.get(s) or {}).get("phase")
 
-    clash = herd_clash(herd)
+    clash = herd_clash(herd) if DETAIL else {}
     live = {s for s, ev in st.items() if ev["phase"] not in ("merged", "parked")}
     clash_of = lambda *ss: ", ".join(sorted({o for s in ss for o in clash.get(s, ()) if o in live and o not in ss}))
 
@@ -906,7 +914,7 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
         wts = [w for m in members for w in as_list((lastwork.get(m) or {}).get("wt"))]
         stale = {m: stale_of(st[m], wts, merged_evs, members) for m in members if ph[m] == "review_ok"}
         refs = [r for m in members if ph[m] in ("review_ok", "review_befund", "accepted", "review_running")
-                for r in pr_refs(st[m])]
+                for r in pr_refs(st[m])] if DETAIL else []
         tags = tail(*dict.fromkeys(tag(m) for m in members if tag(m)))
         c = clash_of(*members)
         d = {"clash": c if c.count(",") < 1 else str(c.count(",") + 1)}  # two or more: just the count, rows stay short
@@ -917,7 +925,8 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
         if not waiting and not ext_bases and reviewed and all(ph[m] in ("review_ok", "merged") for m in members) \
                 and not any(stale.values()):
             word = f"merge {members[0]}"
-            text = f"{t('reviewed')} ✓ · {t('word', w=word)}" + (" · " + " ".join(refs) if refs else "")
+            text = f"{t('reviewed')} ✓" + (f" · {t('word', w=word)}" if DETAIL else "") + \
+                (" · " + " ".join(refs) if refs else "")
             lanes["ready"].append((0, name, "✓", BLUE, "", text, tags, d))  # blue, like the numbers under Merged today
             continue
         if any(ph[m] == "review_befund" for m in members):
@@ -1462,6 +1471,8 @@ def selftest():
     and a failing repaint. Offline: no herdr, no gh, no ~/.cache writes. Exit 0 = pass."""
     import tempfile
     g = globals()
+    detail_before = g["DETAIL"]
+    g["DETAIL"] = True  # most checks read the detailed rows; the simple view has its own check below
     strip = lambda ls: [ANSI.sub("", l) for l in ls]
     fails = []
 
@@ -1654,6 +1665,12 @@ def selftest():
                 check(f"[{lang}] v1 fallback line + rows", t("v1") in text and "hbst-liste" in text and
                       f"{t('missing')} Tests, Doku" in text)
             g["LANG"] = "de"
+            g["DETAIL"] = False
+            simple = "\n".join(strip(render("", [herd, old])[0]))
+            check("simple view: no tags, overlaps, refs or merge word; rev'd ✓ stays",
+                  "O·hi" not in simple and "⇄" not in simple and "@" + sha("b")[:7] not in simple
+                  and t("word", w="merge ok-api") not in simple and f"{t('reviewed')} ✓" in simple)
+            g["DETAIL"] = True
             os.environ.update(LINES="16")
             out, busy = render("", [herd, old])
             lines = strip(out)
@@ -1692,6 +1709,7 @@ def selftest():
         finally:
             g.update(real)
             TOOL_CACHE.clear()
+    g["DETAIL"] = detail_before
     print("herd-board selftest: " + (f"FAILED ({len(fails)})" if fails else "OK"))
     return 1 if fails else 0
 
