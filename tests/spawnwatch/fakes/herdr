@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Fake herdr for the spawnwatch tests: state in $FAKE_HERDR_STATE (JSON), every call logged to $FAKE_HERDR_LOG.
+
+State: {"tabs": [{tab_id, workspace_id, label}], "panes": [{pane_id, tab_id, scroll: {viewport_rows}}],
+        "agents": [{pane_id, tab_id, agent_status, cwd, agent_session: {value}}], "next": int,
+        "fail": ["pane run", ...]}   # command prefixes that exit 1
+`pane run` registers a working agent on the pane, with the session from --session-id/--resume.
+"""
+import json, os, re, sys
+
+st_path, log_path = os.environ["FAKE_HERDR_STATE"], os.environ["FAKE_HERDR_LOG"]
+try:
+    st = json.load(open(st_path))
+except (OSError, ValueError):
+    st = {}
+for k in ("tabs", "panes", "agents", "fail"):
+    st.setdefault(k, [])
+st.setdefault("next", 10)
+args = sys.argv[1:]
+with open(log_path, "a") as f:
+    f.write(json.dumps(args) + "\n")
+cmd = " ".join(args[:2])
+if any(cmd.startswith(x) for x in st["fail"]):
+    print("fake failure", file=sys.stderr)
+    sys.exit(1)
+
+
+def save():
+    json.dump(st, open(st_path, "w"), indent=1)
+
+
+def out(result):
+    print(json.dumps({"result": result}))
+
+
+def opt(name, default=None):
+    return args[args.index(name) + 1] if name in args else default
+
+
+def new_pane(tab, rows=40):
+    st["next"] += 1
+    ws = tab.split(":")[0]
+    p = {"pane_id": f"{ws}:p{st['next']}", "tab_id": tab, "scroll": {"viewport_rows": rows}}
+    st["panes"].append(p)
+    return p
+
+
+if cmd == "tab list":
+    out({"tabs": st["tabs"]})
+elif cmd == "pane list":
+    out({"panes": st["panes"]})
+elif cmd == "agent list":
+    out({"agents": st["agents"]})
+elif cmd == "pane split":
+    src = next(p for p in st["panes"] if p["pane_id"] == opt("--pane"))
+    rows = src["scroll"]["viewport_rows"]
+    if opt("--direction") == "down":
+        src["scroll"]["viewport_rows"] = rows // 2
+        rows = rows - rows // 2
+    p = new_pane(src["tab_id"], rows)
+    save()
+    out({"pane": {"pane_id": p["pane_id"]}})
+elif cmd == "pane move":
+    p = next(p for p in st["panes"] if p["pane_id"] == args[2])
+    st["next"] += 1
+    tab = f"{p['tab_id'].split(':')[0]}:t{st['next']}"
+    st["tabs"].append({"tab_id": tab, "workspace_id": tab.split(":")[0], "label": ""})
+    p["tab_id"] = tab
+    save()
+    out({"move_result": {"created_tab": {"tab_id": tab}}})
+elif cmd == "tab rename":
+    for t in st["tabs"]:
+        if t["tab_id"] == args[2]:
+            t["label"] = args[3]
+    save()
+    out({})
+elif cmd == "pane run":
+    pane, line = args[2], args[3]
+    p = next((p for p in st["panes"] if p["pane_id"] == pane), None)
+    if p is None:
+        print("pane_not_found", file=sys.stderr)
+        sys.exit(1)
+    m = re.search(r"--(?:session-id|resume) ([0-9a-f-]{36})", line)
+    st["agents"] = [a for a in st["agents"] if a["pane_id"] != pane]
+    st["agents"].append({"pane_id": pane, "tab_id": p["tab_id"], "agent_status": "working",
+                         "cwd": "", "agent_session": {"value": m[1] if m else ""}})
+    save()
+    out({})
+elif cmd == "pane close":
+    st["panes"] = [p for p in st["panes"] if p["pane_id"] != args[2]]
+    st["agents"] = [a for a in st["agents"] if a["pane_id"] != args[2]]
+    if os.environ.get("FAKE_HERDR_KEEP_EMPTY_TABS") != "1":   # herdr closes an emptied tab by itself
+        st["tabs"] = [t for t in st["tabs"] if any(p["tab_id"] == t["tab_id"] for p in st["panes"])]
+    save()
+    out({})
+elif cmd in ("agent prompt", "agent focus", "tab focus"):
+    out({})
+else:
+    print(f"fake herdr: unsupported {args}", file=sys.stderr)
+    sys.exit(2)

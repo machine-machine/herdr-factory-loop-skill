@@ -1,0 +1,863 @@
+#!/usr/bin/env python3
+"""m2herd-steer — deterministic intake, ledger and verification for .m2herd/inbox/STEER.md.
+
+"Intelligent determinism" (docs/herd-flow-v2.md, section STEER): a deterministic trigger
+(hooks/m2herd-steer-gate.sh) makes the orchestrator look, the orchestrator judges each item
+(templates/herd/rules/STEER.md), and a deterministic check (`verify`) proves nothing was skipped.
+
+  m2herd-steer [--fabric DIR | --steer FILE] list [--open] [--all] [--json]
+  m2herd-steer ack <key>... --action done|dropped|ticket|register|delegated --note "..."
+  m2herd-steer defer <key>... --until YYYY-MM-DD[THH:MM] --note "..."
+  m2herd-steer pending-count            open items (deferred-until-future ones do not count)
+  m2herd-steer verify                   exit 1 while any item is open
+  m2herd-steer compact [--dry-run]      closed entries -> <fabric>/archives/steer/<YYYY-MM>.md
+  m2herd-steer gate [--event NAME]      hook body: reads the hook payload on stdin (see the hook)
+  m2herd-steer --selftest
+
+Intake. Every entry below the marker (a `- ` bullet line plus indented continuation lines, or a
+bare line) is one report. `- <ISO ts> <Source>: finding; finding; ... [. Word: /path]` is a watcher
+report: it is split at `; ` into findings, the trailing `Word: /path` pointer becomes a hint.
+Anything else (a human or TUI line) is one finding. Each finding gets a stable key from its
+normalised text: timestamps dropped, small numbers (<6 digits: counters, durations) -> `#`,
+ids (`#123`, numbers with >=6 digits, hex shas) -> `<id>`. The subject is the leading id chain
+(`123456789:987654321 ...`), else the first id, else the text; `Label: id,id,id` lists key on the
+label and carry the ids as payload. Repeats fold into one item with first/last seen and count.
+
+Ledger `<inbox>/steer.ledger.jsonl`, append-only, flock on `<ledger>.lock`:
+  seen        one per newly observed entry, with its findings (keys, ids, text)
+  ack         action + note; `done` reopens when reported again, `ticket|register|delegated`
+              reopen only when new ids appear in a `Label: id,id,…` list item (a list that grew;
+              incidental ids like a run number never reopen), `dropped` never reopens
+  defer       until + note; open again once the date has passed
+  superseded  written by intake for open items of a source: a newer status for the same subject,
+              or (snapshot watchers only: consecutive reports share findings and some report
+              carries more than one) absent from the source's last 2 reports; a superseded
+              item reopens when it is reported again
+  compacted / vanished   bookkeeping so a moved or hand-deleted entry is never read twice
+STEER.md itself is only ever rewritten by `compact`, under the engine's `<file>.lock` flock.
+
+Env: M2HERD_DIR (repo root holding .m2herd/), M2HERD_STEER_NOW (ISO clock override, tests),
+M2HERD_STEER_STATE_DIR (gate rate-limit state; default ~/.m2herd/state/<project>/),
+M2HERD_STEER_RATE (gate interval in seconds, default 1800), M2HERD_STEER_GATE=0 (silence the gate).
+"""
+import argparse
+import collections
+import datetime
+import glob
+import hashlib
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+
+try:
+    import fcntl
+except ImportError:  # no flock (non-POSIX): degrade to unlocked, like the engine
+    fcntl = None
+
+MARKER = "<!-- === M2HERD:LIVE === -->"
+ACTIONS = ("done", "dropped", "ticket", "register", "delegated")
+STICKY_IDS = ("ticket", "register", "delegated")
+ABSENT_REPORTS = 2          # a snapshot watcher's item is superseded after this many reports without it
+RATE_SECONDS = 1800
+URGENT = re.compile(r"NEEDS_HUMAN|BLOCK|FAIL|ERROR|PAUSE|KILL|STOP|URGENT|DRINGEND", re.I)
+
+TS_RE = r"\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?"
+ENTRY_HEAD = re.compile(r"^\s*[-*]\s+(?:\[(?P<bts>" + TS_RE + r")\]|(?P<ts>" + TS_RE + r"))?\s*(?P<body>.*)$", re.S)
+BARE_HEAD = re.compile(r"^\s*(?:\[(?P<bts>" + TS_RE + r")\]|(?P<ts>" + TS_RE + r"))?\s*(?P<body>.*)$", re.S)
+SOURCE_RE = re.compile(r"^(?P<src>[^\W\d_][^\d:;/,.]{0,39}?):\s+(?P<rest>.+)$", re.S)
+HINT_RE = re.compile(r"(?:^|[.;]\s+)(?P<word>[^\s:;.,/]{1,24}):\s+(?P<path>\S*/\S+?)\.?\s*$")
+ID_TOKEN = r"(?:#\d+|\b\d{6,}\b|\b(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,40}\b)"
+ID_RE = re.compile(ID_TOKEN)
+CHAIN_RE = re.compile(r"^(?P<chain>(?:#\d+|\d{6,})(?:\s*[:/]\s*(?:#\d+|\d{6,}))*)(?=[\s:]|$)\s*:?\s*")
+LIST_RE = re.compile(r"^(?P<label>[^:]*[^\W\d_][^:]*):\s*(?P<ids>(?:#?\w+)(?:\s*,\s*#?\w+)*)\s*,?\s*$")
+TIME_RE = re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b")
+NUM_RE = re.compile(r"\d+(?:[.,]\d+)*")
+TRANS = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss", "Ä": "ae", "Ö": "oe", "Ü": "ue"})
+
+
+# ------------------------------------------------------------------------------------------- clock
+
+def now_utc():
+    env = os.environ.get("M2HERD_STEER_NOW", "").strip()
+    if env:
+        d = parse_when(env)
+        if d:
+            return d
+    return datetime.datetime.now(datetime.timezone.utc)
+
+
+def parse_when(s):
+    s = (s or "").strip()
+    if not s:
+        return None
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        s += "T00:00:00+00:00"
+    s = s.replace("Z", "+00:00").replace(" ", "T", 1)
+    try:
+        d = datetime.datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=datetime.timezone.utc)
+    return d.astimezone(datetime.timezone.utc)
+
+
+def iso(d):
+    return d.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# ------------------------------------------------------------------------------------------- paths
+
+class Paths:
+    def __init__(self, steer, fabric):
+        self.steer = os.path.abspath(steer)
+        self.fabric = os.path.abspath(fabric)
+        inbox = os.path.dirname(self.steer)
+        self.ledger = os.path.join(inbox, "steer.ledger.jsonl")
+        self.archive = os.path.join(self.fabric, "archives", "steer")
+        project = os.path.basename(os.path.dirname(self.fabric)) if os.path.basename(self.fabric) == ".m2herd" \
+            else os.path.basename(self.fabric)
+        project = re.sub(r"[^A-Za-z0-9._-]", "_", project) or "fabric"
+        self.state_dir = os.environ.get("M2HERD_STEER_STATE_DIR") or \
+            os.path.join(os.path.expanduser("~"), ".m2herd", "state", project)
+
+    def rules(self):
+        own = os.path.join(self.fabric, "rules", "STEER.md")
+        if os.path.isfile(own):
+            return own
+        here = os.path.dirname(os.path.realpath(__file__))
+        return os.path.normpath(os.path.join(here, "..", "templates", "herd", "rules", "STEER.md"))
+
+
+def find_fabric(start=None, use_env=True, walk=True):
+    """The .m2herd dir: $M2HERD_DIR/.m2herd, else start (cwd) or, with walk, its nearest parent holding one."""
+    if use_env and os.environ.get("M2HERD_DIR"):
+        cand = os.path.join(os.environ["M2HERD_DIR"], ".m2herd")
+        if os.path.isdir(cand):
+            return cand
+    d = os.path.abspath(start or os.getcwd())
+    while True:
+        cand = os.path.join(d, ".m2herd")
+        if os.path.isdir(cand):
+            return cand
+        parent = os.path.dirname(d)
+        if not walk or parent == d:
+            return None
+        d = parent
+
+
+def resolve(args):
+    if getattr(args, "steer", None):
+        steer = os.path.abspath(args.steer)
+        inbox = os.path.dirname(steer)
+        fabric = os.path.dirname(inbox) if os.path.basename(inbox) == "inbox" else inbox
+        if getattr(args, "fabric", None):
+            fabric = fab_dir(args.fabric)
+        return Paths(steer, fabric)
+    fabric = fab_dir(args.fabric) if getattr(args, "fabric", None) else find_fabric()
+    if not fabric:
+        die("no .m2herd fabric here (set M2HERD_DIR, pass --fabric DIR or --steer FILE)")
+    return Paths(os.path.join(fabric, "inbox", "STEER.md"), fabric)
+
+
+def fab_dir(p):
+    p = os.path.abspath(p)
+    return os.path.join(p, ".m2herd") if os.path.isdir(os.path.join(p, ".m2herd")) else p
+
+
+def die(msg, code=2):
+    print(f"m2herd-steer: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+class Lock:
+    def __init__(self, path):
+        self.path, self.fd = path, None
+
+    def __enter__(self):
+        if fcntl is not None:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            self.fd = open(self.path, "a")
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd:
+            fcntl.flock(self.fd, fcntl.LOCK_UN)
+            self.fd.close()
+
+
+# ------------------------------------------------------------------------------------------- parse
+
+def split_live(text):
+    """(head incl. marker line, [raw entries]) — no marker: the whole file is live."""
+    i = text.find(MARKER)
+    if i < 0:
+        head, live = "", text
+    else:
+        j = text.find("\n", i)
+        j = len(text) if j < 0 else j + 1
+        head, live = text[:j], text[j:]
+    entries, cur = [], None
+    for line in live.splitlines():
+        if not line.strip():
+            if cur is not None:
+                entries.append(cur)
+                cur = None
+            continue
+        if line[:1] in (" ", "\t") and cur is not None and not re.match(r"^\s*[-*]\s", line):
+            cur += "\n" + line
+            continue
+        if cur is not None:
+            entries.append(cur)
+        cur = line
+    if cur is not None:
+        entries.append(cur)
+    return head, entries
+
+
+def fingerprint(raw):
+    return hashlib.sha1(" ".join(raw.split()).encode("utf-8")).hexdigest()[:12]
+
+
+def norm_text(s):
+    s = re.sub(TS_RE, " ", s)
+    s = TIME_RE.sub(" ", s)
+    s = ID_RE.sub("<id>", s)
+    s = NUM_RE.sub("#", s)
+    s = " ".join(s.lower().split())
+    return s.strip(" .,;:")
+
+
+def slug(s, n=3):
+    s = s.translate(TRANS).lower()
+    s = re.sub(r"<id>|#", " ", s)
+    words = [w for w in re.split(r"[^a-z0-9]+", s.encode("ascii", "ignore").decode()) if w]
+    return "-".join(words[:n])[:24].strip("-") or "item"
+
+
+def make_key(source, subject, status, kind):
+    h = hashlib.sha1("\0".join((source, subject, status, kind)).encode("utf-8")).hexdigest()[:6]
+    head = subject if re.fullmatch(r"[#0-9:/]+", subject or "") else slug(subject or status)
+    head = re.sub(r"[^A-Za-z0-9]+", "-", head).strip("-")[:24] or "item"
+    return f"{head}-{h}"
+
+
+def finding(source, text):
+    """One finding -> dict(key, subject, status, kind, ids, text)."""
+    text = " ".join(text.split()).strip(" .,;")
+    ids = ID_RE.findall(text)
+    m = LIST_RE.match(text)
+    if m and not ID_RE.search(m.group("label")) and \
+            all(ID_RE.fullmatch(t.strip()) for t in m.group("ids").split(",") if t.strip()):
+        label = norm_text(m.group("label"))
+        lids = [t.strip() for t in m.group("ids").split(",") if t.strip()]
+        return {"key": make_key(source, label, label, "list"), "subject": label, "status": label,
+                "kind": "list", "ids": lids, "text": text}
+    c = CHAIN_RE.match(text)
+    if c:
+        subject = re.sub(r"\s+", "", c.group("chain"))
+        status = norm_text(text[c.end():]) or "-"
+    elif ids:
+        subject, status = ids[0], norm_text(text)
+    else:
+        subject, status = "", norm_text(text)
+    return {"key": make_key(source, subject or status, status, "item"), "subject": subject or status,
+            "status": status, "kind": "id" if (c or ids) else "text", "ids": ids, "text": text}
+
+
+def parse_entry(raw):
+    first = raw.lstrip()
+    m = (ENTRY_HEAD if re.match(r"^[-*]\s", first) else BARE_HEAD).match(first)
+    ts = (m.group("bts") or m.group("ts") or "") if m else ""
+    body = " ".join((m.group("body") if m else raw).split())
+    tsd = parse_when(ts) if ts else None
+    source, hint, clauses = "", "", [body]
+    sm = SOURCE_RE.match(body)
+    if sm:
+        source = sm.group("src").strip()
+        rest = sm.group("rest")
+        hm = HINT_RE.search(rest)
+        if hm:
+            hint = f"{hm.group('word')}: {hm.group('path')}"
+            rest = rest[:hm.start()]
+        clauses = []
+        for part in (p.strip(" .,") for p in rest.split("; ")):
+            if not part:
+                continue
+            if re.fullmatch(r"[^\s:;.,/]{1,24}:\s+\S*/\S+", part):
+                hint = hint or part
+                continue
+            # a short, number-free clause continues the previous id finding ("<id>: tab gone; check queue")
+            if clauses and not re.search(r"\d", part) and len(part.split()) <= 3 and CHAIN_RE.match(clauses[-1]) \
+                    and not LIST_RE.match(clauses[-1]):
+                clauses[-1] += "; " + part
+                continue
+            clauses.append(part)
+    items, seen = [], set()
+    for cl in clauses:
+        f = finding(source, cl)
+        if f["key"] in seen:
+            continue
+        seen.add(f["key"])
+        items.append(f)
+    return {"fp": fingerprint(raw), "ts": iso(tsd) if tsd else "", "source": source, "hint": hint,
+            "items": items, "raw": raw}
+
+
+def read_steer(p):
+    try:
+        with open(p, encoding="utf-8") as f:
+            text = f.read()
+    except FileNotFoundError:
+        return "", []
+    return split_live(text)
+
+
+# ------------------------------------------------------------------------------------------- ledger
+
+def load_ledger(p):
+    out = []
+    try:
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    e = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(e, dict) and e.get("ev"):
+                    out.append(e)
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def append_ledger(p, events):
+    if not events:
+        return
+    os.makedirs(os.path.dirname(p), exist_ok=True)
+    with open(p, "a", encoding="utf-8") as f:
+        for e in events:
+            f.write(json.dumps(e, ensure_ascii=False, sort_keys=True) + "\n")
+
+
+def fold(events):
+    """Ledger -> (items by key, reports by source, live fp counts)."""
+    items, reports = {}, collections.defaultdict(list)
+    live = collections.Counter()
+    seq = 0
+    for e in events:
+        ev = e.get("ev")
+        if ev == "seen":
+            seq += 1
+            live[e.get("fp", "")] += 1
+            keys = []
+            for it in e.get("items") or []:
+                k = it.get("key")
+                if not k:
+                    continue
+                keys.append(k)
+                r = items.get(k)
+                if r is None:
+                    r = items[k] = {"key": k, "source": e.get("source", ""), "subject": it.get("subject", ""),
+                                    "status_text": it.get("status", ""), "kind": it.get("kind", ""),
+                                    "count": 0, "first": e.get("ts") or e.get("at", ""), "first_seq": seq,
+                                    "ids_union": [], "close": None}
+                r["count"] += 1
+                r["last"] = e.get("ts") or e.get("at", "")
+                r["last_seq"] = seq
+                r["text"] = it.get("text", "")
+                r["ids"] = list(it.get("ids") or [])
+                r["hint"] = e.get("hint", "") or r.get("hint", "")
+                u = set(r["ids_union"])
+                r["ids_union"] += [i for i in r["ids"] if i not in u]
+            if e.get("source") and keys:
+                reports[e["source"]].append((seq, set(keys)))
+        elif ev in ("compacted", "vanished"):
+            for fp, n in (e.get("fps") or {}).items():
+                live[fp] -= int(n)
+        elif ev in ("ack", "defer", "superseded"):
+            r = items.get(e.get("key"))
+            if r is not None:
+                r["close"] = e
+    return items, reports, live
+
+
+def state_of(r, now):
+    """(status, reason): status in open|acked|deferred|superseded."""
+    c = r.get("close")
+    if not c:
+        return "open", ""
+    n = int(c.get("n") or 0)
+    ev = c["ev"]
+    if ev == "ack":
+        a = c.get("action")
+        if a == "dropped":
+            return "acked", ""
+        if a == "done":
+            return ("open", "reported again after done") if r["count"] > n else ("acked", "")
+        # Only a list item's ids are its content (a list that grew). An id item's subject is in its key;
+        # its other ids are incidental (the run number of "PR #43 red on run <n>" is new every time).
+        new = [i for i in r.get("ids") or [] if i not in set(c.get("ids") or [])] if r.get("kind") == "list" else []
+        if new and r["count"] > n:
+            return "open", f"{len(new)} new id(s) since {a}"
+        return "acked", ""
+    if ev == "defer":
+        until = parse_when(c.get("until", ""))
+        if until and until > now:
+            return "deferred", ""
+        return "open", "deferral expired"
+    if ev == "superseded":
+        return ("open", "reported again after superseded") if r["count"] > n else ("superseded", "")
+    return "open", ""
+
+
+def snapshot_sources(reports):
+    """Sources whose reports repeat findings (a full-state watcher), not one-event-per-line.
+
+    A source whose every report carries exactly one finding is event-style whatever repeats: an
+    event watcher reporting the same thing twice ("PR #42 red on run <n>" for two runs) shares keys
+    too, and absence from its next reports says nothing about the item."""
+    out = set()
+    for src, reps in reports.items():
+        if len(reps) < 2 or all(len(keys) <= 1 for _, keys in reps):
+            continue
+        pairs = list(zip(reps, reps[1:]))
+        shared = sum(1 for (_, a), (_, b) in pairs if a & b)
+        if shared * 2 >= len(pairs):
+            out.add(src)
+    return out
+
+
+def supersessions(items, reports, now, at):
+    snaps = snapshot_sources(reports)
+    by_subject = collections.defaultdict(list)
+    for r in items.values():
+        if r["source"] and r["kind"] in ("id",):
+            by_subject[(r["source"], r["subject"])].append(r)
+    out = []
+    for r in items.values():
+        if not r["source"] or state_of(r, now)[0] != "open":
+            continue
+        newer = [o for o in by_subject.get((r["source"], r["subject"]), [])
+                 if o["key"] != r["key"] and o["first_seq"] > r["last_seq"]] if r["kind"] == "id" else []
+        if newer:
+            by = max(newer, key=lambda o: o["last_seq"])
+            out.append({"ev": "superseded", "key": r["key"], "by": by["key"], "n": r["count"], "at": at,
+                        "reason": "newer status for the same subject"})
+            continue
+        if r["source"] in snaps:
+            later = [s for s, _ in reports[r["source"]] if s > r["last_seq"]]
+            if len(later) >= ABSENT_REPORTS:
+                out.append({"ev": "superseded", "key": r["key"], "by": None, "n": r["count"], "at": at,
+                            "reason": f"absent from the last {len(later)} reports of {r['source']}"})
+    return out
+
+
+def intake(paths, write=True, steer_locked=False):
+    """Read STEER.md, append seen/vanished/superseded events, return (items, entries, now).
+
+    Lock order everywhere: <STEER.md>.lock, then <ledger>.lock. The STEER lock keeps a running
+    `compact` from being read half-way (its rewrite and its `compacted` event land under it)."""
+    if not steer_locked:
+        with Lock(paths.steer + ".lock"):
+            return intake(paths, write, steer_locked=True)
+    now = now_utc()
+    at = iso(now)
+    _, raws = read_steer(paths.steer)
+    entries = [parse_entry(r) for r in raws]
+    with Lock(paths.ledger + ".lock"):
+        events = load_ledger(paths.ledger)
+        _, _, live = fold(events)
+        file_n = collections.Counter(e["fp"] for e in entries)
+        new, occ = [], collections.Counter()
+        for e in entries:
+            k = occ[e["fp"]]
+            occ[e["fp"]] += 1
+            if k >= max(live.get(e["fp"], 0), 0):
+                new.append({"ev": "seen", "at": at, "fp": e["fp"], "ts": e["ts"], "source": e["source"],
+                            "hint": e["hint"],
+                            "items": [{k2: it[k2] for k2 in ("key", "subject", "status", "kind", "ids", "text")}
+                                      for it in e["items"]]})
+        gone = {fp: n - file_n.get(fp, 0) for fp, n in live.items() if n > file_n.get(fp, 0)}
+        add = new + ([{"ev": "vanished", "at": at, "fps": gone}] if gone else [])
+        items, reports, _ = fold(events + add)
+        sup = supersessions(items, reports, now, at)
+        add += sup
+        if write:
+            append_ledger(paths.ledger, add)
+        items, reports, _ = fold(events + add)
+    return items, entries, now
+
+
+# ------------------------------------------------------------------------------------------- views
+
+def priority(r, st):
+    return (0 if URGENT.search(r.get("text", "")) else 1, 0 if st[1] else 1, r["first_seq"])
+
+
+def rows(items, now):
+    out = []
+    for r in items.values():
+        st = state_of(r, now)
+        out.append((r, st))
+    out.sort(key=lambda x: ({"open": 0, "deferred": 1, "acked": 2, "superseded": 3}[x[1][0]],) + priority(*x))
+    return out
+
+
+def pending(items, now):
+    return [r for r, st in rows(items, now) if st[0] == "open"]
+
+
+def item_json(r, st):
+    c = r.get("close") or {}
+    d = {"key": r["key"], "status": st[0], "reopened": st[1], "source": r["source"], "subject": r["subject"],
+         "text": r.get("text", ""), "count": r["count"], "first": r["first"], "last": r.get("last", ""),
+         "ids": r.get("ids", []), "ids_union": len(r.get("ids_union", [])), "hint": r.get("hint", "")}
+    if c:
+        d["close"] = {k: c.get(k) for k in ("ev", "action", "note", "until", "by", "reason", "at") if c.get(k)}
+    return d
+
+
+def short(s, n):
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def cmd_list(paths, a):
+    items, entries, now = intake(paths)
+    rs = rows(items, now)
+    counts = collections.Counter(st[0] for _, st in rs)
+    if a.open:
+        rs = [x for x in rs if x[1][0] == "open"]
+    elif not a.all:
+        rs = [x for x in rs if x[1][0] in ("open", "deferred")]
+    if a.json:
+        print(json.dumps({"steer": paths.steer, "ledger": paths.ledger, "entries": len(entries),
+                          "items_total": len(items), "counts": dict(counts),
+                          "items": [item_json(r, st) for r, st in rs]}, ensure_ascii=False, indent=1))
+        return 0
+    print(f"STEER: {len(entries)} live entries -> {len(items)} distinct items "
+          f"({counts.get('open', 0)} open, {counts.get('deferred', 0)} deferred, "
+          f"{counts.get('acked', 0)} acked, {counts.get('superseded', 0)} superseded)")
+    for r, st in rs:
+        span = r["first"][:16] + (" .. " + r.get("last", "")[:16] if r.get("last") != r["first"] else "")
+        src = r["source"] or "-"
+        print(f"{r['key']:<32} {st[0]:<10} x{r['count']:<3} {span}  [{src}] {short(r.get('text', ''), 120)}")
+        extra = []
+        if st[1]:
+            extra.append("reopened: " + st[1])
+        if r["kind"] == "list":
+            extra.append(f"ids now {len(r.get('ids', []))}, ever {len(r.get('ids_union', []))}")
+        c = r.get("close")
+        if c and st[0] != "open":
+            if c["ev"] == "ack":
+                extra.append(f"{c.get('action')}: {c.get('note', '')}")
+            elif c["ev"] == "defer":
+                extra.append(f"deferred until {c.get('until')}: {c.get('note', '')}")
+            else:
+                extra.append(f"superseded ({c.get('reason')})" + (f" by {c['by']}" if c.get("by") else ""))
+        if r.get("hint") and st[0] == "open":
+            extra.append("hint " + r["hint"])
+        if extra:
+            print(" " * 33 + "; ".join(extra))
+    return 0
+
+
+def match_keys(items, keys):
+    out = []
+    for k in keys:
+        if k in items:
+            out.append(k)
+            continue
+        cands = [x for x in items if x.startswith(k)]
+        if len(cands) != 1:
+            die(f"key {k!r}: " + ("unknown" if not cands else f"ambiguous ({', '.join(sorted(cands)[:5])})"))
+        out.append(cands[0])
+    return out
+
+
+def cmd_close(paths, a, ev):
+    items, _, now = intake(paths)
+    keys = match_keys(items, a.keys)
+    if not a.note.strip():
+        die("--note must say why (what was done, the ticket/register id, who took it)")
+    at = iso(now)
+    evs = []
+    for k in keys:
+        r = items[k]
+        e = {"ev": ev, "key": k, "note": a.note.strip(), "at": at, "n": r["count"], "ids": r.get("ids", [])}
+        if ev == "ack":
+            e["action"] = a.action
+        else:
+            until = parse_when(a.until)
+            if not until:
+                die(f"--until {a.until!r} is not a date (YYYY-MM-DD or ISO)")
+            if until <= now:
+                die(f"--until {a.until} is not in the future")
+            e["until"] = iso(until)
+        evs.append(e)
+    with Lock(paths.ledger + ".lock"):
+        append_ledger(paths.ledger, evs)
+    for e in evs:
+        print(f"{e['ev']} {e['key']}" + (f" {e['action']}" if ev == "ack" else f" until {e['until']}"))
+    return 0
+
+
+def cmd_pending(paths, a):
+    items, _, now = intake(paths)
+    print(len(pending(items, now)))
+    return 0
+
+
+def cmd_verify(paths, a):
+    items, _, now = intake(paths)
+    p = pending(items, now)
+    if p:
+        print(f"steer: {len(p)} open item(s) — triage per {paths.rules()}: " + ", ".join(r["key"] for r in p[:10]),
+              file=sys.stderr)
+        return 1
+    print(f"steer: ok ({len(items)} items, none open)")
+    return 0
+
+
+def cmd_compact(paths, a):
+    if not os.path.isfile(paths.steer):
+        print("steer: no STEER.md — nothing to compact")
+        return 0
+    with Lock(paths.steer + ".lock"):
+        items, _, now = intake(paths, steer_locked=True)
+        closed = {k for k, r in items.items() if state_of(r, now)[0] in ("acked", "superseded")}
+        _, _, live = fold(load_ledger(paths.ledger))
+        with open(paths.steer, encoding="utf-8") as old:
+            text = old.read()
+            head, raws = split_live(text)
+            keep, move = [], []
+            for raw in raws:
+                e = parse_entry(raw)
+                # only entries the ledger has counted (an unlocked appender may have added one since intake)
+                if e["items"] and live.get(e["fp"], 0) > 0 and all(it["key"] in closed for it in e["items"]):
+                    live[e["fp"]] -= 1
+                    move.append((raw, e))
+                else:
+                    keep.append((raw, e))
+            if not move:
+                print(f"steer: nothing to compact ({len(keep)} entries keep open or deferred items)")
+                return 0
+            if a.dry_run:
+                print(f"steer: would move {len(move)} entries, keep {len(keep)}")
+                return 0
+            # 1. archive first (a crash after this only duplicates archive lines)
+            by_month = collections.defaultdict(list)
+            for raw, e in move:
+                by_month[(e["ts"] or iso(now))[:7]].append(raw)
+            os.makedirs(paths.archive, exist_ok=True)
+            for month, lines in sorted(by_month.items()):
+                ap = os.path.join(paths.archive, f"{month}.md")
+                fresh = not os.path.exists(ap)
+                with open(ap, "a", encoding="utf-8") as f:
+                    if fresh:
+                        f.write(f"# STEER archive {month}\n\nEntries moved out of {os.path.relpath(paths.steer, paths.fabric)}"
+                                " by `m2herd-steer compact` once every finding in them was acked or superseded."
+                                " The ledger (inbox/steer.ledger.jsonl) holds each action and note.\n\n")
+                    f.write(f"<!-- compacted {iso(now)} -->\n")
+                    for raw in lines:
+                        f.write(raw.rstrip("\n") + "\n")
+            # 2. rewrite STEER.md: same-dir tmp + rename; then copy anything an unlocked appender wrote
+            #    into the old inode meanwhile (the fd still reads it)
+            if not head:
+                head = MARKER + "\n"
+            body = "".join(raw.rstrip("\n") + "\n" for raw, _ in keep)
+            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(paths.steer), prefix=".STEER.", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(head if head.endswith("\n") else head + "\n")
+                f.write(body)
+            try:
+                shutil.copymode(paths.steer, tmp)
+            except OSError:
+                pass
+            os.replace(tmp, paths.steer)
+            late = old.read()
+        if late:
+            with open(paths.steer, "a", encoding="utf-8") as f:
+                f.write(late)
+        # 3. ledger, still under the STEER lock: these entries left the file on purpose
+        fps = collections.Counter(e["fp"] for _, e in move)
+        with Lock(paths.ledger + ".lock"):
+            append_ledger(paths.ledger, [{"ev": "compacted", "at": iso(now), "fps": dict(fps),
+                                          "archive": sorted(f"{m}.md" for m in by_month)}])
+    print(f"steer: moved {len(move)} entries to {os.path.relpath(paths.archive, paths.fabric)}/"
+          f"{','.join(sorted(f'{m}.md' for m in by_month))}, kept {len(keep)}")
+    return 0
+
+
+# ------------------------------------------------------------------------------------------- gate
+
+CACHE = os.path.join(os.path.expanduser("~"), ".cache", "herd-board")
+
+
+def is_herd_worker(pane):
+    """Same rule as hooks/herd-board-subagents.py: listed in a registered herd.map, and not an orchestrator."""
+    if not pane:
+        return False
+    if os.path.exists(os.path.join(CACHE, pane.replace(":", "_") + ".herds")):
+        return False
+    for reg in glob.glob(os.path.join(CACHE, "*.herds")):
+        try:
+            herds = [ln.strip() for ln in open(reg, encoding="utf-8") if ln.strip()]
+        except OSError:
+            continue
+        for herd in herds:
+            try:
+                with open(os.path.join(herd, "herd.map"), encoding="utf-8") as f:
+                    if any(ln.strip().split("=", 1)[-1] == pane for ln in f if "=" in ln):
+                        return True
+            except OSError:
+                continue
+    return False
+
+
+def quiet_here():
+    env = os.environ
+    return (env.get("M2HERD_WORKER") == "1" or bool(env.get("HERD_SLICE")) or env.get("M2HERD_STEER_GATE") == "0"
+            or is_herd_worker(env.get("HERDR_PANE_ID", "")))
+
+
+def cmd_gate(a):
+    try:
+        data = json.loads(sys.stdin.read() or "{}")
+        if not isinstance(data, dict):
+            data = {}
+    except (ValueError, UnicodeDecodeError):
+        data = {}
+    if data.get("stop_hook_active") or data.get("agent_id") or quiet_here():
+        return 0
+    event = data.get("hook_event_name") or a.event or "UserPromptSubmit"
+    cwd = data.get("cwd") if isinstance(data.get("cwd"), str) and os.path.isdir(data.get("cwd")) else os.getcwd()
+    fabric = find_fabric(cwd, walk=False)
+    if not fabric:
+        return 0
+    paths = Paths(os.path.join(fabric, "inbox", "STEER.md"), fabric)
+    if not os.path.isfile(paths.steer):
+        return 0
+    items, _, now = intake(paths)
+    p = pending(items, now)
+    if not p:
+        return 0
+    sid = re.sub(r"[^A-Za-z0-9_-]", "", str(data.get("session_id") or "nosession"))[:64] or "nosession"
+    sig = hashlib.sha1(" ".join(sorted(r["key"] for r in p)).encode()).hexdigest()[:16]
+    rate = int(os.environ.get("M2HERD_STEER_RATE", RATE_SECONDS))
+    sp = os.path.join(paths.state_dir, "steer-gate.json")
+    with Lock(sp + ".lock"):
+        try:
+            with open(sp, encoding="utf-8") as f:
+                st = json.load(f)
+            if not isinstance(st, dict):
+                st = {}
+        except (OSError, ValueError):
+            st = {}
+        last = st.get(sid) or {}
+        t = now.timestamp()
+        if last.get("sig") == sig and t - float(last.get("at", 0)) < rate:
+            return 0
+        st = {k: v for k, v in st.items() if isinstance(v, dict) and t - float(v.get("at", 0)) < 86400}
+        st[sid] = {"sig": sig, "at": t}
+        os.makedirs(paths.state_dir, exist_ok=True)
+        fd, tmp = tempfile.mkstemp(dir=paths.state_dir, prefix=".steer-gate.", suffix=".tmp")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(st, f)
+        os.replace(tmp, sp)
+    where = "" if shutil.which("m2herd-steer") else f" (m2herd-steer = {os.path.realpath(__file__)})"
+    steer = os.path.relpath(paths.steer, cwd) if paths.steer.startswith(cwd.rstrip("/") + "/") else paths.steer
+    rules = paths.rules()
+    top = ", ".join(r["key"] for r in p[:3])
+    line = (f"STEER: {len(p)} open item(s) in {steer} (top: {top}). Triage per {rules}{where}: "
+            f"`m2herd-steer list --open`, then per item exactly one `m2herd-steer ack <key> "
+            f"--action done|dropped|ticket|register|delegated --note \"...\"` or `m2herd-steer defer <key> "
+            f"--until <date> --note \"...\"`; `m2herd-steer verify` exits 0 when none is left. "
+            + ("Turn end: triage now, or defer what has to wait." if event == "Stop"
+               else "Mid-task: finish first, this comes back."))
+    print(json.dumps({"hookSpecificOutput": {"hookEventName": event, "additionalContext": line}}, ensure_ascii=False))
+    return 0
+
+
+# ------------------------------------------------------------------------------------------- selftest
+
+def selftest():
+    e = parse_entry("- 2026-10-13T05:05:58+00:00 Watch-A: 111111111: old lane after 3 tries; "
+                    "222222222: tab gone; check queue; 23 mentions to check; Open work: 333333,444444,555555. "
+                    "Check: /tmp/x.sqlite3")
+    assert e["source"] == "Watch-A" and e["hint"] == "Check: /tmp/x.sqlite3", e
+    assert [i["kind"] for i in e["items"]] == ["id", "id", "text", "list"], e["items"]
+    assert e["items"][1]["text"] == "222222222: tab gone; check queue", e["items"][1]
+    e2 = parse_entry("- 2026-10-14T05:05:58+00:00 Watch-A: 111111111: old lane after 4 tries; 25 mentions to check; "
+                     "Open work: 333333,444444,555555,666666")
+    assert e2["items"][0]["key"] == e["items"][0]["key"]
+    assert e2["items"][1]["key"] == e["items"][2]["key"]
+    assert e2["items"][2]["key"] == e["items"][3]["key"]
+    h = parse_entry("- [2026-10-20T10:00:00Z] PAUSE the herd; rebase first")
+    assert h["source"] == "" and len(h["items"]) == 1
+    assert parse_entry("PAUSE everything please")["items"][0]["kind"] == "text"
+    _, ents = split_live("x\n" + MARKER + "\n- a\n  more\n- b\n\nbare\n")
+    assert ents == ["- a\n  more", "- b", "bare"], ents
+    print("m2herd-steer selftest: ok")
+    return 0
+
+
+# ------------------------------------------------------------------------------------------- main
+
+def main(argv=None):
+    argv = sys.argv[1:] if argv is None else argv
+    if argv[:1] == ["--selftest"]:
+        return selftest()
+    ap = argparse.ArgumentParser(prog="m2herd-steer", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--fabric", help="the .m2herd dir (or the repo root holding it)")
+    ap.add_argument("--steer", help="a STEER.md file (ledger next to it)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("list")
+    p.add_argument("--open", action="store_true", help="only open items")
+    p.add_argument("--all", action="store_true", help="also acked and superseded items")
+    p.add_argument("--json", action="store_true")
+    p = sub.add_parser("ack")
+    p.add_argument("keys", nargs="+")
+    p.add_argument("--action", required=True, choices=ACTIONS)
+    p.add_argument("--note", required=True)
+    p = sub.add_parser("defer")
+    p.add_argument("keys", nargs="+")
+    p.add_argument("--until", required=True)
+    p.add_argument("--note", required=True)
+    sub.add_parser("pending-count")
+    sub.add_parser("verify")
+    p = sub.add_parser("compact")
+    p.add_argument("--dry-run", action="store_true")
+    p = sub.add_parser("gate")
+    p.add_argument("--event", default="")
+    a = ap.parse_args(argv)
+    if a.cmd == "gate":
+        try:
+            return cmd_gate(a)
+        except Exception:  # the gate never breaks a turn
+            return 0
+    paths = resolve(a)
+    if a.cmd == "list":
+        return cmd_list(paths, a)
+    if a.cmd == "ack":
+        return cmd_close(paths, a, "ack")
+    if a.cmd == "defer":
+        return cmd_close(paths, a, "defer")
+    if a.cmd == "pending-count":
+        return cmd_pending(paths, a)
+    if a.cmd == "verify":
+        return cmd_verify(paths, a)
+    if a.cmd == "compact":
+        return cmd_compact(paths, a)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

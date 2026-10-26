@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+"""herd-merge — squash-merge one reviewed package on the human's go (docs/herd-flow-v2.md §4).
+
+  herd-merge <herd> <package> --go "<verbatim words>" [--dry-run] [--keep-branches]
+  herd-merge <herd> <package> --dry-run          # prints the exact plan; merges nothing
+
+<package> is any slice of the package (transitive closure of `together_with`). Nothing is merged
+without --go; the words are recorded verbatim (≤ 120 chars) in each `merged` event and in
+<herd>/herd-merge.log.
+
+Before the FIRST merge the whole package is checked (lesson of 23.10.: api #210 went to main before
+its pair ui #86, which was already conflicting):
+  - every slice is `review_ok` (slices already `merged` are skipped, so a stopped run can resume);
+  - `stacked_on` bases outside the package are `merged`;
+  - every PR is OPEN, its head equals the reviewed sha, its base is `main` (or, for a stacked child
+    inside the package, its parent's branch) and GitHub reports it MERGEABLE;
+  - every repo's main still equals review_ok.main (a merge landed since = stale, re-probe first).
+Order: `stacked_on` first, then API before UI ($HERD_MERGE_ORDER, comma list of repos; default:
+names containing "api" first, "ui" last). Each merge re-reads the PR right before it (state OPEN,
+baseRefName == main, head as expected, MERGEABLE, main unchanged except by this run) and merges with
+`gh pr merge --squash --match-head-commit`.
+
+After a merge, for each open stacked child (a slice whose .repos base is the merged branch): in its
+worktree `git rebase --onto origin/main <old-parent-head> <child-branch>`; `git range-diff` must show
+only `=` lines, else the child is reset to its old head, marked `fix_queued` with a befunde file, and
+the run stops; then `push --force-with-lease`, REST `PATCH pulls/<n> base=main`, and only then the
+parent branch is deleted (kept when any open PR still targets it, or with --keep-branches). A child
+that is `working`/`review_running`, dirty or not at its PR head is left alone and the parent branch is
+kept. The run stops at the first failure and never continues past a half-merged package.
+
+Env: HERD_ORG (or HERD_BOARD_ORG) for repos written without owner; HERD_MAIN_BRANCH (main);
+HERD_MERGE_POLL seconds between mergeability polls (3) and HERD_MERGE_TRIES (10).
+"""
+import argparse
+import fcntl
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+import importlib.machinery
+import importlib.util
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+import herd_events as he  # noqa: E402
+
+
+
+def _load(name, filename):
+    """Import a sibling script that has no .py extension (herd-clash holds the worktree/diff helpers)."""
+    sys.dont_write_bytecode = True  # no stray herd-clashcpython-*.pyc next to the scripts
+    loader = importlib.machinery.SourceFileLoader(name, os.path.join(HERE, filename))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(mod)
+    return mod
+
+
+clash = _load("herd_clash", "herd-clash")
+
+PR_RE = re.compile(r"^(?P<repo>[^#\s@]+)#(?P<n>\d+)@(?P<sha>[0-9a-f]{7,40})$")
+MAIN_RE = re.compile(r"^(?P<repo>[^#\s@]+)@(?P<sha>[0-9a-f]{7,40})$")
+RD_LINE_RE = re.compile(r"^\s*(\d+|-):\s+([0-9a-f]+|-+)\s+(\S)\s+(\d+|-):\s+([0-9a-f]+|-+)\s")
+GO_MAX = 120
+MAIN = os.environ.get("HERD_MAIN_BRANCH", "main")
+
+
+class Stop(Exception):
+    """The run cannot continue; message says why."""
+
+
+# ------------------------------------------------------------------------------------------ gh / git
+
+def run(cmd, cwd=None, check=True):
+    p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise Stop(f"`{' '.join(cmd)}` failed: {(p.stderr or p.stdout).strip()}")
+    return p
+
+
+def gh_json(*args):
+    out = run(["gh", *args]).stdout
+    try:
+        return json.loads(out or "null")
+    except ValueError:
+        raise Stop(f"`gh {' '.join(args)}` returned no JSON: {out[:200]!r}")
+
+
+PR_FIELDS = "number,state,headRefName,headRefOid,baseRefName,mergeable,mergeStateStatus,mergeCommit,url"
+
+
+def pr_view(full, n, settle=True):
+    tries = int(os.environ.get("HERD_MERGE_TRIES", "10"))
+    pause = float(os.environ.get("HERD_MERGE_POLL", "3"))
+    for i in range(max(tries, 1)):
+        pr = gh_json("pr", "view", str(n), "--repo", full, "--json", PR_FIELDS)
+        if not settle or pr.get("state") != "OPEN" or pr.get("mergeable") != "UNKNOWN":
+            return pr
+        if i + 1 < tries:
+            time.sleep(pause)
+    return pr
+
+
+def main_sha(full):
+    ref = gh_json("api", f"repos/{full}/git/ref/heads/{MAIN}")
+    return (ref.get("object") or {}).get("sha", "")
+
+
+def open_prs_on_base(full, branch):
+    return gh_json("pr", "list", "--repo", full, "--base", branch, "--state", "open",
+                   "--json", "number,headRefName") or []
+
+
+def same(a, b):
+    a, b = (a or "").lower(), (b or "").lower()
+    return bool(a and b) and (a.startswith(b) or b.startswith(a))
+
+
+def full_repo(repo, herd, slice_name):
+    if "/" in repo:
+        return repo
+    org = os.environ.get("HERD_ORG") or os.environ.get("HERD_BOARD_ORG")
+    if org:
+        return f"{org}/{repo}"
+    wt = clash.worktree_for(herd, slice_name, repo)
+    if wt:
+        url = run(["git", "-C", wt, "remote", "get-url", "origin"], check=False).stdout.strip()
+        m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?/?$", url)
+        if m:
+            return m.group(1)
+    raise Stop(f"cannot tell the owner of repo {repo!r}: set HERD_ORG or write owner/repo in prs")
+
+
+# ------------------------------------------------------------------------------------------ planning
+
+class Step:
+    def __init__(self, slice_name, repo, full, n, sha):
+        self.slice, self.repo, self.full, self.n, self.sha = slice_name, repo, full, int(n), sha
+        self.pr = None             # last gh view
+        self.parent = None         # Step this PR is stacked on inside the plan
+        self.done = False          # already merged (resume)
+        self.merge_sha = None
+
+    @property
+    def name(self):
+        return f"{self.full}#{self.n}"
+
+
+def repo_rank(repo):
+    order = [x.strip() for x in re.split(r"[,\s]+", os.environ.get("HERD_MERGE_ORDER", "")) if x.strip()]
+    short = clash.repo_short(repo)
+    if order:
+        names = [clash.repo_short(x) for x in order]
+        return names.index(short) if short in names else len(names)
+    if "api" in short:
+        return 0
+    if re.search(r"(^|[-_])ui($|[-_])|web|frontend", short):
+        return 2
+    return 1
+
+
+def topo(slices, edges, key):
+    """Kahn's algorithm; edges = {node: set(prereqs)}; ties broken by key. Raises Stop on a cycle."""
+    left, out = set(slices), []
+    while left:
+        ready = sorted((s for s in left if not (edges.get(s, set()) & left)), key=key)
+        if not ready:
+            raise Stop(f"stacked_on cycle among {', '.join(sorted(left))}")
+        out.append(ready[0])
+        left.discard(ready[0])
+    return out
+
+
+def build_plan(herd, name):
+    st = he.state(herd)
+    if name not in st:
+        raise Stop(f"no events for slice {name!r} in {herd}")
+    pkg = he.package(herd, name)
+    todo, merged, problems = [], [], []
+    for s in pkg:
+        ph = (st.get(s) or {}).get("phase")
+        if ph == "merged":
+            merged.append(s)
+        elif ph == "review_ok":
+            todo.append(s)
+        else:
+            problems.append(f"{s} is {ph or 'without events'} (needs review_ok)")
+    for s in todo:
+        base = he.task_header(herd, s).get("stacked_on")
+        if base and base not in todo and (st.get(base) or {}).get("phase") != "merged":
+            problems.append(f"{s} is stacked on {base}, which is {(st.get(base) or {}).get('phase') or 'unknown'} "
+                            f"— merge {base}'s package first")
+    if problems:
+        raise Stop("package not ready: " + "; ".join(problems))
+    edges = {s: {he.task_header(herd, s).get("stacked_on")} & set(todo) for s in todo}
+    order = topo(todo, edges, key=lambda s: s)
+    steps = []
+    for s in order:
+        prs = st[s].get("prs") or []
+        if not prs:
+            raise Stop(f"{s}: review_ok carries no prs")
+        for raw in prs:
+            m = PR_RE.match(str(raw))
+            if not m:
+                raise Stop(f"{s}: cannot read pr {raw!r} (expected repo#n@sha)")
+            steps.append(Step(s, m["repo"], full_repo(m["repo"], herd, s), m["n"], m["sha"]))
+    # stack links inside the plan: a child's .repos base is the parent's branch in the same repo
+    branch_of = {}
+    for s in order:
+        for r in he.repos(herd, s):
+            branch_of[(s, clash.repo_short(r["repo"]))] = r["branch"]
+    for st_ in steps:
+        for r in he.repos(herd, st_.slice):
+            if clash.repo_short(r["repo"]) != clash.repo_short(st_.repo):
+                continue
+            base = re.sub(r"^origin/", "", r["base"])
+            for other in steps:
+                if other is not st_ and other.full == st_.full and \
+                        branch_of.get((other.slice, clash.repo_short(other.repo))) == base:
+                    st_.parent = other
+    idx = {s: i for i, s in enumerate(order)}
+    pedges = {id(x): ({id(x.parent)} if x.parent else set()) for x in steps}
+    by_id = {id(x): x for x in steps}
+    ordered = topo([id(x) for x in steps], pedges,
+                   key=lambda i: (repo_rank(by_id[i].repo), idx[by_id[i].slice], by_id[i].n))
+    return pkg, merged, [by_id[i] for i in ordered]
+
+
+def preflight(herd, pkg, merged, steps, report):
+    """Read-only checks of the WHOLE package before anything is merged. Returns {full: allowed mains}."""
+    st = he.state(herd)
+    problems = []
+    allowed = {}
+    for s in merged:  # resume: merges this package already made are the expected main
+        for raw in st[s].get("prs") or []:
+            m = PR_RE.match(str(raw))
+            if m:
+                allowed.setdefault(full_repo(m["repo"], herd, s), set()).add(m["sha"])
+    for x in steps:
+        pr = x.pr = pr_view(x.full, x.n)
+        if pr.get("state") == "MERGED" and (pr.get("mergeCommit") or {}).get("oid"):
+            x.done, x.merge_sha = True, pr["mergeCommit"]["oid"]
+            allowed.setdefault(x.full, set()).add(x.merge_sha)
+            report(f"  ok    {x.name} ({x.slice}) already merged as {x.merge_sha[:7]} — skipped")
+            continue
+        bad = []
+        if pr.get("state") != "OPEN":
+            bad.append(f"state {pr.get('state')}")
+        if not same(pr.get("headRefOid"), x.sha):
+            bad.append(f"head {str(pr.get('headRefOid'))[:7]} ≠ reviewed {x.sha[:7]} (stale)")
+        want_base = MAIN
+        if x.parent:
+            want_base = x.parent.pr.get("headRefName") if x.parent.pr else None
+        if pr.get("baseRefName") != want_base:
+            bad.append(f"base {pr.get('baseRefName')} (expected {want_base})")
+        if pr.get("mergeable") != "MERGEABLE":
+            bad.append(f"mergeable {pr.get('mergeable')} ({pr.get('mergeStateStatus')})")
+        if x.parent and not bad:
+            # the restack after the parent's merge must not be able to fail half-way through the package
+            line = next((r for r in he.repos(herd, x.slice)
+                         if clash.repo_short(r["repo"]) == clash.repo_short(x.repo)), None)
+            wt = clash.worktree_for(herd, x.slice, x.repo)
+            why, _ = restack_blocker(x.slice, "review_ok", wt, line["branch"] if line else "?",
+                                     pr.get("headRefOid"), parent_head=x.parent.sha)
+            if why:
+                bad.append(f"restack not possible: {why}")
+        if bad:
+            problems.append(f"{x.name} ({x.slice}): " + ", ".join(bad))
+            report(f"  FAIL  {x.name} ({x.slice}): " + ", ".join(bad))
+        else:
+            via = f"stacked on {x.parent.name}" if x.parent else f"base {MAIN}"
+            report(f"  ok    {x.name} ({x.slice}) head {x.sha[:7]} = reviewed, {via}, MERGEABLE")
+    mains = {}
+    for s in sorted({x.slice for x in steps}):
+        recorded = {}
+        for raw in st[s].get("main") or []:
+            m = MAIN_RE.match(str(raw))
+            if m:
+                recorded[full_repo(m["repo"], herd, s)] = m["sha"]
+        for full in sorted({x.full for x in steps if x.slice == s}):
+            if full not in mains:
+                mains[full] = main_sha(full)
+            cur = mains[full]
+            rec = recorded.get(full)
+            if not rec:
+                problems.append(f"{s}: review_ok has no main sha for {full} — re-run the review")
+                report(f"  FAIL  main {full}: {s} recorded none")
+            elif same(cur, rec) or any(same(cur, a) for a in allowed.get(full, ())):
+                report(f"  ok    main {full} @{cur[:7]} = reviewed by {s}")
+            else:
+                problems.append(f"{s}: main of {full} moved {rec[:7]} → {cur[:7]} since the review (stale, re-probe)")
+                report(f"  FAIL  main {full} @{cur[:7]} ≠ {rec[:7]} reviewed by {s} (stale)")
+    if problems:
+        raise Stop("refused before the first merge: " + "; ".join(problems))
+    return {full: cur for full, cur in mains.items()}
+
+
+def children_of(herd, step, pkg_steps):
+    """Open slices stacked on this PR's branch in the same repo -> [(slice, repos-line, in_plan_step)]."""
+    branch = step.pr.get("headRefName")
+    out = []
+    for s, ev in sorted(he.state(herd).items()):
+        if s == step.slice or ev["phase"] in ("merged", "parked"):
+            continue
+        try:
+            lines = he.repos(herd, s)
+        except ValueError:
+            continue
+        for r in lines:
+            if clash.repo_short(r["repo"]) == clash.repo_short(step.repo) and \
+                    re.sub(r"^origin/", "", r["base"]) == branch:
+                inplan = next((x for x in pkg_steps if x.slice == s and x.full == step.full), None)
+                out.append((s, r, inplan))
+    return out
+
+
+# ------------------------------------------------------------------------------------------ actions
+
+def range_diff_ok(text):
+    """True when every line of `git range-diff` output is a `=` pair line (no `!`, `<`, `>`, no body)."""
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        m = RD_LINE_RE.match(line)
+        if not m or m.group(3) != "=":
+            return False
+    return True
+
+
+def child_pr_number(herd, child, full, branch):
+    ev = he.last(herd, child) or {}
+    for raw in ev.get("prs") or []:
+        m = PR_RE.match(str(raw))
+        if m and full_repo(m["repo"], herd, child) == full:
+            return int(m["n"])
+    prs = gh_json("pr", "list", "--repo", full, "--head", branch, "--state", "open", "--json", "number") or []
+    return int(prs[0]["number"]) if prs else None
+
+
+def write_befunde(herd, child, sha7, parent, cmds, output):
+    path = os.path.join(herd, f"{child}.befunde-{sha7}.md")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(f"# {child}: restack after {parent.name} was merged changed the patch\n\n"
+                f"herd-merge rebased the branch onto {MAIN} after its parent {parent.slice} was squash-merged, and "
+                f"the result is not identical to the reviewed commits. The branch was reset to {sha7}; "
+                f"nothing was pushed. Rebase it yourself, re-run the tests, then report again.\n\n"
+                f"## Commands\n\n" + "".join(f"    {c}\n" for c in cmds) +
+                f"\n## Output\n\n" + "".join(f"    {ln}\n" for ln in output.splitlines()) + "\n")
+    return path
+
+
+def restack_blocker(child, phase, wt, branch, pr_head, parent_head=None):
+    """Why this child's worktree must not be rebased now (None = safe), and its current head."""
+    if phase in ("working", "review_running"):
+        return f"{child} is {phase}", None
+    if not wt:
+        return "no worktree", None
+    if run(["git", "-C", wt, "rev-parse", "--abbrev-ref", "HEAD"]).stdout.strip() != branch:
+        return f"worktree {wt} is not on {branch}", None
+    if run(["git", "-C", wt, "status", "--porcelain", "--untracked-files=no"]).stdout.strip():
+        return f"worktree {wt} has uncommitted changes", None
+    run(["git", "-C", wt, "fetch", "-q", "origin"])
+    head = run(["git", "-C", wt, "rev-parse", "HEAD"]).stdout.strip()
+    if not same(pr_head, head):
+        return f"worktree head {head[:7]} ≠ PR head {str(pr_head)[:7]}", head
+    if parent_head and run(["git", "-C", wt, "merge-base", "--is-ancestor", parent_head, head],
+                           check=False).returncode != 0:
+        return f"not built on the parent's reviewed head {parent_head[:7]} (restack it first)", head
+    return None, head
+
+
+def restack(herd, step, child, line, inplan, say, dry):
+    """Rebase one child off the merged parent. Returns (retargeted: bool, stop_reason: str|None)."""
+    full = step.full
+    branch = line["branch"]
+    old_parent = step.pr.get("headRefOid") or step.sha
+    phase = (he.last(herd, child) or {}).get("phase")
+    wt = clash.worktree_for(herd, child, line["repo"])
+    n = child_pr_number(herd, child, full, branch)
+    cmds = [f"git -C {wt} fetch origin",
+            f"git -C {wt} rebase --onto origin/{MAIN} {old_parent[:12]} {branch}",
+            f"git -C {wt} range-diff {old_parent[:12]}..<old-head> origin/{MAIN}..HEAD   # only '=' allowed",
+            f"git -C {wt} push --force-with-lease={branch}:<old-head> origin HEAD:{branch}",
+            f"gh api -X PATCH repos/{full}/pulls/{n} -f base={MAIN}"]
+    must = inplan is not None
+    if dry:
+        say(f"     restack child {child} ({full}#{n}, {phase}{', in this package' if must else ''}):")
+        for c in cmds:
+            say(f"       {c}")
+        return True, None
+    why = f"no open PR for {branch}" if n is None else None
+    if not why:
+        pr = pr_view(full, n, settle=False)
+        why, old_head = restack_blocker(child, phase, wt, branch, pr.get("headRefOid"))
+    if why:
+        msg = f"child {child}: not restacked ({why}); parent branch kept"
+        say(f"     {msg}")
+        return False, (msg if must else None)
+    if run(["git", "-C", wt, "cat-file", "-e", f"{old_parent}^{{commit}}"], check=False).returncode != 0:
+        run(["git", "-C", wt, "fetch", "-q", "origin", step.pr.get("headRefName")], check=False)
+    sha7 = old_head[:7]
+    rb = run(["git", "-C", wt, "rebase", "--onto", f"origin/{MAIN}", old_parent, branch], check=False)
+    if rb.returncode != 0:
+        run(["git", "-C", wt, "rebase", "--abort"], check=False)
+        run(["git", "-C", wt, "reset", "-q", "--hard", old_head], check=False)
+        bf = write_befunde(herd, child, sha7, step, cmds[:2], rb.stdout + rb.stderr)
+        return False, _fix_queue(herd, child, bf, f"rebase onto {MAIN} conflicts", say)
+    rd = run(["git", "-C", wt, "range-diff", "--no-color", f"{old_parent}..{old_head}", f"origin/{MAIN}..HEAD"],
+             check=False)
+    if rd.returncode != 0 or not range_diff_ok(rd.stdout):
+        run(["git", "-C", wt, "reset", "-q", "--hard", old_head])
+        bf = write_befunde(herd, child, sha7, step, cmds[:3], rd.stdout + rd.stderr)
+        return False, _fix_queue(herd, child, bf, "range-diff shows changed commits after the restack", say)
+    run(["git", "-C", wt, "push", "-q", f"--force-with-lease=refs/heads/{branch}:{old_head}", "origin",
+         f"HEAD:refs/heads/{branch}"])
+    run(["gh", "api", "-X", "PATCH", f"repos/{full}/pulls/{n}", "-f", f"base={MAIN}"])
+    new_head = run(["git", "-C", wt, "rev-parse", "HEAD"]).stdout.strip()
+    say(f"     restacked {child} {full}#{n}: {sha7} → {new_head[:7]} (range-diff '=' only), base → {MAIN}")
+    if inplan is not None:
+        inplan.sha = new_head  # content-identical to the reviewed commits, proven by range-diff
+        inplan.parent = None
+    return True, None
+
+
+def _fix_queue(herd, child, befunde, why, say):
+    rel = os.path.basename(befunde)
+    try:
+        he.append(herd, child, "fix_queued", by="merge", note=why, befunde_file=rel)
+        say(f"     {child} → fix_queued ({rel})")
+    except he.TransitionError as e:
+        say(f"     {child}: could not mark fix_queued ({e}); befunde in {rel}")
+    return f"child {child}: {why} — see {rel}"
+
+
+def other_review_ok(herd, pkg, full):
+    out = []
+    for s, ev in sorted(he.state(herd).items()):
+        if s in pkg or ev["phase"] != "review_ok":
+            continue
+        for raw in ev.get("prs") or []:
+            m = PR_RE.match(str(raw))
+            try:
+                if m and full_repo(m["repo"], herd, s) == full:
+                    out.append(s)
+                    break
+            except Stop:
+                continue
+    return out
+
+
+def execute(herd, pkg, steps, mains, go, keep_branches, say):
+    expected_main = dict(mains)
+    merged_prs = {}
+    left = {}
+    for x in steps:
+        left.setdefault(x.slice, []).append(x)
+    def record(s):
+        # also for a slice whose PRs were all merged before this run (crash after `gh pr merge`, merge by hand)
+        if all(y.done for y in left[s]):
+            he.append(herd, s, "merged", by="merge", prs=merged_prs[s], go=go[:GO_MAX])
+            say(f"   {s} → merged")
+
+    for i, x in enumerate(steps, 1):
+        if x.done:
+            merged_prs.setdefault(x.slice, []).append(f"{x.repo}#{x.n}@{x.merge_sha[:7]}")
+            record(x.slice)
+            continue
+        say(f"{i}. {x.name} ({x.slice})")
+        pr = x.pr = pr_view(x.full, x.n)
+        bad = []
+        if pr.get("state") != "OPEN":
+            bad.append(f"state {pr.get('state')}")
+        if pr.get("baseRefName") != MAIN:
+            bad.append(f"base {pr.get('baseRefName')} ≠ {MAIN}")
+        if not same(pr.get("headRefOid"), x.sha):
+            bad.append(f"head {str(pr.get('headRefOid'))[:7]} ≠ expected {x.sha[:7]}")
+        if pr.get("mergeable") != "MERGEABLE":
+            bad.append(f"mergeable {pr.get('mergeable')}")
+        cur = main_sha(x.full)
+        if x.full in expected_main and not same(cur, expected_main[x.full]):
+            bad.append(f"{MAIN} moved to {cur[:7]} outside this run")
+        if bad:
+            raise Stop(f"{x.name}: re-read before merge failed: " + ", ".join(bad))
+        run(["gh", "pr", "merge", str(x.n), "--repo", x.full, "--squash", "--match-head-commit", pr["headRefOid"]])
+        after = pr_view(x.full, x.n, settle=False)
+        oid = (after.get("mergeCommit") or {}).get("oid")
+        if after.get("state") != "MERGED" or not oid:
+            raise Stop(f"{x.name}: gh reported success but the PR is {after.get('state')}")
+        x.done, x.merge_sha = True, oid
+        expected_main[x.full] = oid
+        merged_prs.setdefault(x.slice, []).append(f"{x.repo}#{x.n}@{oid[:7]}")
+        say(f"   merged as {oid[:7]}")
+        record(x.slice)
+        keep = keep_branches
+        for child, line, inplan in children_of(herd, x, steps):
+            ok, stop = restack(herd, x, child, line, inplan, say, dry=False)
+            keep = keep or not ok
+            if stop:
+                raise Stop(stop)
+        branch = pr.get("headRefName")
+        if not keep:
+            still = open_prs_on_base(x.full, branch)
+            if still:
+                say(f"   branch {branch} kept: open PRs still target it: "
+                    + ", ".join(f"#{p['number']}" for p in still))
+            else:
+                run(["gh", "api", "-X", "DELETE", f"repos/{x.full}/git/refs/heads/{branch}"])
+                say(f"   deleted branch {branch}")
+        stale = other_review_ok(herd, pkg, x.full)
+        if stale:
+            say(f"   now stale on {x.full} (re-probe before their merge): {', '.join(stale)}")
+
+
+def dry_plan(herd, steps, keep_branches, say):
+    for i, x in enumerate(steps, 1):
+        if x.done:
+            say(f"{i}. {x.name} ({x.slice}) — already merged, skip")
+            continue
+        say(f"{i}. {x.name} ({x.slice})")
+        say(f"     re-read: state OPEN, base {MAIN}, head {x.sha[:7]}, MERGEABLE, {MAIN} unchanged")
+        say(f"     gh pr merge {x.n} --repo {x.full} --squash --match-head-commit {x.sha}")
+        kids = children_of(herd, x, steps)
+        for child, line, inplan in kids:
+            restack(herd, x, child, line, inplan, say, dry=True)
+        branch = x.pr.get("headRefName") if x.pr else "?"
+        if keep_branches:
+            say(f"     keep branch {branch} (--keep-branches)")
+        else:
+            say(f"     gh api -X DELETE repos/{x.full}/git/refs/heads/{branch}   # only when no open PR targets it")
+    for s in sorted({x.slice for x in steps}):
+        say(f"   record: herd-phase merged {s} (by merge, prs repo#n@merge_sha7, go)")
+
+
+def main():
+    if "--selftest" in sys.argv[1:]:
+        test = os.path.join(HERE, "..", "tests", "mergectx", "test_herd_merge.py")
+        if not os.path.exists(test):
+            print(f"herd-merge: selftest lives in {test}, which is not here", file=sys.stderr)
+            return 2
+        return subprocess.call([sys.executable, test])
+    ap = argparse.ArgumentParser(prog="herd-merge", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__.split("\n\n", 1)[1])
+    ap.add_argument("herd")
+    ap.add_argument("package", help="any slice of the package")
+    ap.add_argument("--go", help="the human's verbatim go words; required to merge")
+    ap.add_argument("--dry-run", action="store_true", help="check and print the exact plan, merge nothing")
+    ap.add_argument("--keep-branches", action="store_true", help="never delete merged branches")
+    ap.add_argument("--selftest", action="store_true", help="run tests/mergectx/test_herd_merge.py")
+    a = ap.parse_args()
+    go = (a.go or "").strip()
+    if not a.dry_run and not go:
+        print("herd-merge: refused — no --go \"<the human's words>\". herd-merge never merges without them.",
+              file=sys.stderr)
+        return 2
+    herd = os.path.abspath(a.herd)
+    if not os.path.isdir(herd):
+        print(f"herd-merge: no herd dir {herd}", file=sys.stderr)
+        return 2
+    lines = []
+
+    def say(msg):
+        lines.append(msg)
+        print(msg, flush=True)
+
+    lock = open(os.path.join(herd, "herd-merge.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("herd-merge: another herd-merge runs in this herd", file=sys.stderr)
+        return 2
+    outcome = "ok"
+    try:
+        pkg, merged, steps = build_plan(herd, a.package)
+        say(f"herd-merge {'plan' if a.dry_run else 'run'} — herd {os.path.basename(herd)}, "
+            f"package {', '.join(pkg)}")
+        say(f"go: {json.dumps(go[:GO_MAX], ensure_ascii=False) if go else '(none — dry run only)'}")
+        if merged:
+            say(f"already merged: {', '.join(merged)}")
+        if not steps:
+            say("nothing left to merge")
+            return 0
+        say("checks (whole package, before the first merge):")
+        mains = preflight(herd, pkg, merged, steps, say)
+        say("steps:")
+        if a.dry_run:
+            dry_plan(herd, steps, a.keep_branches, say)
+            outcome = "dry-run"
+            return 0
+        execute(herd, pkg, steps, mains, go, a.keep_branches, say)
+        say("done: package merged")
+        return 0
+    except Stop as e:
+        outcome = f"stopped: {e}"
+        done = [x.name for x in locals().get("steps", []) if x.done]
+        print(f"herd-merge: STOP — {e}", file=sys.stderr)
+        if done:
+            print(f"herd-merge: merged so far: {', '.join(done)}", file=sys.stderr)
+        waiting = [x.name for x in locals().get("steps", []) if not x.done]
+        if waiting:
+            print(f"herd-merge: not merged: {', '.join(waiting)}", file=sys.stderr)
+        return 1
+    finally:
+        try:
+            with open(os.path.join(herd, "herd-merge.log"), "a", encoding="utf-8") as f:
+                f.write(json.dumps({"ts": he.now(), "package": a.package, "dry_run": a.dry_run,
+                                    "go": go[:GO_MAX], "outcome": outcome, "lines": lines},
+                                   ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    sys.exit(main())
