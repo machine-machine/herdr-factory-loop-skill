@@ -112,9 +112,9 @@ OUT="$(board --selftest 2>&1)" && ok "--selftest passes ($(grep -c '^ok:' <<<"$O
 
 : >"$T/calls.log"
 OUT="$(board --once "$H" "$V1")"
-has "header: du + Plätze from herd-limits" "du: 2 Plätze 3/6 (1 Review)"
-has "needs you: merge word" "✓✓ okp Wort: „merge okp“ · api#20@aaaaaaa"
-has "needs you: blocked, with clash + tag" "? blk ⇄ run braucht Antwort F·md"
+has "header: Plätze from herd-limits" "Plätze 3/6 (1 Review)"; hasnt "header: no du-counter" "du: "
+has "ready: rev'd ✓ + merge word" "✓ okp rev'd ✓ · Wort: „merge okp“ · api#20@aaaaaaa"; hasnt "no Braucht-dich lane" "Braucht dich"
+has "working: blocked first, with clash + tag" "? blk ⇄ run braucht Antwort F·md"
 has "queue: fix first" "! fx Befunde zurück, startet als 1."
 has "queue: queued second" "◌ q1 startet als 2."
 has "working: tag + clash" "● run ⇄ blk baut die Lanes O·hi"
@@ -133,7 +133,7 @@ has "no slot: queue says why" "◌ q1 startet als 2. · kein Platz frei"
 has "no slot: header shows full" "Plätze 6/6 (2 Review)"
 
 OUT="$(HERD_BOARD_LANG=en board --once "$H")"
-has "en strings" "Needs you"; has "en merge word" "say “merge okp”"
+has "en strings" "Ready to merge"; has "en merge word" "say “merge okp”"; hasnt "en: no Needs-you lane" "Needs you"
 
 OUT="$(PATH="$T/notools:$BASEPATH" "$T/board/herd-board" --once "$H")"
 hasnt "herd-clash absent: no clash mark" "⇄"

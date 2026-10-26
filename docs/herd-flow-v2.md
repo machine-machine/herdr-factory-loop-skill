@@ -67,19 +67,19 @@ or the parent's branch). A package = transitive closure of `together_with`; a st
 ## 3. Board lanes (`herd-board`)
 
 Top to bottom, a lane is drawn only when non-empty:
-1. **Braucht dich / Needs you** — packages ready for the merge word (✓✓ bold green + the exact word,
-   e.g. `merge reviere`), and slices herdr reports `blocked` (? yellow).
-2. **Warteschlange / Queue** — `fix_queued` first (! orange, always above first starts), then
+1. **Warteschlange / Queue** — `fix_queued` first (! orange, always above first starts), then
    `queued` (◌ grey, „startet als n.“, and the reason it waits: slot, base not accepted, memory).
-3. **Arbeit / Working** — `working` (● cyan; ⧗ while tests/build run; ↺ orange on a fix round),
+2. **Arbeit / Working** — slices herdr reports `blocked` first (? yellow, „braucht Antwort“), then `working` (● cyan; ⧗ while tests/build run; ↺ orange on a fix round),
    computed `reported` (✓ thin green „prüfe ich“), disturbances (⚠ still, ✕ gone).
-4. **Merge-bereit / Ready to merge** — one row per package: `accepted` (◇ grey + why the review
-   waits: partner, base, slot), `review_running` (… pink, round n/3), `review_ok` (✓ green @sha7),
+3. **Merge-bereit / Ready to merge** — one row per package: `accepted` (◇ grey + why the review
+   waits: partner, base, slot), `review_running` (… pink, round n/3), `review_ok` on current heads
+   (✓ blue „rev'd ✓“ + the exact merge word, e.g. `merge reviere`, + refs @sha7),
    `stale` (yellow „veraltet“), `review_befund` (! orange, moves to the queue lane right after).
-5. **Heute gemergt / Merged today** — one line, numbers green, from `merged` events plus the
+4. **Heute gemergt / Merged today** — one line, numbers green, from `merged` events plus the
    existing GitHub search fallback.
 
-Header adds `Plätze n/m (k Review)` and `du: n`. Each slice row ends dim with model·effort (`O·hi`,
+Header adds `Plätze n/m (k Review)`. (Until 26.10.2026 there was a separate „Braucht dich“ lane and a
+`du: n` counter; dropped on the operator's request — the merge word lives in the Ready-to-merge row.) Each slice row ends dim with model·effort (`O·hi`,
 `F·hi`, `S·md`). Meaning is carried by the icon, colour only reinforces it. Never truncate with „…“;
 never silently cap — overflow says `+N weitere`. Existing behaviour kept: subagents (◆ magenta),
 adaptive height, `--selftest`, `NO_COLOR`, `HERD_BOARD_LANG`, `HERD_BOARD_ORG`, `HERD_BOARD_REPOS`.
