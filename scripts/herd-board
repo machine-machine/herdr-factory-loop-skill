@@ -1118,11 +1118,11 @@ def detail_lines(row, budget, w):
         satz = satz[len(head):].lstrip(" ,;:–—")  # the header already says the first clause
     if satz:
         lines += [paint(l) for l in wrap(satz, tw, 5 if budget >= 14 else 3)]
-    for words, start in d.get("acts", []):
+    for words, start in (d.get("acts", []) if DETAIL else []):  # simple view: no process list
         part = wrap(f"⧗ {words} {t('since')} {int((time.time() - start) / 60)}m", tw, 2)
         lines += [f"{CYAN}⧗{RST}" + paint(part[0][1:])] + [paint(p) for p in part[1:]]
     lines = lines[:budget]
-    room = budget - len(lines)
+    room = budget - len(lines) if DETAIL else 0  # simple view: no step feed under the sentence
     if room > 0:
         # newest first until the room is full; the age only where it changes, wrapped lines indented under the text
         picked, used = [], 0
