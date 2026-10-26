@@ -120,15 +120,18 @@ def same(a, b):
 def full_repo(repo, herd, slice_name):
     if "/" in repo:
         return repo
-    org = os.environ.get("HERD_ORG") or os.environ.get("HERD_BOARD_ORG")
-    if org:
-        return f"{org}/{repo}"
+    if os.environ.get("HERD_ORG"):
+        return f"{os.environ['HERD_ORG']}/{repo}"
     wt = clash.worktree_for(herd, slice_name, repo)
     if wt:
         url = run(["git", "-C", wt, "remote", "get-url", "origin"], check=False).stdout.strip()
         m = re.search(r"[:/]([^/:]+/[^/]+?)(?:\.git)?/?$", url)
         if m:
             return m.group(1)
+    # HERD_BOARD_ORG may list several owners for the board's search ("a,b"); only a single one names the owner
+    board_orgs = [o.strip() for o in os.environ.get("HERD_BOARD_ORG", "").split(",") if o.strip()]
+    if len(board_orgs) == 1:
+        return f"{board_orgs[0]}/{repo}"
     raise Stop(f"cannot tell the owner of repo {repo!r}: set HERD_ORG or write owner/repo in prs")
 
 
