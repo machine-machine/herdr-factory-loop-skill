@@ -15,7 +15,8 @@ Lanes, top to bottom, each drawn only when non-empty:
   3. Working        ● working (⧗ tests/build, ↺ fix round), ✓ reported (report written, idle), ⚠ still, ✕ gone,
                     plus the orchestrator's own subagents (◆) and Workflow runs (▸ with their agents)
   4. Ready to merge one row per package: ◇ accepted (+ why the review waits), … review running (round n/3),
-                    ✓ reviewed, ⟳ stale (PR head or main moved since review_ok), ! findings
+                    ✓ rev'd ✓ (also listed under Needs you with its merge word), ⟳ stale (PR head or main
+                    moved since review_ok), ! findings
   5. Merged today   numbers from `merged` events plus the GitHub search (HERD_BOARD_ORG)
 Each slice row ends dim with age and model·effort from its working event (O·hi = Opus/high). ⇄ marks a file
 overlap with another live slice (`herd-clash <herd> --json`, on PATH or next to this script; skipped when absent).
@@ -919,6 +920,10 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
             word = f"merge {members[0]}"
             text = t("word", w=word) + (" · " + " ".join(refs) if refs else "")
             lanes["needs"].append((0, name, "✓✓", BLUE, "", text, tags, dict(d, bold=True)))
+            # the package also keeps its place in Ready to merge, so that lane shows every package from accepted
+            # to the merge: rev'd ✓ in blue, like the numbers under Merged today
+            lanes["ready"].append((0, name, "✓", BLUE, "", f"{t('reviewed')} ✓" + (" · " + " ".join(refs) if refs else ""),
+                                   tags, d))
             continue
         if any(ph[m] == "review_befund" for m in members):
             files = [os.path.basename(str(st[m].get("befunde_file") or "")) for m in members
@@ -1612,6 +1617,9 @@ def selftest():
                 check(f"[{lang}] all four lanes in order", busy and -1 not in order and order == sorted(order))
                 check(f"[{lang}] merge word for the clean package",
                       "✓✓ ok-api+ok-ui" in text and t("word", w="merge ok-api") in text)
+                ready_at = next(i for i, l in enumerate(lines) if l.startswith("✓ ok-api+ok-ui"))
+                check(f"[{lang}] the clean package also shows rev'd ✓ under Ready to merge",
+                      order[3] < ready_at and f"{t('reviewed')} ✓" in lines[ready_at])
                 check(f"[{lang}] blocked slice needs you", "? w-blk" in row("w-blk") and order[0] < lines.index(
                     row("w-blk")) < order[1])
                 check(f"[{lang}] header you + slots", t("you", n=2) in lines[0] and
