@@ -793,7 +793,9 @@ def pr_refs(ev):
     for ref in as_list(ev.get("prs")):
         m = PR_REF.match(str(ref))
         if m:
-            out.append(f"{short_repo(m[1])}#{m[2]}" + (f"@{m[3][:7]}" if m[3] else ""))
+            # simple view: just the PR number („api #224“); the reviewed sha only with HERD_BOARD_DETAIL
+            out.append(f"{short_repo(m[1])}#{m[2]}" + (f"@{m[3][:7]}" if m[3] else "") if DETAIL
+                       else f"{short_repo(m[1])} #{m[2]}")
     return out
 
 
@@ -914,7 +916,7 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
         wts = [w for m in members for w in as_list((lastwork.get(m) or {}).get("wt"))]
         stale = {m: stale_of(st[m], wts, merged_evs, members) for m in members if ph[m] == "review_ok"}
         refs = [r for m in members if ph[m] in ("review_ok", "review_befund", "accepted", "review_running")
-                for r in pr_refs(st[m])] if DETAIL else []
+                for r in pr_refs(st[m])]
         tags = tail(*dict.fromkeys(tag(m) for m in members if tag(m)))
         c = clash_of(*members)
         d = {"clash": c if c.count(",") < 1 else str(c.count(",") + 1)}  # two or more: just the count, rows stay short
@@ -1667,9 +1669,10 @@ def selftest():
             g["LANG"] = "de"
             g["DETAIL"] = False
             simple = "\n".join(strip(render("", [herd, old])[0]))
-            check("simple view: no tags, overlaps, refs or merge word; rev'd ✓ stays",
+            check("simple view: PR numbers without sha; no tags, overlaps or merge word; rev'd ✓ stays",
                   "O·hi" not in simple and "⇄" not in simple and "@" + sha("b")[:7] not in simple
-                  and t("word", w="merge ok-api") not in simple and f"{t('reviewed')} ✓" in simple)
+                  and "app #20" in simple and t("word", w="merge ok-api") not in simple
+                  and f"{t('reviewed')} ✓" in simple)
             g["DETAIL"] = True
             os.environ.update(LINES="16")
             out, busy = render("", [herd, old])
