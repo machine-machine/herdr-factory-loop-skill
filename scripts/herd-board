@@ -389,7 +389,9 @@ def workflow_rows(reg, label, wdir):
         tail = f"{int(age)}m" if age >= 1 else ""
         name = f"  {alabel}"[:40]
         d = {"jsonl": jsonl, "sort": f"{label}\x01{alabel}"}
-        if aid not in done and age >= STILL_MIN:
+        # still for a while = ⚠; no move for WF_STALE_MIN = an agent of an interrupted session that a resumed run
+        # replaced with a new one (its journal entry never gets a result) — dead, not stuck: leave it out
+        if aid not in done and STILL_MIN <= age < WF_STALE_MIN:
             rows.append((2, name, "⚠", RED, "", f"{t('still')} {tail}", "", d))
     return rows
 
