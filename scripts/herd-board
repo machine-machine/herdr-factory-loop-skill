@@ -13,7 +13,7 @@ Lanes, top to bottom, each drawn only when non-empty:
   1. Queue          ! fix_queued (always first), ◌ queued "starts as no. n" + why it waits (slot, base, memory)
   2. Working        ? herdr reports `blocked` (first, yellow), ● working (⧗ tests/build, ↺ fix round),
                     ✓ reported (report written, idle), ⚠ still, ✕ gone,
-                    plus the orchestrator's own subagents (◆) and Workflow runs (▸ with their agents)
+                    plus the orchestrator's own subagents (◆) and Workflow runs (▸ one line; ⚠ only for a still agent)
   3. Ready to merge one row per package: ◇ accepted (+ why the review waits), … review running (round n/3),
                     ✓ rev'd ✓ + the exact merge word (reviewed on current heads), ✓ rev'd waiting for a partner or
                     base, ⟳ stale (PR head or main moved since review_ok), ! findings
@@ -78,7 +78,7 @@ STRINGS = {
            "checking": "checking", "starting": "starting", "queued": "starts as no. {pos}",
            "fix_queued": "findings back, starts as no. {pos}", "w_slot": "no free slot", "w_mem": "memory",
            "w_load": "load", "w_base_q": "base {b} not accepted", "accepted": "accepted", "review_due": "review due",
-           "w_partner": "waits for {x}", "w_base": "waits for base {b}", "review_round": "review running, round {n}/3",
+           "w_partner": "waits for {x}", "w_base": "waits for base {b}", "review_round": "review running, round {n}/3", "reprobe": "re-probe after a merge",
            "reviewed": "rev'd", "stale": "stale", "stale_head": "{ref} has new commits",
            "stale_main": "{repo} main moved", "stale_nomain": "{repo} main not recorded", "befund": "findings", "word": "say “{w}”",
            "v1": "v1 herd — herd-recover migrates it", "wf": "workflow: {r} running, {d} done",
@@ -102,7 +102,7 @@ STRINGS = {
            "fix_queued": "Befunde zurück, startet als {pos}.", "w_slot": "kein Platz frei", "w_mem": "Speicher knapp",
            "w_load": "Last zu hoch", "w_base_q": "Basis {b} nicht abgenommen", "accepted": "abgenommen",
            "review_due": "Review steht an", "w_partner": "wartet auf {x}", "w_base": "wartet auf Basis {b}",
-           "review_round": "Review läuft, Runde {n}/3", "reviewed": "rev'd", "stale": "veraltet",
+           "review_round": "Review läuft, Runde {n}/3", "reprobe": "Nachprüfung nach Merge", "reviewed": "rev'd", "stale": "veraltet",
            "stale_head": "{ref} hat neue Commits", "stale_main": "{repo}-main ist weiter",
            "stale_nomain": "{repo}-main nicht erfasst", "befund": "Befunde",
            "word": "Wort: „{w}“", "v1": "v1-Herde — herd-recover migriert",
@@ -354,7 +354,8 @@ WF_STALE_MIN = 30      # a run with no movement for this long was stopped
 
 
 def workflow_rows(reg, label, wdir):
-    """Rows for a Workflow run: one per running agent (journal 'started' without 'result'), finished ones briefly."""
+    """Rows for a Workflow run: one header line with the counts; an agent gets its own row only when it is still
+    (⚠). Three review loops with a step feed per agent crowded the Working lane — their state is in Ready to merge."""
     try:
         events = [json.loads(l) for l in open(os.path.join(wdir, "journal.jsonl"), encoding="utf-8") if l.strip()]
         jage = (time.time() - os.path.getmtime(os.path.join(wdir, "journal.jsonl"))) / 60
@@ -388,13 +389,8 @@ def workflow_rows(reg, label, wdir):
         tail = f"{int(age)}m" if age >= 1 else ""
         name = f"  {alabel}"[:40]
         d = {"jsonl": jsonl, "sort": f"{label}\x01{alabel}"}
-        if aid in done:
-            if age <= AGENT_DONE_KEEP_MIN:
-                rows.append((2, name, "✓", GREEN, "", t("done"), "", d))
-        elif age >= STILL_MIN:
+        if aid not in done and age >= STILL_MIN:
             rows.append((2, name, "⚠", RED, "", f"{t('still')} {tail}", "", d))
-        else:
-            rows.append((2, name, "◆", MAG, "", last_action(jsonl) or t("working"), tail, d))
     return rows
 
 
@@ -910,7 +906,8 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
         refs = [r for m in members if ph[m] in ("review_ok", "review_befund", "accepted", "review_running")
                 for r in pr_refs(st[m])]
         tags = tail(*dict.fromkeys(tag(m) for m in members if tag(m)))
-        d = {"clash": clash_of(*members)}
+        c = clash_of(*members)
+        d = {"clash": c if c.count(",") < 1 else str(c.count(",") + 1)}  # two or more: just the count, rows stay short
         reviewed = [m for m in members if ph[m] == "review_ok"]
         # herd-merge refuses while a stacked_on base outside the package is not merged: no merge word before that
         ext_bases = sorted({hdr(m).get("stacked_on") for m in members if hdr(m).get("stacked_on")
@@ -929,10 +926,13 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
             why = next(v for v in stale.values() if v)
             row = (1, name, "⟳", YEL, "", f"{t('stale')}: {why}", tags, d)
         elif any(ph[m] == "review_running" for m in members):
-            rnd = next((st[m].get("round") for m in members if ph[m] == "review_running"), None)
-            rnd = rnd if isinstance(rnd, int) and not isinstance(rnd, bool) else \
-                int(rnd) if isinstance(rnd, str) and rnd.strip().isdigit() else "?"
-            row = (2, name, "…", MAG, "", t("review_round", n=rnd) + (" · " + " ".join(refs) if refs else ""), tags, d)
+            # the loop restarts its own counter at 1 on every call: count the rounds from the slice's history
+            # instead (findings so far + 1); a review straight after review_ok is the re-probe after a merge
+            hist = next((st[m].get("history") or [] for m in members if ph[m] == "review_running"), [])
+            before = [h for h in hist[:-1] if h != "accepted"]
+            label = t("reprobe") if before and before[-1] == "review_ok" else \
+                t("review_round", n=hist.count("review_befund") + 1)
+            row = (2, name, "…", MAG, "", label + (" · " + " ".join(refs) if refs else ""), tags, d)
         elif any(ph[m] == "accepted" for m in members):
             bases = [hdr(m).get("stacked_on") for m in members if ph[m] == "accepted" and hdr(m).get("stacked_on")]
             bases = [b for b in bases if b not in members and phase(b) not in ("review_ok", "merged")]
@@ -1510,7 +1510,9 @@ def selftest():
         ev("w-still", W)                                       # idle, transcript old -> ⚠
         ev("a-one", A, prs=["app#11@" + sha("a")[:7]])        # partner a-two still working -> waits for partner
         ev("a-two", W)
-        ev("rr", RR, run_id="r1", round=2)
+        ev("rr", RR[:-1] + ["review_running", "review_befund", "fix_queued", "working", "accepted", "review_running"],
+           run_id="r1", round=1)                               # the loop's own counter restarts; history says 2
+        ev("rp", OK + ["review_running"], run_id="r4", round=1)  # review straight after review_ok -> re-probe
         ev("ok-api", OK, prs=["app#20@" + sha("b")], main=["app@" + sha("c")], run_id="r2")
         ev("ok-ui", OK, prs=["web#7@" + sha("d")], main=["web@" + sha("e")], run_id="r3")
         ev("st-head", OK, prs=["app#30@" + sha("f")], main=["app@" + sha("c")])        # head moved -> stale
@@ -1631,7 +1633,8 @@ def selftest():
                 check(f"[{lang}] progress bar + missing", "█" in text and f"{t('missing')} tests, docs" in text)
                 check(f"[{lang}] accepted waits for partner", row("a-one+a-two").startswith("◇") and
                       t("w_partner", x="a-two") in row("a-one+a-two"))
-                check(f"[{lang}] review running round 2/3", t("review_round", n=2) in row("rr"))
+                check(f"[{lang}] review running round 2/3 from the history", t("review_round", n=2) in row("rr"))
+                check(f"[{lang}] review after review_ok reads as re-probe", t("reprobe") in row("rp"))
                 check(f"[{lang}] reviewed but base unmerged: no merge word", row("ok-stk").startswith("✓ ok-stk")
                       and t("w_base", b="rr") in row("ok-stk") and order[2] < lines.index(row("ok-stk")))
                 check(f"[{lang}] stale by PR head", row("st-head").startswith("⟳") and
