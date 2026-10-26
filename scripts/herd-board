@@ -40,7 +40,7 @@ Environment:
   HERD_BOARD_DISK   path whose free space the header shows (default: the first herd dir, else the cwd)
   NO_COLOR          plain text
 """
-import calendar, glob, json, os, re, shlex, shutil, subprocess, sys, textwrap, time
+import calendar, glob, json, os, re, shlex, shutil, subprocess, sys, textwrap, time, unicodedata
 
 HERE = os.path.dirname(os.path.realpath(__file__))
 sys.path.insert(0, HERE)
@@ -173,6 +173,24 @@ TOKENS = [
     (re.compile(r"\b\d+(?:[.,]\d+)?\s?(?:%|GB|MB|ha|min|h|Min|Std|tests?|Tests?)\b|\b\d+/\d+\b"), BLUE),
 ]
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def clip(line, w):
+    """`line` cut to `w` terminal columns, colour codes kept and not counted, wide glyphs (emoji, CJK) as two. The
+    last guard before painting: a line the terminal wraps itself makes the frame taller than the panel, the panel
+    scrolls on every repaint and the header piles up."""
+    out, col, i = [], 0, 0
+    for m in ANSI.finditer(line + "\x1b[0m"):
+        for ch in line[i:m.start()]:
+            cw = 0 if unicodedata.combining(ch) else 2 if unicodedata.east_asian_width(ch) in "WF" else 1
+            if col + cw > w:
+                return "".join(out) + RST
+            out.append(ch)
+            col += cw
+        if m.start() < len(line):  # the appended reset only ends the scan
+            out.append(m.group(0))
+        i = m.end()
+    return "".join(out)
 
 
 def paint(text, base=""):
@@ -1659,6 +1677,11 @@ def selftest():
                       busy and any("ZeroDivisionError" in l for l in strip(out)))
             finally:
                 g["render"] = render_impl
+            wide = f"{DIM}herde-2010: v1 herd — herd-recover migrates it{RST}  🤖 cut check"
+            cut = [ANSI.sub("", clip(wide, n)) for n in (38, 20, 50)]
+            check("clip keeps every line inside the panel width (colour codes free, emoji two columns)",
+                  [sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in v) for v in cut] == [38, 20, 50]
+                  and clip("abc", 10) == "abc")
         finally:
             g.update(real)
             TOOL_CACHE.clear()
@@ -1697,7 +1720,8 @@ def main():
     given = [os.path.abspath(a) for a in args]
     if once:
         out, _ = frame(anchor, given)
-        print("\n".join(out))
+        cols = max(20, shutil.get_terminal_size((66, 40)).columns - 1)
+        print("\n".join(clip(l, cols) for l in out))
         return 0
     me = os.environ.get("HERDR_PANE_ID")
     if not anchor and me:
@@ -1715,7 +1739,8 @@ def main():
         while True:
             out, busy = frame(anchor, given)
             rows = shutil.get_terminal_size((66, 40)).lines
-            sys.stdout.write("\033[H" + "\n".join(l + "\033[K" for l in out[:rows - 1]) + "\033[J")
+            cols = max(20, shutil.get_terminal_size((66, 40)).columns - 1)
+            sys.stdout.write("\033[H" + "\n".join(clip(l, cols) + "\033[K" for l in out[:rows - 1]) + "\033[J")
             sys.stdout.flush()
             if busy:
                 quiet_since = time.time()
