@@ -10,13 +10,14 @@ Usage: herd-board [--anchor <pane>] [<herd-dir> ...]
 Herd dirs: those given plus those listed in ~/.cache/herd-board/<anchor>.herds. The state of a slice is its last
 event in <herd>/herd.events.jsonl (read through herd_events.py next to this script); everything live is computed.
 Lanes, top to bottom, each drawn only when non-empty:
-  1. Needs you      ✓✓ package reviewed on current heads -> the exact merge word; ? herdr reports `blocked`
-  2. Queue          ! fix_queued (always first), ◌ queued "starts as no. n" + why it waits (slot, base, memory)
-  3. Working        ● working (⧗ tests/build, ↺ fix round), ✓ reported (report written, idle), ⚠ still, ✕ gone,
-                    plus the orchestrator's own subagents (◆) and Workflow runs (▸ with their agents)
-  4. Ready to merge one row per package: ◇ accepted (+ why the review waits), … review running (round n/3),
-                    ✓ reviewed, ⟳ stale (PR head or main moved since review_ok), ! findings
-  5. Merged today   numbers from `merged` events plus the GitHub search (HERD_BOARD_ORG)
+  1. Queue          ! fix_queued (always first), ◌ queued "starts as no. n" + why it waits (slot, base, memory)
+  2. Working        ? herdr reports `blocked` (first, yellow), ● working (⧗ tests/build, ↺ fix round),
+                    ✓ reported (report written, idle), ⚠ still, ✕ gone,
+                    plus the orchestrator's own subagents (◆) and Workflow runs (▸ one line; ⚠ only for a still agent)
+  3. Ready to merge one row per package: ◇ accepted (+ why the review waits), … review running (round n/3),
+                    ✓ rev'd ✓ + the exact merge word (reviewed on current heads), ✓ rev'd waiting for a partner or
+                    base, ⟳ stale (PR head or main moved since review_ok), ! findings
+  4. Merged today   numbers from `merged` events plus the GitHub search (HERD_BOARD_ORG)
 Each slice row ends dim with age and model·effort from its working event (O·hi = Opus/high). ⇄ marks a file
 overlap with another live slice (`herd-clash <herd> --json`, on PATH or next to this script; skipped when absent).
 Header: time, `you: n`, `slots n/m (k review)` from `herd-limits` (when present), free RAM, free disk, and the
@@ -34,6 +35,8 @@ Worker status contract (<slice>.status.json, written by the worker, English or G
 
 Environment:
   HERD_BOARD_LANG   en (default) | de
+  HERD_BOARD_DETAIL 1 = also model·effort tags, ⇄ overlaps, PR refs @sha7, merge word, Workflow runs
+                    (default: simple — name, state, progress, sentence)
   HERD_BOARD_ORG    GitHub owner(s), comma-separated, for bare repo names and the "merged today" search
                     (unset: no search; gh resolves repos from the slice's worktree)
   HERD_BOARD_REPOS  short names used in refs, e.g. "api=my-api,ui=my-ui,ma=other-owner/agent"
@@ -59,6 +62,9 @@ REPOS = dict(p.strip().split("=", 1) for p in os.environ.get("HERD_BOARD_REPOS",
 SHORT = {v.split("/")[-1]: k for k, v in REPOS.items()}
 
 LANG = "de" if os.environ.get("HERD_BOARD_LANG", "").lower().startswith("de") else "en"
+# Simple by default: name, state, progress, the worker's sentence. HERD_BOARD_DETAIL=1 adds model·effort tags,
+# ⇄ file overlaps, PR refs @sha7, the merge word and one line per Workflow run (operator 26.10.: too crowded).
+DETAIL = os.environ.get("HERD_BOARD_DETAIL", "").lower() in ("1", "true", "yes", "ja")
 STRINGS = {
     "en": {"title": "Herd", "load": "load", "done": "done", "check": "check", "working": "working",
            "still": "still", "needs_answer": "needs an answer", "ended": "ended without a report", "missing": "missing:",
@@ -72,12 +78,12 @@ STRINGS = {
            "devsrv": "UI preview is running", "srv": "test server is running", "deps": "installs packages",
            "push": "uploads",
            "ram": "GB RAM", "ram_s": "G RAM", "disk": "GB disk", "disk_s": "G disk", "input": "input ",
-           "slots": "slots {u}/{m} ({k} review)", "slots_s": "{u}/{m}", "you": "you: {n}", "you_s": "you {n}",
-           "lane_needs": "Needs you", "lane_queue": "Queue", "lane_work": "Working", "lane_ready": "Ready to merge",
+           "slots": "slots {u}/{m} ({k} review)", "slots_s": "{u}/{m}",
+           "lane_queue": "Queue", "lane_work": "Working", "lane_ready": "Ready to merge",
            "checking": "checking", "starting": "starting", "queued": "starts as no. {pos}",
            "fix_queued": "findings back, starts as no. {pos}", "w_slot": "no free slot", "w_mem": "memory",
            "w_load": "load", "w_base_q": "base {b} not accepted", "accepted": "accepted", "review_due": "review due",
-           "w_partner": "waits for {x}", "w_base": "waits for base {b}", "review_round": "review running, round {n}/3",
+           "w_partner": "waits for {x}", "w_base": "waits for base {b}", "review_round": "review running, round {n}/3", "reprobe": "re-probe after a merge",
            "reviewed": "rev'd", "stale": "stale", "stale_head": "{ref} has new commits",
            "stale_main": "{repo} main moved", "stale_nomain": "{repo} main not recorded", "befund": "findings", "word": "say “{w}”",
            "v1": "v1 herd — herd-recover migrates it", "wf": "workflow: {r} running, {d} done",
@@ -94,14 +100,14 @@ STRINGS = {
            "devsrv": "Vorschau der Oberfläche läuft", "srv": "Test-Server läuft", "deps": "installiert Pakete",
            "push": "lädt hoch",
            "ram": "GB RAM", "ram_s": "G RAM", "disk": "GB Platte", "disk_s": "G Platte", "input": "Eingabe ",
-           "slots": "Plätze {u}/{m} ({k} Review)", "slots_s": "{u}/{m}", "you": "du: {n}", "you_s": "du {n}",
-           "lane_needs": "Braucht dich", "lane_queue": "Warteschlange", "lane_work": "Arbeit",
+           "slots": "Plätze {u}/{m} ({k} Review)", "slots_s": "{u}/{m}",
+           "lane_queue": "Warteschlange", "lane_work": "Arbeit",
            "lane_ready": "Merge-bereit",
            "checking": "prüfe ich", "starting": "startet", "queued": "startet als {pos}.",
            "fix_queued": "Befunde zurück, startet als {pos}.", "w_slot": "kein Platz frei", "w_mem": "Speicher knapp",
            "w_load": "Last zu hoch", "w_base_q": "Basis {b} nicht abgenommen", "accepted": "abgenommen",
            "review_due": "Review steht an", "w_partner": "wartet auf {x}", "w_base": "wartet auf Basis {b}",
-           "review_round": "Review läuft, Runde {n}/3", "reviewed": "rev'd", "stale": "veraltet",
+           "review_round": "Review läuft, Runde {n}/3", "reprobe": "Nachprüfung nach Merge", "reviewed": "rev'd", "stale": "veraltet",
            "stale_head": "{ref} hat neue Commits", "stale_main": "{repo}-main ist weiter",
            "stale_nomain": "{repo}-main nicht erfasst", "befund": "Befunde",
            "word": "Wort: „{w}“", "v1": "v1-Herde — herd-recover migriert",
@@ -353,7 +359,8 @@ WF_STALE_MIN = 30      # a run with no movement for this long was stopped
 
 
 def workflow_rows(reg, label, wdir):
-    """Rows for a Workflow run: one per running agent (journal 'started' without 'result'), finished ones briefly."""
+    """Rows for a Workflow run: one header line with the counts; an agent gets its own row only when it is still
+    (⚠). Three review loops with a step feed per agent crowded the Working lane — their state is in Ready to merge."""
     try:
         events = [json.loads(l) for l in open(os.path.join(wdir, "journal.jsonl"), encoding="utf-8") if l.strip()]
         jage = (time.time() - os.path.getmtime(os.path.join(wdir, "journal.jsonl"))) / 60
@@ -387,13 +394,10 @@ def workflow_rows(reg, label, wdir):
         tail = f"{int(age)}m" if age >= 1 else ""
         name = f"  {alabel}"[:40]
         d = {"jsonl": jsonl, "sort": f"{label}\x01{alabel}"}
-        if aid in done:
-            if age <= AGENT_DONE_KEEP_MIN:
-                rows.append((2, name, "✓", GREEN, "", t("done"), "", d))
-        elif age >= STILL_MIN:
+        # still for a while = ⚠; no move for WF_STALE_MIN = an agent of an interrupted session that a resumed run
+        # replaced with a new one (its journal entry never gets a result) — dead, not stuck: leave it out
+        if aid not in done and STILL_MIN <= age < WF_STALE_MIN:
             rows.append((2, name, "⚠", RED, "", f"{t('still')} {tail}", "", d))
-        else:
-            rows.append((2, name, "◆", MAG, "", last_action(jsonl) or t("working"), tail, d))
     return rows
 
 
@@ -430,7 +434,8 @@ def agent_rows(anchor, agents=None):
             label, jsonl = open(reg, encoding="utf-8").read().split("\n", 1)
             jsonl = jsonl.strip()
             if os.path.isdir(jsonl):
-                rows += workflow_rows(reg, label, jsonl)
+                if DETAIL:  # simple view: a review run already shows as "Review läuft" under Ready to merge
+                    rows += workflow_rows(reg, label, jsonl)
                 continue
             meta = json.load(open(jsonl[:-6] + ".meta.json")) if os.path.exists(jsonl[:-6] + ".meta.json") else {}
             meta = meta if isinstance(meta, dict) else {}
@@ -788,7 +793,9 @@ def pr_refs(ev):
     for ref in as_list(ev.get("prs")):
         m = PR_REF.match(str(ref))
         if m:
-            out.append(f"{short_repo(m[1])}#{m[2]}" + (f"@{m[3][:7]}" if m[3] else ""))
+            # simple view: just the PR number („api #224“); the reviewed sha only with HERD_BOARD_DETAIL
+            out.append(f"{short_repo(m[1])}#{m[2]}" + (f"@{m[3][:7]}" if m[3] else "") if DETAIL
+                       else f"{short_repo(m[1])} #{m[2]}")
     return out
 
 
@@ -799,7 +806,7 @@ def limits_reason(limits):
 
 
 def v2_rows(herd, agents, limits, merged_evs, lanes):
-    """Rows of one v2 herd into lanes {"needs", "queue", "work", "ready"}. Row = (rank, name, icon, colour, n/m, text,
+    """Rows of one v2 herd into lanes {"queue", "work", "ready"}. Row = (rank, name, icon, colour, n/m, text,
     tail, detail). Returns the herd's state, so the caller does not read the file again."""
     st = he.state(herd)
     lastwork, hdrs = {}, {}
@@ -816,6 +823,8 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
         return hdrs[s]
 
     def tag(s):
+        if not DETAIL:
+            return ""
         w = lastwork.get(s) or {}
         return model_tag(w.get("model") or hdr(s).get("model"), w.get("effort") or hdr(s).get("effort"))
 
@@ -825,7 +834,7 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
     def phase(s):
         return (st.get(s) or {}).get("phase")
 
-    clash = herd_clash(herd)
+    clash = herd_clash(herd) if DETAIL else {}
     live = {s for s, ev in st.items() if ev["phase"] not in ("merged", "parked")}
     clash_of = lambda *ss: ", ".join(sorted({o for s in ss for o in clash.get(s, ()) if o in live and o not in ss}))
 
@@ -848,7 +857,7 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
             row = (i, s, "◌", DIM, "", t("queued", pos=i + 1) + (f" · {why}" if why else ""), tag(s), d)
         lanes["queue"].append(row)
 
-    # 3. working (+ computed reported / still / gone; blocked goes to "needs you")
+    # 3. working (+ computed reported / still / gone; blocked comes first, in yellow)
     for s, ev in st.items():
         if ev["phase"] != "working":
             continue
@@ -869,7 +878,7 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
              "m": m, "acts": acts, "jsonl": newest_jsonl(a["cwd"]) if a and a.get("cwd") else None,
              "clash": clash_of(s)}
         if status == "blocked":
-            lanes["needs"].append((1, s, "?", YEL, "", t("needs_answer"), tail(age, tag(s)), {"clash": d["clash"]}))
+            lanes["work"].append((0, s, "?", YEL, "", t("needs_answer"), tail(age, tag(s)), {"clash": d["clash"]}))
             continue
         if report and (not a or status in ("idle", "done")) and not acts:
             pr = stj.get("pr") or ""
@@ -887,7 +896,7 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
             row = (2, s, icon, col, prog, kurz(stj) or busy or t("working"), tail(age, tag(s)), d)
         lanes["work"].append(row)
 
-    # 4. packages: one row per package with any member past `accepted`; reviewed on current heads -> "needs you"
+    # 4. packages: one row per package with any member past `accepted`; reviewed on current heads -> merge word
     done = set()
     for s in sorted(st):
         if phase(s) not in READYISH:
@@ -909,7 +918,8 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
         refs = [r for m in members if ph[m] in ("review_ok", "review_befund", "accepted", "review_running")
                 for r in pr_refs(st[m])]
         tags = tail(*dict.fromkeys(tag(m) for m in members if tag(m)))
-        d = {"clash": clash_of(*members)}
+        c = clash_of(*members)
+        d = {"clash": c if c.count(",") < 1 else str(c.count(",") + 1)}  # two or more: just the count, rows stay short
         reviewed = [m for m in members if ph[m] == "review_ok"]
         # herd-merge refuses while a stacked_on base outside the package is not merged: no merge word before that
         ext_bases = sorted({hdr(m).get("stacked_on") for m in members if hdr(m).get("stacked_on")
@@ -917,8 +927,9 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
         if not waiting and not ext_bases and reviewed and all(ph[m] in ("review_ok", "merged") for m in members) \
                 and not any(stale.values()):
             word = f"merge {members[0]}"
-            text = t("word", w=word) + (" · " + " ".join(refs) if refs else "")
-            lanes["needs"].append((0, name, "✓✓", BLUE, "", text, tags, dict(d, bold=True)))
+            text = f"{t('reviewed')} ✓" + (f" · {t('word', w=word)}" if DETAIL else "") + \
+                (" · " + " ".join(refs) if refs else "")
+            lanes["ready"].append((0, name, "✓", BLUE, "", text, tags, d))  # blue, like the numbers under Merged today
             continue
         if any(ph[m] == "review_befund" for m in members):
             files = [os.path.basename(str(st[m].get("befunde_file") or "")) for m in members
@@ -928,10 +939,13 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
             why = next(v for v in stale.values() if v)
             row = (1, name, "⟳", YEL, "", f"{t('stale')}: {why}", tags, d)
         elif any(ph[m] == "review_running" for m in members):
-            rnd = next((st[m].get("round") for m in members if ph[m] == "review_running"), None)
-            rnd = rnd if isinstance(rnd, int) and not isinstance(rnd, bool) else \
-                int(rnd) if isinstance(rnd, str) and rnd.strip().isdigit() else "?"
-            row = (2, name, "…", MAG, "", t("review_round", n=rnd) + (" · " + " ".join(refs) if refs else ""), tags, d)
+            # the loop restarts its own counter at 1 on every call: count the rounds from the slice's history
+            # instead (findings so far + 1); a review straight after review_ok is the re-probe after a merge
+            hist = next((st[m].get("history") or [] for m in members if ph[m] == "review_running"), [])
+            before = [h for h in hist[:-1] if h != "accepted"]
+            label = t("reprobe") if before and before[-1] == "review_ok" else \
+                t("review_round", n=hist.count("review_befund") + 1)
+            row = (2, name, "…", MAG, "", label + (" · " + " ".join(refs) if refs else ""), tags, d)
         elif any(ph[m] == "accepted" for m in members):
             bases = [hdr(m).get("stacked_on") for m in members if ph[m] == "accepted" and hdr(m).get("stacked_on")]
             bases = [b for b in bases if b not in members and phase(b) not in ("review_ok", "merged")]
@@ -1027,7 +1041,7 @@ def v1_rows(herd, agents, lanes):
         if report and (not a or status in ("idle", "done")) and not acts:
             lanes["work"].append((1, s, "✓", GREEN, "", st.get("pr") or t("done"), t("check"), d))
         elif status == "blocked":
-            lanes["needs"].append((1, s, "?", YEL, "", t("needs_answer"), "", {}))
+            lanes["work"].append((0, s, "?", YEL, "", t("needs_answer"), "", {}))
         elif s in queue:
             pos = queue.index(s) + 1
             lanes["queue"].append((100 + pos, s, "◌", DIM, "", t("paused", pos=pos) if st else t("waiting", pos=pos),
@@ -1106,11 +1120,11 @@ def detail_lines(row, budget, w):
         satz = satz[len(head):].lstrip(" ,;:–—")  # the header already says the first clause
     if satz:
         lines += [paint(l) for l in wrap(satz, tw, 5 if budget >= 14 else 3)]
-    for words, start in d.get("acts", []):
+    for words, start in (d.get("acts", []) if DETAIL else []):  # simple view: no process list
         part = wrap(f"⧗ {words} {t('since')} {int((time.time() - start) / 60)}m", tw, 2)
         lines += [f"{CYAN}⧗{RST}" + paint(part[0][1:])] + [paint(p) for p in part[1:]]
     lines = lines[:budget]
-    room = budget - len(lines)
+    room = budget - len(lines) if DETAIL else 0  # simple view: no step feed under the sentence
     if room > 0:
         # newest first until the room is full; the age only where it changes, wrapped lines indented under the text
         picked, used = [], 0
@@ -1242,7 +1256,7 @@ def machine():
     return l1, mem, os.cpu_count() or 1
 
 
-def header(w, herds, needs, limits, reviews, quiet):
+def header(w, herds, limits, reviews, quiet):
     """One line, whatever the width: drop words until it fits."""
     l1, mem, cores = machine()
     warn = mem < 2.5 or l1 > 2 * cores
@@ -1254,15 +1268,14 @@ def header(w, herds, needs, limits, reviews, quiet):
         disk = None
     dcol = RED if disk is not None and disk < 8 else YEL if disk is not None and disk < 15 else GREEN
     k = limits.get("review") if limits and limits.get("review") is not None else reviews
-    # (RAM label, disk label, input label, separator, slots key, you key, space before the unit)
-    variants = ((t("ram"), t("disk"), t("input"), " · ", "slots", "you", " "),
-                (t("ram_s"), t("disk_s"), t("input"), " · ", "slots", "you", ""),
-                (t("ram_s"), t("disk_s"), t("input"), "·", "slots_s", "you_s", ""),
-                ("G", "G", "✎", "·", "slots_s", "you_s", ""))
+    # (RAM label, disk label, input label, separator, slots key, space before the unit)
+    variants = ((t("ram"), t("disk"), t("input"), " · ", "slots", " "),
+                (t("ram_s"), t("disk_s"), t("input"), " · ", "slots", ""),
+                (t("ram_s"), t("disk_s"), t("input"), "·", "slots_s", ""),
+                ("G", "G", "✎", "·", "slots_s", ""))
     head = ""
-    for ram_l, disk_l, quiet_l, sep, slots_k, you_k, sp in variants:
+    for ram_l, disk_l, quiet_l, sep, slots_k, sp in variants:
         parts = [f"{BOLD}{CYAN}{t('title')}{RST} {DIM}{time.strftime('%H:%M')}{RST}"]
-        parts.append(f"{BOLD}{RED}{t(you_k, n=needs)}{RST}" if needs else f"{DIM}{t(you_k, n=needs)}{RST}")
         if limits:
             full = limits["used"] >= limits["max"] or not limits.get("ok", True)
             parts.append(f"{YEL if full else BLUE}{t(slots_k, u=limits['used'], m=limits['max'], k=k)}{RST}")
@@ -1280,7 +1293,7 @@ def render(anchor, given):
     height = shutil.get_terminal_size((66, 40)).lines - 1
     agents = herdr_agents()
     herds = herd_dirs(anchor, given)
-    lanes = {"needs": [], "queue": [], "work": [], "ready": []}
+    lanes = {"queue": [], "work": [], "ready": []}
     notes = []
     v2 = [h for h in herds if os.path.exists(os.path.join(h, "herd.events.jsonl"))]
     v1 = [h for h in herds if h not in v2 and os.path.exists(os.path.join(h, "herd.map"))]
@@ -1302,7 +1315,7 @@ def render(anchor, given):
 
     last = last_human_input(anchor, agents) if anchor else None
     quiet = time.strftime('%H:%M', time.localtime(last)) if last and time.time() - last > 30 * 60 else ""
-    top = [header(w, herds, len(lanes["needs"]), limits, reviews, quiet)] + notes
+    top = [header(w, herds, limits, reviews, quiet)] + notes
     key = lambda r: (r[0], (r[7] or {}).get("sort", r[1]) if isinstance(r[7], dict) else r[1])
     for k in lanes:
         lanes[k].sort(key=key)
@@ -1325,15 +1338,15 @@ def render(anchor, given):
         merged_lines = [(f"{BOLD}{GREEN}{label}{RST}" if i == 0 else " " * len(label)) + f"{GREEN}{p}{RST}"
                         for i, p in enumerate(parts)]
 
-    # fixed-size lanes first; the Working lane gets what is left. Over budget: queue gives way, then ready, then needs
+    # fixed-size lanes first; the Working lane gets what is left. Over budget: queue gives way, then ready
     avail = height - len(top)
-    blocks = {"needs": compact(lanes["needs"]), "queue": compact(lanes["queue"]), "ready": compact(lanes["ready"])}
+    blocks = {"queue": compact(lanes["queue"]), "ready": compact(lanes["ready"])}
     work_min = 2 if lanes["work"] else 0
     size = lambda k: (1 + sum(len(b) for b in blocks[k])) if blocks[k] else 0
     foot_extra = (1 + len(merged_lines)) if merged_lines else 0
     limit = {k: size(k) for k in blocks}
     over = sum(limit.values()) + foot_extra + work_min + (1 if blocks["ready"] else 0) - avail
-    for k in ("queue", "ready", "needs"):
+    for k in ("queue", "ready"):
         if over <= 0:
             break
         cut = min(over, max(0, limit[k] - 2))
@@ -1343,7 +1356,7 @@ def render(anchor, given):
     def lane(k, col):
         return [lane_title(k, col)] + fit(blocks[k], limit[k] - 1) if blocks[k] else []
 
-    body = lane("needs", RED) + lane("queue", YEL)
+    body = lane("queue", YEL)
     foot = ([""] + lane("ready", GREEN) if blocks["ready"] else []) + ([""] + merged_lines if merged_lines else [])
 
     # Working lane, adaptive: the free height is shared evenly — one worker gets a full picture plus its step feed,
@@ -1460,6 +1473,8 @@ def selftest():
     and a failing repaint. Offline: no herdr, no gh, no ~/.cache writes. Exit 0 = pass."""
     import tempfile
     g = globals()
+    detail_before = g["DETAIL"]
+    g["DETAIL"] = True  # most checks read the detailed rows; the simple view has its own check below
     strip = lambda ls: [ANSI.sub("", l) for l in ls]
     fails = []
 
@@ -1503,14 +1518,16 @@ def selftest():
         ev("fx", BF + ["fix_queued"], befunde_file="fx.befunde-abc1234.md")
         ev("w-run", W)                                         # agent working -> ● O·hi, clash with w-fix
         ev("w-fix", BF + ["fix_queued", "working"])            # fix round -> ↺
-        ev("w-blk", W)                                         # agent blocked -> needs you ?
+        ev("w-blk", W)                                         # agent blocked -> ? first under Working
         ev("w-rep", W)                                         # out.md + idle -> reported ✓
         ev("w-gone", W, ago=3600)                              # pane gone, no report -> ✕
         ev("w-new", W, ago=5)                                  # pane not listed yet, fresh -> starting
         ev("w-still", W)                                       # idle, transcript old -> ⚠
         ev("a-one", A, prs=["app#11@" + sha("a")[:7]])        # partner a-two still working -> waits for partner
         ev("a-two", W)
-        ev("rr", RR, run_id="r1", round=2)
+        ev("rr", RR[:-1] + ["review_running", "review_befund", "fix_queued", "working", "accepted", "review_running"],
+           run_id="r1", round=1)                               # the loop's own counter restarts; history says 2
+        ev("rp", OK + ["review_running"], run_id="r4", round=1)  # review straight after review_ok -> re-probe
         ev("ok-api", OK, prs=["app#20@" + sha("b")], main=["app@" + sha("c")], run_id="r2")
         ev("ok-ui", OK, prs=["web#7@" + sha("d")], main=["web@" + sha("e")], run_id="r3")
         ev("st-head", OK, prs=["app#30@" + sha("f")], main=["app@" + sha("c")])        # head moved -> stale
@@ -1608,15 +1625,17 @@ def selftest():
                 lines = strip(out)
                 row = lambda s: next((l for l in lines if re.match(rf"^\S+ {re.escape(s)}(\s|$)", l)), "")
                 order = [next((i for i, l in enumerate(lines) if l == t("lane_" + k)), -1)
-                         for k in ("needs", "queue", "work", "ready")]
-                check(f"[{lang}] all four lanes in order", busy and -1 not in order and order == sorted(order))
-                check(f"[{lang}] merge word for the clean package",
-                      "✓✓ ok-api+ok-ui" in text and t("word", w="merge ok-api") in text)
-                check(f"[{lang}] blocked slice needs you", "? w-blk" in row("w-blk") and order[0] < lines.index(
-                    row("w-blk")) < order[1])
-                check(f"[{lang}] header you + slots", t("you", n=2) in lines[0] and
-                      t("slots", u=4, m=6, k=1) in lines[0])
-                q = [l.split()[1] for l in lines[order[1] + 1:order[2]] if l[:1] in "!◌"]
+                         for k in ("queue", "work", "ready")]
+                check(f"[{lang}] all three lanes in order", busy and -1 not in order and order == sorted(order))
+                ready_at = next((i for i, l in enumerate(lines) if l.startswith("✓ ok-api+ok-ui")), -1)
+                check(f"[{lang}] clean package: rev'd ✓ + merge word under Ready to merge",
+                      order[2] < ready_at and f"{t('reviewed')} ✓" in lines[ready_at]
+                      and t("word", w="merge ok-api") in text and "✓✓" not in text)
+                check(f"[{lang}] blocked slice first under Working, yellow ?", "? w-blk" in row("w-blk") and
+                      order[1] < lines.index(row("w-blk")) < order[2])
+                check(f"[{lang}] header slots, no you-counter", t("slots", u=4, m=6, k=1) in lines[0]
+                      and "du:" not in lines[0] and "you:" not in lines[0])
+                q = [l.split()[1] for l in lines[order[0] + 1:order[1]] if l[:1] in "!◌"]
                 check(f"[{lang}] queue: fix first, then by pos", q == ["fx", "q-two", "q-one", "q-stack"])
                 check(f"[{lang}] fix row + base reason", t("fix_queued", pos=1) in row("fx")
                       and t("w_base_q", b="w-run") in row("q-stack"))
@@ -1629,9 +1648,10 @@ def selftest():
                 check(f"[{lang}] progress bar + missing", "█" in text and f"{t('missing')} tests, docs" in text)
                 check(f"[{lang}] accepted waits for partner", row("a-one+a-two").startswith("◇") and
                       t("w_partner", x="a-two") in row("a-one+a-two"))
-                check(f"[{lang}] review running round 2/3", t("review_round", n=2) in row("rr"))
+                check(f"[{lang}] review running round 2/3 from the history", t("review_round", n=2) in row("rr"))
+                check(f"[{lang}] review after review_ok reads as re-probe", t("reprobe") in row("rp"))
                 check(f"[{lang}] reviewed but base unmerged: no merge word", row("ok-stk").startswith("✓ ok-stk")
-                      and t("w_base", b="rr") in row("ok-stk") and order[3] < lines.index(row("ok-stk")))
+                      and t("w_base", b="rr") in row("ok-stk") and order[2] < lines.index(row("ok-stk")))
                 check(f"[{lang}] stale by PR head", row("st-head").startswith("⟳") and
                       t("stale_head", ref="app#30") in row("st-head"))
                 check(f"[{lang}] stale by a later merge", row("st-main").startswith("⟳") and
@@ -1647,11 +1667,18 @@ def selftest():
                 check(f"[{lang}] v1 fallback line + rows", t("v1") in text and "hbst-liste" in text and
                       f"{t('missing')} Tests, Doku" in text)
             g["LANG"] = "de"
+            g["DETAIL"] = False
+            simple = "\n".join(strip(render("", [herd, old])[0]))
+            check("simple view: PR numbers without sha; no tags, overlaps or merge word; rev'd ✓ stays",
+                  "O·hi" not in simple and "⇄" not in simple and "@" + sha("b")[:7] not in simple
+                  and "app #20" in simple and t("word", w="merge ok-api") not in simple
+                  and f"{t('reviewed')} ✓" in simple)
+            g["DETAIL"] = True
             os.environ.update(LINES="16")
             out, busy = render("", [herd, old])
             lines = strip(out)
-            check("small panel: within height, needs-you kept, overflow counted",
-                  len(out) <= 15 and any("✓✓" in l for l in lines) and any(f" {t('more')}" in l for l in lines))
+            check("small panel: within height, merge word kept, overflow counted",
+                  len(out) <= 15 and any(t("word", w="merge ok-api") in l for l in lines) and any(f" {t('more')}" in l for l in lines))
             check("small panel: footer pinned", any(l.startswith(t("merged").strip()) for l in lines[-2:]))
             os.environ.update(LINES="90")
             for s in cases:  # reports written: the v1 footer reads every status file's "pr"
@@ -1685,6 +1712,7 @@ def selftest():
         finally:
             g.update(real)
             TOOL_CACHE.clear()
+    g["DETAIL"] = detail_before
     print("herd-board selftest: " + (f"FAILED ({len(fails)})" if fails else "OK"))
     return 1 if fails else 0
 
