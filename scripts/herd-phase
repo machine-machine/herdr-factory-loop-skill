@@ -1,0 +1,81 @@
+#!/usr/bin/env python3
+"""herd-phase — write and read the herd's phase events (docs/herd-flow-v2.md §1).
+
+  herd-phase <herd> <slice> <phase> [--by WHO] [--field k=v ...] [--note TEXT] [--force]
+  herd-phase <herd> --state [--json]
+
+A field value that parses as JSON (list, number, object) is stored as such, so
+`--field prs='["api#210@6cb1f80"]'` keeps a list. The event is mirrored to `lage log` for each
+ticket in the task header when `lage` is on PATH; failures there never fail the write.
+"""
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import herd_events as he  # noqa: E402
+
+
+def parse_field(raw):
+    if "=" not in raw:
+        raise argparse.ArgumentTypeError(f"--field expects k=v, got {raw!r}")
+    k, v = raw.split("=", 1)
+    try:
+        v = json.loads(v)
+    except ValueError:
+        pass
+    return k, v
+
+
+def mirror(herd, ev):
+    if not shutil.which("lage"):
+        return
+    for t in he.task_header(herd, ev["slice"]).get("tickets", []):
+        text = f"herd {os.path.basename(os.path.abspath(herd))}/{ev['slice']}: {ev['phase']}"
+        if ev.get("note"):
+            text += f" — {ev['note']}"
+        try:
+            subprocess.run(["lage", "log", str(t), f"herd-{ev['phase']}", text],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="herd-phase", description=__doc__.split("\n\n")[0])
+    ap.add_argument("herd")
+    ap.add_argument("slice", nargs="?")
+    ap.add_argument("phase", nargs="?", choices=he.PHASES)
+    ap.add_argument("--by", default="orchestrator", choices=he.BY)
+    ap.add_argument("--field", action="append", default=[], type=parse_field)
+    ap.add_argument("--note")
+    ap.add_argument("--force", action="store_true")
+    ap.add_argument("--state", action="store_true")
+    ap.add_argument("--json", action="store_true")
+    a = ap.parse_args()
+
+    if a.state:
+        st = he.state(a.herd)
+        if a.json:
+            print(json.dumps(st, ensure_ascii=False, indent=1))
+        else:
+            for s, ev in sorted(st.items()):
+                print(f"{s:24} {ev['phase']:15} {ev.get('since', '')}  {ev.get('note', '')}")
+        return 0
+    if not (a.slice and a.phase):
+        ap.error("slice and phase are required unless --state")
+    try:
+        ev = he.append(a.herd, a.slice, a.phase, by=a.by, note=a.note, force=a.force, **dict(a.field))
+    except (ValueError, he.TransitionError) as e:
+        print(f"herd-phase: {e}", file=sys.stderr)
+        return 2
+    mirror(a.herd, ev)
+    print(json.dumps(ev, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

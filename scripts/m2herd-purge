@@ -1,0 +1,1064 @@
+#!/usr/bin/env python3
+"""m2herd-purge — weekly purge of a project's .m2herd fabric and its run data (docs/herd-flow-v2.md §7).
+
+  m2herd-purge <m2herd-dir> [--apply] [--readers DIR,DIR…] [--run-days N] [--archive-days N]
+               [--grace-hours N] [--live-hours N] [--date YYYY-MM-DD] [--project NAME]
+               [--cache-root DIR] [--summary] [--verbose]
+  m2herd-purge --fabrics FILE [--apply] [same options]     one fabric path per line, # comments
+  m2herd-purge --selftest
+
+Dry run by default: prints every action with its size and reason, then the totals, and changes nothing.
+--apply performs the plan. A flock on the fabric directory keeps two runs (dry or apply) apart. When
+--apply changed something, one line is appended to <fabric>/NOTES.md (under NOTES.md.lock).
+
+Policy (<cache> = <cache-root>/<project>, default ~/.cache/m2herd/<project>; <project> = --project, else the
+name of the dir holding .m2herd):
+  a) run data in <cache> is DELETED once it is older than HERD_PURGE_RUN_DAYS (14). The unit is each entry
+     inside a run-data dir (screens/, screenshots/, runs/, backups/, logs/ — HERD_PURGE_RUN_DIRS) and
+     every top-level *.log. Herd run data (<cache>/herden/<herd>/) is one unit whose age counts from the
+     herd's last `merged` event (<herd>/herd.events.jsonl, read through herd_events.py); a herd with a
+     slice not merged/parked is kept whatever its age; a herd whose events are not found falls back to
+     the newest file mtime.
+  b) inside the fabric nothing is deleted except caches: __pycache__/, stray *.pyc, orphaned *.lock files
+     (the base file <x> of <x>.lock — or <x> of <x>.<y>.lock — is gone, the lock is unchanged for
+     HERD_PURGE_GRACE_HOURS (24), no open fd in /proc, a non-blocking flock succeeds; a lock whose base
+     file exists always stays, since flock-only locks never change their mtime) and empty directories (empty for the grace time, or emptied by this
+     run; one a sibling file names as `<dir>/`, like `deep: ./deep/`, stays). Everything else that is "no longer used" is MOVED to archives/<date>/<same path>, with one
+     line per entry in archives/<date>/INDEX.md (path, size, last modified, why). No longer used means
+     all three: no file in it modified for HERD_PURGE_ARCHIVE_DAYS (30); not referenced by any reader;
+     not on the keep list. Units: each top-level entry, each entry of dispatch/ and herden/ (a herd dir
+     moves whole or not at all; other dirs are never split).
+     Readers: the m2herd-migrate reader check (fixed strings `.m2herd/<path>` under the --readers roots,
+     default HERD_PURGE_READERS = ~/.local/bin,~/.claude/hooks,~/.claude/skills, plus the fabric's own
+     scripts), the top-level files of the project dir (decisions register, CLAUDE.md, …), and every
+     text file of the fabric that stays — RESUME.md, PHASE-NEXT-*, rules/, live herds, recent reports;
+     of NOTES.md only the current month's entries. A reference from a file that is itself archived in
+     the same run does not keep anything.
+     Keep list: RESUME.md, NOTES.md, PHASE-NEXT-*, rules/, herden/, dispatch/, archives/, checks.sh,
+     top-level register/decisions files, the m2herd engine's own files (the names in templates/m2herd/),
+     top-level scripts, runtime state (*.sqlite3, *.db and side files, *state.json, .sync-*), files with
+     a sibling <file>.lock, *.jsonl event logs and dirs holding one (herd dirs excepted), INDEX.md,
+     dotfiles, live herds (a slice not merged/parked; a v1 herd changed within --live-hours), and
+     HERD_PURGE_KEEP globs (matched against path and name). Text files are scanned whatever their mode
+     (fabric notes are often 0600); names that look like secrets (env, token, credential, …) never are.
+  c) run data found inside the fabric (any dir named like a run-data dir, e.g. dispatch/screens/,
+     <herd>/screens/, <loop>/runs/, backups/) moves to <cache> — dispatch/screens -> <cache>/screens,
+     <herd>/… -> <cache>/herden/<herd>/…, other paths keep their path — and then falls under (a): an
+     entry that (a) would delete at once is deleted in place instead of being copied first. Entries newer
+     than the grace time, the run a runs/CURRENT names, and live herds stay where they are.
+archives/ itself is never touched; nothing a process holds open is moved or deleted.
+
+Settings: command line > environment > <fabric>/rules/purge.env (KEY=VALUE lines) > defaults. Keys:
+HERD_PURGE_RUN_DAYS, HERD_PURGE_ARCHIVE_DAYS, HERD_PURGE_GRACE_HOURS, HERD_PURGE_READERS,
+HERD_PURGE_RUN_DIRS, HERD_PURGE_KEEP (comma-separated).
+
+Exit: 0 ok (dry run printed, or apply finished — also when there was nothing to do); 1 at least one
+action failed (the others still ran; each failure is printed); 2 usage error, missing fabric, a path
+that is not a .m2herd fabric (it must end in /.m2herd), or another m2herd-purge run holds the lock. With --fabrics the highest code of all fabrics.
+"""
+import argparse
+import datetime
+import fcntl
+import fnmatch
+import importlib.machinery
+import importlib.util
+import os
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.realpath(__file__))
+sys.path.insert(0, HERE)
+
+
+def _load_migrate():
+    path = os.path.join(HERE, "m2herd-migrate")
+    loader = importlib.machinery.SourceFileLoader("m2herd_migrate", path)
+    spec = importlib.util.spec_from_loader("m2herd_migrate", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+mg = _load_migrate()          # reader check, measure, open-file guard, cross-device move, NOTES lock
+he = mg.he
+
+DEFAULTS = {
+    "HERD_PURGE_RUN_DAYS": "14",
+    "HERD_PURGE_ARCHIVE_DAYS": "30",
+    "HERD_PURGE_GRACE_HOURS": "24",
+    "HERD_PURGE_READERS": "~/.local/bin,~/.claude/hooks,~/.claude/skills",
+    "HERD_PURGE_RUN_DIRS": "screens,screenshots,runs,backups,logs",
+    "HERD_PURGE_KEEP": "",
+}
+SKIP_DIRS = (".git", "node_modules", ".venv")
+KEEP_DIRS = {"rules", "herden", "dispatch", "archives"}
+REGISTER_RE = re.compile(r"(register|decisions)", re.I)
+NOTES_DATED = re.compile(r"^(?:- \[?|#{2,3} )(\d{4})-(\d{2})-\d{2}")
+BOUND = "A-Za-z0-9_.-"
+TEMPLATE_NAMES = set()
+_tmpl = os.path.join(HERE, "..", "templates", "m2herd")
+if os.path.isdir(_tmpl):
+    TEMPLATE_NAMES = set(os.listdir(_tmpl))
+
+
+# ---------------------------------------------------------------------------------------- helpers
+
+def day(t):
+    return datetime.datetime.fromtimestamp(t).strftime("%Y-%m-%d") if t else "?"
+
+
+def ts_epoch(ts):
+    try:
+        return datetime.datetime.strptime(ts, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=datetime.timezone.utc).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def measure(path, vanish=frozenset()):
+    """(bytes, files, newest FILE mtime) without following symlinks; paths in `vanish` (and below) are
+    left out. A dir's own mtime counts only when it holds no file (our own moves touch dir mtimes)."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return 0, 0, 0
+    if not stat.S_ISDIR(st.st_mode):
+        return st.st_size, 1, st.st_mtime
+    size = files = 0
+    newest = 0
+    for root, dirs, fnames in os.walk(path):
+        dirs[:] = [d for d in dirs if os.path.join(root, d) not in vanish]
+        for f in fnames:
+            fp = os.path.join(root, f)
+            if fp in vanish:
+                continue
+            try:
+                s = os.lstat(fp)
+            except OSError:
+                continue
+            size += s.st_size
+            files += 1
+            newest = max(newest, s.st_mtime)
+    return size, files, newest or st.st_mtime
+
+
+def under(p, roots):
+    """True when p is one of `roots` or below one."""
+    while True:
+        if p in roots:
+            return True
+        parent = os.path.dirname(p)
+        if parent == p:
+            return False
+        p = parent
+
+
+def load_env_file(path):
+    out = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                k = k.strip()
+                if k.startswith("export "):
+                    k = k[7:].strip()
+                if k in DEFAULTS:
+                    out[k] = v.strip().strip("'\"")
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def settings(fabric, a):
+    cfg = dict(DEFAULTS)
+    cfg.update(load_env_file(os.path.join(fabric, "rules", "purge.env")))
+    cfg.update({k: os.environ[k] for k in DEFAULTS if k in os.environ})
+    for k, attr in (("HERD_PURGE_RUN_DAYS", "run_days"), ("HERD_PURGE_ARCHIVE_DAYS", "archive_days"),
+                    ("HERD_PURGE_GRACE_HOURS", "grace_hours"), ("HERD_PURGE_READERS", "readers")):
+        if getattr(a, attr) is not None:
+            cfg[k] = str(getattr(a, attr))
+    for k in ("HERD_PURGE_RUN_DAYS", "HERD_PURGE_ARCHIVE_DAYS", "HERD_PURGE_GRACE_HOURS"):
+        try:
+            cfg[k] = float(cfg[k])
+        except ValueError:
+            raise SystemExit(f"m2herd-purge: {k}={cfg[k]!r} is not a number")
+    for k in ("HERD_PURGE_READERS", "HERD_PURGE_RUN_DIRS", "HERD_PURGE_KEEP"):
+        cfg[k] = [x.strip() for x in cfg[k].split(",") if x.strip()]
+    return cfg
+
+
+def text_of(fp, limit=2 * 1024 * 1024):
+    """Text of a regular, non-binary file up to `limit` bytes whose name does not look like a secret, else ''.
+    Owner-only files ARE read (many fabric notes are 0600); only reader paths are ever printed, never text."""
+    try:
+        st = os.lstat(fp)
+    except OSError:
+        return ""
+    if not stat.S_ISREG(st.st_mode) or st.st_size > limit:
+        return ""
+    if mg.SECRET_NAME.search(os.path.basename(fp)):
+        return ""
+    try:
+        with open(fp, "rb") as f:
+            head = f.read(8192)
+            if b"\0" in head:
+                return ""
+            raw = head + f.read()
+    except OSError:
+        return ""
+    return raw.decode("utf-8", errors="replace")
+
+
+def ref_regexes(names, behind):
+    """Regexes (group 1 = the name) that find `names` as path references. A name with a dot or a slash is
+    matched with path boundaries; a bare word (`context`) only as `.m2herd/<word>` or `<word>/`, so prose
+    does not count as a reference."""
+    def alt(xs):
+        return "|".join(re.escape(x) for x in sorted(xs, key=len, reverse=True))
+    paths = [n for n in names if "." in n or "/" in n]
+    words = [n for n in names if n not in paths]
+    out = []
+    if paths:
+        out.append(re.compile(rf"(?<![{behind}])({alt(paths)})(?![{BOUND}])"))
+    if words:
+        out.append(re.compile(rf"\.m2herd/({alt(words)})(?![{BOUND}])"))
+        out.append(re.compile(rf"(?<![{behind}])({alt(words)})/"))
+    return out
+
+
+def notes_current(fp, month):
+    """NOTES.md as a reader: the header plus the entries of `month` only."""
+    out, cur = [], True
+    for ln in text_of(fp).splitlines(True):
+        m = NOTES_DATED.match(ln)
+        if m:
+            cur = f"{m.group(1)}-{m.group(2)}" >= month
+        if cur:
+            out.append(ln)
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------------------- plan
+
+class Purge:
+    def __init__(self, fabric, a, cfg):
+        self.root = os.path.abspath(fabric)
+        self.a = a
+        self.cfg = cfg
+        self.now = time.time()
+        self.date = a.date
+        self.month = a.date[:7]
+        self.project = a.project or os.path.basename(os.path.dirname(self.root)) or "project"
+        self.cache = os.path.join(os.path.expanduser(a.cache_root), self.project)
+        self.archive = os.path.join(self.root, "archives", self.date)
+        self.run_cut = self.now - cfg["HERD_PURGE_RUN_DAYS"] * 86400
+        self.arch_cut = self.now - cfg["HERD_PURGE_ARCHIVE_DAYS"] * 86400
+        self.grace_cut = self.now - cfg["HERD_PURGE_GRACE_HOURS"] * 3600
+        self.live_cut = self.now - a.live_hours * 3600
+        self.run_dirs = set(cfg["HERD_PURGE_RUN_DIRS"])
+        self.opened = mg.open_paths() if a.check_open else {}
+        self.actions = []     # dicts: cat, op (delete|move|rmdir), src, dst, size, files, dir, why, mtime
+        self.skipped = []     # (path, reason)
+        self.kept = []        # (path, reason) — printed with --verbose
+        self.vanish = set()   # fabric paths that leave the fabric in this run
+        self.herds = {}       # herd name -> {"dir", "live", "ref"}
+
+    def rel(self, p):
+        return os.path.relpath(p, self.root) if p == self.root or p.startswith(self.root + "/") else mg.tilde(p)
+
+    def add(self, cat, op, src, dst=None, why="", size=None):
+        if op != "rmdir":
+            who = mg.holder(src, self.opened)
+            if who:
+                self.skipped.append((src, f"in use by {who}"))
+                return False
+        if dst and os.path.lexists(dst):
+            self.skipped.append((src, f"destination {self.rel(dst)} exists"))
+            return False
+        sz, files, newest = measure(src, self.vanish) if size is None else (size, 1, 0)
+        isdir = os.path.isdir(src) and not os.path.islink(src)
+        self.actions.append({"cat": cat, "op": op, "src": src, "dst": dst, "size": sz, "files": files,
+                             "dir": isdir, "why": why, "mtime": newest})
+        if src.startswith(self.root + "/"):
+            self.vanish.add(src)
+        return True
+
+    # -- herds -------------------------------------------------------------------------------------
+    def herd_status(self, d):
+        """{'live': reason|None, 'ref': epoch the retention counts from}."""
+        if os.path.exists(os.path.join(d, "herd.events.jsonl")) and he is not None:
+            st = he.state(d)
+            open_ = sorted(s for s, ev in st.items() if ev["phase"] not in ("merged", "parked"))
+            evs = he.read(d)
+            merged = [t for t in (ts_epoch(e.get("ts")) for e in evs if e.get("phase") == "merged") if t]
+            alls = [t for t in (ts_epoch(e.get("ts")) for e in evs) if t]
+            ref = max(merged) if merged else (max(alls) if alls else measure(d)[2])
+            return {"live": f"slices not merged/parked: {', '.join(open_)}" if open_ else None, "ref": ref,
+                    "how": f"last merged {day(ref)}" if merged else f"last event {day(ref)}"}
+        newest = mg.measure(d)[2]   # v1: same liveness rule as m2herd-migrate (dir mtimes count)
+        live = (f"changed {datetime.datetime.fromtimestamp(newest).strftime('%Y-%m-%d %H:%M')} "
+                f"(< {self.a.live_hours:g} h)") if newest >= self.live_cut else None
+        return {"live": live, "ref": newest, "how": f"newest file {day(newest)} (no events)"}
+
+    def index_herds(self):
+        def is_herd(p):
+            return os.path.isdir(p) and not os.path.islink(p) and any(
+                os.path.exists(os.path.join(p, m)) for m in mg.HERD_MARKERS)
+        for top in ("dispatch", "herden"):
+            base = os.path.join(self.root, top)
+            if os.path.isdir(base):
+                for n in sorted(os.listdir(base)):
+                    p = os.path.join(base, n)
+                    if is_herd(p):
+                        self.herds.setdefault(n, dict(self.herd_status(p), dir=p))
+        arch = os.path.join(self.root, "archives")
+        if os.path.isdir(arch):
+            for r, dirs, _ in os.walk(arch):
+                if r[len(arch):].count("/") >= 4:
+                    dirs[:] = []
+                    continue
+                for d in list(dirs):
+                    p = os.path.join(r, d)
+                    if is_herd(p):
+                        self.herds.setdefault(d, dict(self.herd_status(p), dir=p))
+                        dirs.remove(d)
+
+    def herd_of(self, p):
+        """(name, herd dir) when p lies inside a herd dir of dispatch/ or herden/."""
+        rel = os.path.relpath(p, self.root).split("/")
+        if len(rel) >= 2 and rel[0] in ("dispatch", "herden") and rel[1] in self.herds \
+                and self.herds[rel[1]]["dir"] == os.path.join(self.root, rel[0], rel[1]):
+            return rel[1], os.path.join(self.root, rel[0], rel[1])
+        return None, None
+
+    def live_herd_dirs(self):
+        return {h["dir"] for h in self.herds.values() if h["live"] and h["dir"].startswith(self.root + "/")
+                and not h["dir"].startswith(os.path.join(self.root, "archives") + "/")}
+
+    # -- build -------------------------------------------------------------------------------------
+    def build(self):
+        self.index_herds()
+        live = self.live_herd_dirs()
+        for d in sorted(live):
+            self.kept.append((d, f"live herd ({self.herds[os.path.basename(d)]['live']})"))
+        self.plan_caches(live)
+        self.plan_fabric_run_data(live)
+        self.plan_archive(live)
+        self.plan_cache_retention()
+        self.plan_empty_dirs(live)
+
+    def walk_fabric(self, live):
+        """os.walk of the fabric without archives/, live herds and vendored dirs."""
+        arch = os.path.join(self.root, "archives")
+        for r, dirs, files in os.walk(self.root):
+            dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS and os.path.join(r, d) != arch
+                             and os.path.join(r, d) not in live)
+            yield r, dirs, sorted(files)
+
+    def plan_caches(self, live):
+        for r, dirs, files in self.walk_fabric(live):
+            for d in list(dirs):
+                if d == "__pycache__":
+                    self.add("cache", "delete", os.path.join(r, d), why="__pycache__")
+                    dirs.remove(d)
+            for f in files:
+                p = os.path.join(r, f)
+                if f.endswith(".pyc"):
+                    self.add("cache", "delete", p, why="stray *.pyc")
+                elif f.endswith(".lock"):
+                    why = self.stale_lock(p)
+                    if why:
+                        self.add("cache", "delete", p, why=why)
+
+    def stale_lock(self, p):
+        try:
+            lm = os.lstat(p).st_mtime
+        except OSError:
+            return None
+        if lm >= self.grace_cut:
+            return None
+        n = os.path.basename(p)[:-len(".lock")]
+        d = os.path.dirname(p)
+        bases = [os.path.join(d, n)]
+        if "." in n:
+            bases.append(os.path.join(d, n.rsplit(".", 1)[0]))   # <file>.<x>.lock
+        # A flock-only lock (opened "a", never written) keeps its creation mtime however often it is
+        # taken, so age says nothing about use. While its base file exists it stays: unlinking it would
+        # let a process that opened the old inode and the next one that creates a new file both "hold" it.
+        for b in bases:
+            if os.path.lexists(b):
+                return None
+        return f"orphaned lock (no {os.path.basename(bases[0])}), unchanged since {day(lm)}, no holder"
+
+    def run_dest(self, p):
+        name, hdir = self.herd_of(p)
+        if name:
+            return os.path.join(self.cache, "herden", name, os.path.relpath(p, hdir)), name
+        rel = os.path.relpath(p, self.root)
+        if rel == "dispatch/screens":
+            return os.path.join(self.cache, "screens"), None
+        return os.path.join(self.cache, rel), None
+
+    def current_run(self, d):
+        try:
+            with open(os.path.join(d, "CURRENT"), encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    def run_children(self, d):
+        """Entries of a run-data dir that are units; CURRENT, README.md and the current run stay."""
+        cur = self.current_run(d)
+        for n in sorted(os.listdir(d)):
+            p = os.path.join(d, n)
+            if n in ("CURRENT", "README.md"):
+                continue
+            if cur and n == cur:
+                self.kept.append((p, "current run (CURRENT)"))
+                continue
+            yield n, p
+
+    def plan_fabric_run_data(self, live):
+        keep_top = {os.path.join(self.root, x) for x in ("rules",)}
+        for r, dirs, _ in self.walk_fabric(live):
+            if r in keep_top:
+                dirs[:] = []
+                continue
+            for d in list(dirs):
+                if d not in self.run_dirs:
+                    continue
+                dirs.remove(d)
+                p = os.path.join(r, d)
+                if r == self.root and d == "runs":
+                    # the engine's run store: `m2herd evolve` resolves --run against .m2herd/runs/r-*
+                    # and m2herd-up writes slice status there — moving it would break both
+                    self.kept.append((p, "engine run store (m2herd evolve reads .m2herd/runs)"))
+                    continue
+                if os.path.islink(p):
+                    continue
+                dest, herd = self.run_dest(p)
+                for n, c in self.run_children(p):
+                    if c in self.vanish:
+                        continue
+                    _, _, newest = measure(c, self.vanish)
+                    if newest >= self.grace_cut:
+                        self.kept.append((c, f"run data newer than {self.cfg['HERD_PURGE_GRACE_HOURS']:g} h"))
+                        continue
+                    if herd:
+                        h = self.herds[herd]
+                        expiry, how = h["ref"], f"herd {herd} {h['how']}"
+                    else:
+                        expiry, how = newest, f"newest file {day(newest)}"
+                    if expiry < self.run_cut:
+                        self.add("run-fabric", "delete", c,
+                                 why=f"run data, {how} (> {self.cfg['HERD_PURGE_RUN_DAYS']:g} d)")
+                    else:
+                        self.add("run-move", "move", c, os.path.join(dest, n), why=f"run data -> cache, {how}")
+
+    # -- archive -----------------------------------------------------------------------------------
+    def keep_reason(self, p, top):
+        n = os.path.basename(p)
+        rel = os.path.relpath(p, self.root)
+        if top and n in mg.KEEP_TOP | KEEP_DIRS:
+            return "keep list"
+        if top and n in TEMPLATE_NAMES:
+            return "m2herd engine file"
+        if n.startswith("."):
+            return "dotfile"
+        if n == "__pycache__" or n.endswith((".pyc", ".lock")):
+            return "cache (own rule)"
+        if mg.PHASE_RE.match(n) or n.startswith("PHASE-NEXT-"):
+            return "keep list (PHASE-NEXT)"
+        if n in ("checks.sh", "INDEX.md") or n.endswith(".jsonl"):
+            return "keep list"
+        if top and REGISTER_RE.search(n):
+            return "keep list (register)"
+        if (mg.STATE_RE.search(n) or mg.SQLITE_SIDE.search(n) or n in mg.STATE_NAMES) and not os.path.isdir(p):
+            return "runtime state (m2herd-migrate moves it)"
+        if os.path.lexists(p + ".lock"):
+            return f"engine-managed ({n}.lock exists)"
+        if n in self.run_dirs and os.path.isdir(p):
+            return "run-data dir (own rule)"
+        if top and os.path.isfile(p) and not os.path.islink(p):
+            try:
+                mode = os.lstat(p).st_mode
+            except OSError:
+                mode = 0
+            if n.endswith(mg.SCRIPT_EXT) or mode & 0o111:
+                return "top-level script"
+        if os.path.isdir(p) and not os.path.islink(p) and not any(
+                os.path.exists(os.path.join(p, mk)) for mk in mg.HERD_MARKERS):
+            for _r, _d, fs in os.walk(p):
+                if any(f.endswith(".jsonl") for f in fs):
+                    return "holds an event log (*.jsonl)"
+        for g in self.cfg["HERD_PURGE_KEEP"]:
+            if fnmatch.fnmatch(rel, g) or fnmatch.fnmatch(n, g):
+                return f"HERD_PURGE_KEEP {g}"
+        return None
+
+    def units(self, live):
+        """Top-level entries, plus the entries of dispatch/ and herden/."""
+        for n in sorted(os.listdir(self.root)):
+            p = os.path.join(self.root, n)
+            if n in ("dispatch", "herden") and os.path.isdir(p) and not os.path.islink(p):
+                for m in sorted(os.listdir(p)):
+                    yield os.path.join(p, m), False
+            else:
+                yield p, True
+
+    def plan_archive(self, live):
+        cands = {}
+        for p, top in self.units(live):
+            if p in self.vanish:
+                continue
+            if p in live:
+                continue
+            why = self.keep_reason(p, top)
+            if why:
+                self.kept.append((p, why))
+                continue
+            size, files, newest = measure(p, self.vanish)
+            if files == 0 and os.path.isdir(p):
+                continue            # an empty dir is the empty-dir rule's business
+            if newest >= self.arch_cut:
+                self.kept.append((p, f"modified {day(newest)}"))
+                continue
+            cands[p] = (size, files, newest)
+        refs = self.references(cands, live)
+        keep = set()
+        changed = True
+        while changed:          # a reference counts unless its reader is archived in this run too
+            changed = False
+            for c in cands:
+                if c in keep:
+                    continue
+                for reader in refs.get(c, ()):
+                    owner = next((x for x in cands if reader == x or reader.startswith(x + "/")), None)
+                    if owner is None or owner in keep:
+                        keep.add(c)
+                        self.kept.append((c, f"referenced by {self.rel(reader)}"))
+                        changed = True
+                        break
+        days = self.cfg["HERD_PURGE_ARCHIVE_DAYS"]
+        for c, (size, files, newest) in cands.items():
+            if c in keep:
+                continue
+            self.add("archive", "move", c, os.path.join(self.archive, os.path.relpath(c, self.root)),
+                     why=f"unmodified since {day(newest)} (> {days:g} d), no reader, not on the keep list")
+
+    def references(self, cands, live):
+        """candidate -> set of reader files naming it (outside readers, project files, fabric files)."""
+        refs = {}
+        if not cands:
+            return refs
+        # 1. the m2herd-migrate reader check: grep -RlIF `.m2herd/<path>` over the roots + fabric scripts
+        roots = list(self.cfg["HERD_PURGE_READERS"])
+        proj = os.path.dirname(self.root)
+        try:
+            for n in sorted(os.listdir(proj)):
+                fp = os.path.join(proj, n)
+                if os.path.isfile(fp) and not mg.SECRET_NAME.search(n) and fp != self.root:
+                    roots.append(fp)
+        except OSError:
+            pass
+        args = mg.parse([self.root, "--no-open-check", "--readers", ",".join(roots), "--date", self.date])[1]
+        mp = mg.Plan(self.root, args)
+        mp.actions = [{"op": "move", "src": c} for c in cands]
+        pats = {f".m2herd/{os.path.relpath(c, self.root)}": c for c in cands}
+        for fp, hits in mp.readers(pats):
+            for pat in hits:
+                c = pats[pat]
+                if not (fp == c or fp.startswith(c + "/")):
+                    refs.setdefault(c, set()).add(fp)
+        # 2. every text file of the fabric (kept or candidate) by bare path; same-dir files by name too
+        rels = {os.path.relpath(c, self.root): c for c in cands}
+        rxs = ref_regexes(rels, BOUND)
+        by_dir = {}
+        for c in cands:
+            by_dir.setdefault(os.path.dirname(c), {})[os.path.basename(c)] = c
+        dir_rxs = {d: ref_regexes(ns, BOUND + "/") for d, ns in by_dir.items()}
+        notes = os.path.join(self.root, "NOTES.md")
+        for r, dirs, files in os.walk(self.root):
+            dirs[:] = [d for d in dirs if d not in SKIP_DIRS and d != "__pycache__" and d not in self.run_dirs
+                       and os.path.join(r, d) != os.path.join(self.root, "archives")
+                       and os.path.join(r, d) not in self.vanish]
+            for f in files:
+                fp = os.path.join(r, f)
+                if fp in self.vanish:
+                    continue
+                text = notes_current(fp, self.month) if fp == notes else text_of(fp)
+                if not text:
+                    continue
+                for rx in rxs:
+                    for m in rx.finditer(text):
+                        c = rels[m.group(1)]
+                        if not (fp == c or fp.startswith(c + "/")):
+                            refs.setdefault(c, set()).add(fp)
+                for rx in dir_rxs.get(r, ()):
+                    for m in rx.finditer(text):
+                        c = by_dir[r][m.group(1)]
+                        if fp != c:
+                            refs.setdefault(c, set()).add(fp)
+        return refs
+
+    # -- cache retention ---------------------------------------------------------------------------
+    def plan_cache_retention(self):
+        if not os.path.isdir(self.cache):
+            return
+        days = self.cfg["HERD_PURGE_RUN_DAYS"]
+        hroot = os.path.join(self.cache, "herden")
+        if os.path.isdir(hroot):
+            for n in sorted(os.listdir(hroot)):
+                p = os.path.join(hroot, n)
+                h = self.herds.get(n)
+                if h and h["live"]:
+                    self.kept.append((p, f"herd {n} is live ({h['live']})"))
+                    continue
+                if h:
+                    expiry, how = h["ref"], f"herd {n} {h['how']}"
+                else:
+                    expiry = measure(p)[2]
+                    how = f"herd {n} not found, newest file {day(expiry)}"
+                if expiry < self.run_cut:
+                    self.add("run-cache", "delete", p, why=f"herd run data, {how} (> {days:g} d)")
+                else:
+                    self.kept.append((p, how))
+        for r, dirs, files in os.walk(self.cache):
+            if r == self.cache:
+                dirs[:] = [d for d in dirs if d != "herden"]
+                for f in sorted(files):
+                    if f.endswith(".log"):
+                        self.cache_unit(os.path.join(r, f))
+            for d in sorted(dirs):
+                if d in self.run_dirs:
+                    for _, c in self.run_children(os.path.join(r, d)):
+                        self.cache_unit(c)
+            dirs[:] = sorted(d for d in dirs if d not in self.run_dirs and d not in SKIP_DIRS)
+
+    def cache_unit(self, p):
+        _, _, newest = measure(p)
+        if newest < self.run_cut:
+            self.add("run-cache", "delete", p,
+                     why=f"run data, newest file {day(newest)} (> {self.cfg['HERD_PURGE_RUN_DAYS']:g} d)")
+
+    # -- empty dirs --------------------------------------------------------------------------------
+    def plan_empty_dirs(self, live):
+        protected = {os.path.join(self.root, n) for n in KEEP_DIRS | TEMPLATE_NAMES}
+        arch = os.path.join(self.root, "archives")
+        removable = set()
+        for r, dirs, files in os.walk(self.root, topdown=False):
+            if r == self.root or under(r, {arch, os.path.join(self.root, "rules")}) or under(r, live) \
+                    or r in protected:
+                continue
+            if any(part in SKIP_DIRS for part in os.path.relpath(r, self.root).split("/")):
+                continue
+            if os.path.basename(r) in self.run_dirs or under(r, self.vanish):
+                continue
+            kids = [os.path.join(r, x) for x in os.listdir(r)] if os.path.isdir(r) else []
+            if any(k not in self.vanish and k not in removable for k in kids):
+                continue
+            if not kids:
+                try:
+                    if os.lstat(r).st_mtime >= self.grace_cut:
+                        continue
+                except OSError:
+                    continue
+            sib = self.sibling_ref(r)
+            if sib:
+                self.kept.append((r, f"empty, but {self.rel(sib)} points at it"))
+                continue
+            removable.add(r)
+            self.actions.append({"cat": "empty", "op": "rmdir", "src": r, "dst": None, "size": 0, "files": 0,
+                                 "dir": True, "why": "empty" if not kids else "emptied by this run",
+                                 "mtime": 0})
+            self.vanish.add(r)
+
+
+    def sibling_ref(self, d):
+        """A file next to the empty dir `d` that names it as `<name>/` (e.g. `deep: ./deep/`), or None."""
+        parent, name = os.path.dirname(d), os.path.basename(d)
+        rx = re.compile(rf"(?<![{BOUND}]){re.escape(name)}/")
+        try:
+            names = sorted(os.listdir(parent))
+        except OSError:
+            return None
+        for n in names:
+            fp = os.path.join(parent, n)
+            if fp in self.vanish or not os.path.isfile(fp):
+                continue
+            if rx.search(text_of(fp)):
+                return fp
+        return None
+
+
+# ---------------------------------------------------------------------------------------- report
+
+CATS = (("cache", "caches deleted"), ("run-fabric", "run data deleted in the fabric"),
+        ("run-move", "run data moved to the cache"), ("run-cache", "run data deleted in the cache"),
+        ("archive", "archived in the fabric"), ("empty", "empty dirs removed"))
+ORDER = {"cache": 0, "run-fabric": 1, "run-move": 2, "archive": 3, "run-cache": 4, "empty": 5}
+
+
+def totals(actions):
+    t = {k: [0, 0] for k, _ in CATS}
+    for x in actions:
+        t[x["cat"]][0] += 1
+        t[x["cat"]][1] += x["size"]
+    return t
+
+
+def print_plan(pg, out=sys.stdout):
+    a, c = pg.a, pg.cfg
+    w = out.write
+    w(f"m2herd-purge: {mg.tilde(pg.root)} ({'apply' if a.apply else 'dry run'}) — date {pg.date}, run data "
+      f"{c['HERD_PURGE_RUN_DAYS']:g} d, archive {c['HERD_PURGE_ARCHIVE_DAYS']:g} d, grace "
+      f"{c['HERD_PURGE_GRACE_HOURS']:g} h, project {pg.project}\n")
+    w(f"  cache {mg.tilde(pg.cache)}; readers {', '.join(mg.tilde(os.path.expanduser(r)) for r in c['HERD_PURGE_READERS']) or '(none)'}"
+      f" + project files + the fabric's own files\n\n")
+    if not a.summary:
+        for x in sorted(pg.actions, key=lambda x: ORDER[x["cat"]]):
+            src = pg.rel(x["src"]) + ("/" if x["dir"] else "")
+            cnt = f", {mg.plural(x['files'], 'file', 'files')}" if x["dir"] and x["op"] != "rmdir" else ""
+            if x["op"] == "move":
+                verb = "ARCHIVE" if x["cat"] == "archive" else "MOVE   "
+                w(f"{verb} {src} -> {pg.rel(x['dst'])}{'/' if x['dir'] else ''}  ({mg.human(x['size'])}{cnt})  "
+                  f"[{x['why']}]\n")
+            elif x["op"] == "rmdir":
+                w(f"RMDIR   {src}  [{x['why']}]\n")
+            else:
+                w(f"DELETE  {src}  ({mg.human(x['size'])}{cnt})  [{x['cat']}: {x['why']}]\n")
+        for p, why in pg.skipped:
+            w(f"SKIP    {pg.rel(p)} — {why}\n")
+        if a.verbose:
+            for p, why in pg.kept:
+                w(f"KEEP    {pg.rel(p)} — {why}\n")
+        w("\n")
+    t = totals(pg.actions)
+    verb = "applied" if a.apply else "would be"
+    w(f"totals ({verb}):\n")
+    for k, label in CATS:
+        n, size = t[k]
+        w(f"  {label:<32} {n:>6}  {mg.human(size):>10}\n")
+    dele = sum(t[k][1] for k in ("cache", "run-fabric", "run-cache"))
+    w(f"  {'freed from disk (deleted)':<32} {'':>6}  {mg.human(dele):>10}\n")
+    w(f"  {'leaves the fabric (del + moved)':<32} {'':>6}  "
+      f"{mg.human(t['cache'][1] + t['run-fabric'][1] + t['run-move'][1]):>10}\n")
+    referenced = sum(1 for _, why in pg.kept if why.startswith("referenced by"))
+    w(f"  skipped {len(pg.skipped)} (in use / destination exists), kept {referenced} old entries a reader "
+      f"still names\n")
+
+
+# ---------------------------------------------------------------------------------------- apply
+
+def try_lock_delete(p):
+    """Delete a lock file only while holding it ourselves (non-blocking flock)."""
+    fd = os.open(p, os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        os.close(fd)
+        raise OSError("held by another process (flock)")
+    try:
+        os.unlink(p)
+    finally:
+        os.close(fd)
+
+
+def apply(pg, out=sys.stdout):
+    done, failed = [], []
+    for x in sorted(pg.actions, key=lambda x: ORDER[x["cat"]]):
+        try:
+            if x["op"] == "delete":
+                if not os.path.lexists(x["src"]):
+                    continue
+                if x["dir"]:
+                    shutil.rmtree(x["src"])
+                elif x["src"].endswith(".lock") and x["cat"] == "cache":
+                    try_lock_delete(x["src"])
+                else:
+                    os.unlink(x["src"])
+            elif x["op"] == "move":
+                if os.path.lexists(x["dst"]):
+                    raise OSError(f"destination {pg.rel(x['dst'])} appeared meanwhile")
+                mg.move_entry(x["src"], x["dst"])
+            elif x["op"] == "rmdir":
+                try:
+                    os.rmdir(x["src"])
+                except OSError:
+                    continue          # not empty after all (something new arrived) — fine
+            done.append(x)
+        except OSError as e:
+            failed.append(x)
+            out.write(f"FAILED  {pg.rel(x['src'])}: {e}\n")
+    arch = [x for x in done if x["cat"] == "archive"]
+    if arch:
+        write_index(pg, arch)
+    if done:
+        note(pg, done)
+    out.write(f"\napplied {len(done)} of {len(pg.actions)} actions, {len(failed)} failed\n")
+    return (1 if failed else 0), done
+
+
+def write_index(pg, done):
+    p = os.path.join(pg.archive, "INDEX.md")
+    os.makedirs(pg.archive, exist_ok=True)
+    new = not os.path.exists(p)
+    with open(p, "a", encoding="utf-8") as f:
+        if new:
+            f.write(f"# Archive {pg.date}\n\nOne line per entry moved here by `m2herd-purge --apply` "
+                    "(path, size, last modified, why). Nothing in this list was deleted.\n\n")
+        f.write(f"\n<!-- m2herd-purge {datetime.datetime.now().strftime('%Y-%m-%d %H:%M')} -->\n")
+        for x in done:
+            src = pg.rel(x["src"]) + ("/" if x["dir"] else "")
+            cnt = f", {mg.plural(x['files'], 'file', 'files')}" if x["dir"] else ""
+            f.write(f"- {src} ({mg.human(x['size'])}{cnt}; last modified {day(x['mtime'])}) — {x['why']}\n")
+
+
+def note(pg, done):
+    t = totals(done)
+    dele = sum(t[k][1] for k in ("cache", "run-fabric", "run-cache"))
+    parts = [f"deleted {mg.human(dele)} ({t['cache'][0]} caches, {t['run-fabric'][0] + t['run-cache'][0]} run data)"]
+    if t["run-move"][0]:
+        parts.append(f"moved {t['run-move'][0]} run-data entries ({mg.human(t['run-move'][1])}) to {mg.tilde(pg.cache)}/")
+    if t["archive"][0]:
+        parts.append(f"archived {t['archive'][0]} unused entries ({mg.human(t['archive'][1])}) to "
+                     f"archives/{pg.date}/ (INDEX.md)")
+    if t["empty"][0]:
+        parts.append(f"removed {t['empty'][0]} empty dirs")
+    line = f"- [{he.now() if he else time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}] m2herd-purge: " \
+           + "; ".join(parts) + "\n"
+    p = os.path.join(pg.root, "NOTES.md")
+    if not os.path.exists(p):
+        open(p, "a").close()
+    with mg.locked(p):
+        with open(p, "a", encoding="utf-8") as f:
+            f.write(line)
+
+
+# ---------------------------------------------------------------------------------------- main
+
+def parse(argv):
+    ap = argparse.ArgumentParser(prog="m2herd-purge", description=__doc__.split("\n\n")[0],
+                                 formatter_class=argparse.RawDescriptionHelpFormatter,
+                                 epilog=__doc__.split("\n\n", 1)[1])
+    ap.add_argument("m2herd", nargs="?", help="the project's .m2herd directory")
+    ap.add_argument("--fabrics", help="file listing one .m2herd path per line (the weekly timer uses it)")
+    ap.add_argument("--apply", action="store_true", help="perform the plan (default: dry run)")
+    ap.add_argument("--readers", help="comma-separated roots to grep for references (HERD_PURGE_READERS)")
+    ap.add_argument("--run-days", type=float, help="run-data retention in days (HERD_PURGE_RUN_DAYS, 14)")
+    ap.add_argument("--archive-days", type=float, help="unused age in days before archiving (HERD_PURGE_ARCHIVE_DAYS, 30)")
+    ap.add_argument("--grace-hours", type=float, help="locks, empty dirs, fresh run data (HERD_PURGE_GRACE_HOURS, 24)")
+    ap.add_argument("--live-hours", type=float, default=48, help="a v1 herd changed this recently is live (48)")
+    ap.add_argument("--date", default=datetime.date.today().isoformat(), help="archive date (default today)")
+    ap.add_argument("--project", help="project name for the cache dir")
+    ap.add_argument("--cache-root", default=os.environ.get("M2HERD_CACHE_ROOT", "~/.cache/m2herd"))
+    ap.add_argument("--summary", action="store_true", help="print the totals only")
+    ap.add_argument("--verbose", action="store_true", help="also list what is kept and why")
+    ap.add_argument("--no-open-check", dest="check_open", action="store_false",
+                    help="do not skip entries held open by a process (tests)")
+    ap.add_argument("--selftest", action="store_true", help="run the offline selftest in a temp dir")
+    return ap, ap.parse_args(argv)
+
+
+def run_one(fabric, a, out):
+    fabric = os.path.abspath(os.path.expanduser(fabric))
+    if not os.path.isdir(fabric):
+        out.write(f"m2herd-purge: no directory {fabric}\n")
+        return 2
+    why = mg.fabric_problem(fabric)
+    if why:
+        out.write(f"m2herd-purge: {why} — nothing done\n")
+        return 2
+    lock = os.open(fabric, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            out.write(f"m2herd-purge: another m2herd-purge run holds {mg.tilde(fabric)} — nothing done\n")
+            return 2
+        try:
+            cfg = settings(fabric, a)
+        except SystemExit as e:
+            out.write(f"{e}\n")
+            return 2
+        pg = Purge(fabric, a, cfg)
+        pg.build()
+        print_plan(pg, out)
+        if not a.apply:
+            return 0
+        if not pg.actions:
+            out.write("nothing to apply\n")
+            return 0
+        rc, _ = apply(pg, out)
+        return rc
+    finally:
+        os.close(lock)
+
+
+def main(argv=None, out=sys.stdout):
+    ap, a = parse(sys.argv[1:] if argv is None else argv)
+    if a.selftest:
+        return selftest()
+    try:
+        datetime.date.fromisoformat(a.date)
+    except ValueError:
+        print(f"m2herd-purge: --date {a.date!r} is not YYYY-MM-DD", file=sys.stderr)
+        return 2
+    fabrics = [a.m2herd] if a.m2herd else []
+    if a.fabrics:
+        try:
+            with open(os.path.expanduser(a.fabrics), encoding="utf-8") as f:
+                fabrics += [ln.split("#", 1)[0].strip() for ln in f if ln.split("#", 1)[0].strip()]
+        except OSError as e:
+            print(f"m2herd-purge: --fabrics {a.fabrics}: {e.strerror}", file=sys.stderr)
+            return 2
+    if not fabrics:
+        ap.print_usage(sys.stderr)
+        return 2
+    rc = 0
+    for i, fab in enumerate(fabrics):
+        if i:
+            out.write("\n")
+        rc = max(rc, run_one(fab, a, out))
+    return rc
+
+
+# ---------------------------------------------------------------------------------------- selftest
+
+def selftest():
+    import io
+    ok = fail = 0
+
+    def check(name, cond, detail=""):
+        nonlocal ok, fail
+        if cond:
+            ok += 1
+        else:
+            fail += 1
+            print(f"FAIL {name}\n{detail[-2500:]}")
+
+    tmp = tempfile.mkdtemp(prefix="m2herd-purge-selftest-")
+    try:
+        m = os.path.join(tmp, "proj", ".m2herd")
+        cache = os.path.join(tmp, "cache")
+        now = time.time()
+        old, mid = now - 40 * 86400, now - 5 * 86400
+
+        def w(rel, text="x\n", mtime=None, base=m):
+            p = os.path.join(base, rel)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write(text)
+            if mtime:
+                os.utime(p, (mtime, mtime))
+            return p
+
+        def iso(t):
+            return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(t))
+
+        w("RESUME.md", "see dispatch/kept-by-resume.md\n", old)
+        w("NOTES.md", "<!-- === M2HERD:LIVE === -->\n- [2026-01-02T00:00:00Z] old month dispatch/notes-old.md\n"
+          f"- [{iso(now)}] this month dispatch/notes-now.md\n", old)
+        w("PHASE-NEXT-2026-01-01.md", "x\n", old)
+        w("dispatch/kept-by-resume.md", "r\n", old)
+        w("dispatch/notes-old.md", "r\n", old)
+        w("dispatch/notes-now.md", "r\n", old)
+        w("dispatch/unused.md", "r\n", old)
+        w("dispatch/fresh.md", "r\n")
+        w("dispatch/by-tool.md", "r\n", old)
+        w("dispatch/chain-a.md", "see dispatch/chain-b.md\n", old)   # both old, a names b: both go
+        w("dispatch/chain-b.md", "r\n", old)
+        w("dispatch/__pycache__/x.pyc", "c")
+        w("dispatch/screens/s-old/1.png", "png", old)
+        w("dispatch/screens/s-mid/1.png", "png", mid)
+        w("dispatch/screens/s-new/1.png", "png")
+        w("dispatch/herde-0101/a.task.md", "t\n", old)                # merged 20 d ago
+        w("dispatch/herde-0101/herd.events.jsonl",
+          json_line(slice="a", phase="merged", ts=iso(now - 20 * 86400)), old)
+        w("dispatch/herde-0101/screens/x.png", "png", mid)
+        w("dispatch/herde-0202/a.task.md", "needs dispatch/live-ref.md\n", old)     # still working
+        w("dispatch/herde-0202/herd.events.jsonl", json_line(slice="a", phase="working", ts=iso(old)), old)
+        w("dispatch/herde-0202/screens/y.png", "png", old)
+        w("dispatch/live-ref.md", "r\n", old)
+        w("stale.lock", "", old)
+        os.makedirs(os.path.join(m, "empty-old"))
+        os.utime(os.path.join(m, "empty-old"), (old, old))
+        w("screens/README.md", "x", old, base=cache + "/proj")
+        w("screens/c-old/1.png", "png", old, base=cache + "/proj")
+        w("screens/c-new/1.png", "png", mid, base=cache + "/proj")
+        rd = os.path.join(tmp, "bin")
+        w("tool", "cat .m2herd/dispatch/by-tool.md\n", base=rd)
+        base = [m, "--readers", rd, "--cache-root", cache, "--no-open-check", "--date", "2026-10-23"]
+
+        def run(extra):
+            buf = io.StringIO()
+            rc = main(base + extra, out=buf)
+            return rc, buf.getvalue()
+
+        rc, txt = run([])
+        check("dry run exit 0", rc == 0, txt)
+        check("unused archived", "ARCHIVE dispatch/unused.md -> archives/2026-10-23/dispatch/unused.md" in txt, txt)
+        check("chain both archived", "dispatch/chain-a.md ->" in txt and "dispatch/chain-b.md ->" in txt, txt)
+        for kept in ("kept-by-resume", "by-tool", "notes-now", "live-ref", "fresh"):
+            check(f"{kept} kept", f"dispatch/{kept}.md ->" not in txt, txt)
+        check("older NOTES month does not count", "dispatch/notes-old.md ->" in txt, txt)
+        check("keep list", "RESUME.md ->" not in txt and "PHASE-NEXT" not in txt, txt)
+        check("old screens deleted in place", "DELETE  dispatch/screens/s-old/" in txt, txt)
+        check("mid screens move", "MOVE    dispatch/screens/s-mid/ -> " in txt and "cache/proj/screens/s-mid/" in txt, txt)
+        check("fresh screens stay", "s-new" not in txt, txt)
+        check("merged herd screens deleted", "DELETE  dispatch/herde-0101/screens/x.png" in txt, txt)
+        check("live herd untouched", "herde-0202" not in txt.split("totals")[0], txt)
+        check("cache old deleted, new kept", "c-old/" in txt and "c-new" not in txt and "README" not in txt, txt)
+        check("pycache, stale lock, empty dir", "dispatch/__pycache__/" in txt and "DELETE  stale.lock" in txt
+              and "RMDIR   empty-old/" in txt, txt)
+        check("dry run changed nothing", os.path.exists(os.path.join(m, "dispatch/unused.md"))
+              and not os.path.exists(os.path.join(m, "archives")), txt)
+        rc, txt = run(["--apply"])
+        check("apply exit 0", rc == 0, txt)
+        check("archived on disk", os.path.isfile(os.path.join(m, "archives/2026-10-23/dispatch/unused.md")))
+        with open(os.path.join(m, "archives/2026-10-23/INDEX.md")) as f:
+            idx = f.read()
+        check("index line", "- dispatch/unused.md (" in idx and "last modified" in idx, idx)
+        check("moved to cache", os.path.isfile(os.path.join(cache, "proj/screens/s-mid/1.png")))
+        check("cache old gone", not os.path.exists(os.path.join(cache, "proj/screens/c-old")))
+        with open(os.path.join(m, "NOTES.md")) as f:
+            notes = f.read()
+        check("one NOTES line", notes.count("m2herd-purge:") == 1, notes)
+        rc, txt = run(["--apply"])
+        with open(os.path.join(m, "NOTES.md")) as f:
+            check("second apply: nothing, no NOTES line", "nothing to apply" in txt
+                  and f.read().count("m2herd-purge:") == 1, txt)
+        child = subprocess.Popen([sys.executable, "-c",
+                                  "import fcntl,os,sys,time;fd=os.open(sys.argv[1],os.O_RDONLY);"
+                                  "fcntl.flock(fd,fcntl.LOCK_EX);print('ok',flush=True);time.sleep(30)", m],
+                                 stdout=subprocess.PIPE, text=True)
+        try:
+            child.stdout.readline()
+            rc, txt = run([])
+            check("second run refused while locked", rc == 2 and "holds" in txt, txt)
+        finally:
+            child.kill()
+            child.wait()
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"m2herd-purge selftest: {ok} passed, {fail} failed")
+    return 0 if fail == 0 else 1
+
+
+def json_line(**ev):
+    import json
+    ev.setdefault("by", "merge")
+    return json.dumps(ev) + "\n"
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,2 @@
+#!/usr/bin/env bash
+echo "claude $*" >> "${FAKE_TOOL_LOG:-/dev/null}"

@@ -1,0 +1,198 @@
+#!/usr/bin/env python3
+"""herd-limits — the one start budget for herd workers AND review agents (docs/herd-flow-v2.md §4).
+
+  herd-limits [<herd>] [--anchor PANE] [--plus N] [--json]
+  herd-limits --selftest
+
+Exit 0 = a slot is free, 1 = no slot (the reasons are printed), 2 = usage error / herdr unreadable.
+Prints one line: `slots used/max (k review), free MB, load` and, when refused, `no slot: <reasons>`.
+
+Limits — the environment wins, `<herd>/limits.env` (KEY=VALUE lines, `export` and quotes allowed) fills in
+what the environment leaves unset, then the defaults:
+  HERD_MAX_SLOTS    default 6
+  HERD_MIN_FREE_MB  default 8000 (MemAvailable from /proc/meminfo)
+  HERD_MAX_LOAD     default cores x 2.5 (1-minute load average)
+
+What counts as a used slot:
+  - every herdr agent in the tab labelled HERD_SPAWN_TAB (default `herde`) of the anchor's workspace whose
+    status is `working` or `blocked` (a blocked worker resumes as soon as it is answered, so it keeps its
+    slot); `idle`/`done` workers do not count — their memory is covered by HERD_MIN_FREE_MB. Without an
+    anchor, `herde` tabs of every workspace count.
+  - review agents: running agents of the anchor's Workflow runs registered in
+    ~/.cache/herd-board/<anchor>.agents/ (the herd-board registry: a file per run whose second line is the
+    run dir; an agent runs while its journal has `started` without `result` and its transcript moved within
+    30 min). If <anchor>.agents is a plain file instead, its content is taken as the count. Plain
+    subagents of the orchestrator (in-process, no TUI) do not count.
+  - `--plus N`: starts already decided but not yet visible in herdr.
+The anchor is --anchor, else HERD_ANCHOR, HERD_ORCH_PANE, HERDR_PANE_ID.
+Test hooks: HERD_LIMITS_MEMINFO / HERD_LIMITS_LOADAVG replace /proc/meminfo and /proc/loadavg.
+"""
+import glob
+import json
+import os
+import subprocess
+import sys
+import time
+
+WF_STALE_MIN = 30   # same as herd-board: a workflow agent whose transcript did not move for this long is gone
+DEFAULTS = {"HERD_MAX_SLOTS": "6", "HERD_MIN_FREE_MB": "8000", "HERD_MAX_LOAD": None}
+
+
+def read_env_file(p):
+    out = {}
+    try:
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                line = line.split("#", 1)[0].strip()
+                if line.startswith("export "):
+                    line = line[7:].strip()
+                if "=" not in line:
+                    continue
+                k, v = line.split("=", 1)
+                out[k.strip()] = v.strip().strip("'\"")
+    except OSError:
+        pass
+    return out
+
+
+def limits(herd):
+    file_vals = read_env_file(os.path.join(herd, "limits.env")) if herd else {}
+    vals = {}
+    for k, d in DEFAULTS.items():
+        vals[k] = os.environ.get(k) or file_vals.get(k) or d
+    cores = os.cpu_count() or 1
+    return (int(vals["HERD_MAX_SLOTS"]), int(vals["HERD_MIN_FREE_MB"]),
+            float(vals["HERD_MAX_LOAD"]) if vals["HERD_MAX_LOAD"] else round(cores * 2.5, 1))
+
+
+def herdr_json(*args):
+    r = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=10)
+    if r.returncode != 0:
+        raise RuntimeError(f"herdr {' '.join(args)}: {(r.stderr or r.stdout).strip()[:200]}")
+    return json.loads(r.stdout)["result"]
+
+
+def herde_workers(anchor, label):
+    """Agents in the herde tab(s) that hold a slot: [(pane, status)]."""
+    ws = anchor.split(":", 1)[0] if anchor else None
+    tabs = {t["tab_id"] for t in herdr_json("tab", "list").get("tabs", [])
+            if t.get("label") == label and (ws is None or t.get("workspace_id") == ws)}
+    return [(a["pane_id"], a.get("agent_status")) for a in herdr_json("agent", "list").get("agents", [])
+            if a.get("tab_id") in tabs and a.get("agent_status") in ("working", "blocked")]
+
+
+def running_workflow_agents(wdir, now):
+    try:
+        with open(os.path.join(wdir, "journal.jsonl"), encoding="utf-8") as f:
+            events = [json.loads(line) for line in f if line.strip()]
+    except (OSError, ValueError):
+        return 0
+    started = {e["agentId"] for e in events if e.get("type") == "started" and e.get("agentId")}
+    done = {e["agentId"] for e in events if e.get("type") == "result" and e.get("agentId")}
+    n = 0
+    for aid in started - done:
+        try:
+            if (now - os.path.getmtime(os.path.join(wdir, f"agent-{aid}.jsonl"))) / 60 <= WF_STALE_MIN:
+                n += 1
+        except OSError:
+            pass
+    return n
+
+
+def review_agents(anchor):
+    if not anchor:
+        return 0
+    reg = os.path.join(os.path.expanduser("~/.cache/herd-board"), f"{anchor.replace(':', '_')}.agents")
+    if os.path.isfile(reg):
+        try:
+            return int(open(reg, encoding="utf-8").read().split()[0])
+        except (OSError, ValueError, IndexError):
+            return 0
+    n, now = 0, time.time()
+    for entry in glob.glob(os.path.join(reg, "*")):
+        try:
+            target = open(entry, encoding="utf-8").read().split("\n", 1)[1].strip()
+        except (OSError, IndexError):
+            continue
+        if os.path.isdir(target):
+            n += running_workflow_agents(target, now)
+    return n
+
+
+def free_mb():
+    src = os.environ.get("HERD_LIMITS_MEMINFO", "/proc/meminfo")
+    with open(src, encoding="utf-8") as f:
+        for line in f:
+            if line.startswith("MemAvailable:"):
+                return int(line.split()[1]) // 1024
+    return 0
+
+
+def load1():
+    with open(os.environ.get("HERD_LIMITS_LOADAVG", "/proc/loadavg"), encoding="utf-8") as f:
+        return float(f.read().split()[0])
+
+
+def check(herd=None, anchor=None, plus=0):
+    """dict with the measurement and `ok`/`reasons`; raises RuntimeError when herdr cannot be read."""
+    max_slots, min_free, max_load = limits(herd)
+    label = os.environ.get("HERD_SPAWN_TAB", "herde")
+    workers = herde_workers(anchor, label)
+    reviews = review_agents(anchor)
+    used = len(workers) + reviews + plus
+    mb, load = free_mb(), load1()
+    reasons = []
+    if used >= max_slots:
+        reasons.append(f"all {max_slots} slots used")
+    if mb < min_free:
+        reasons.append(f"only {mb} MB free (min {min_free})")
+    if load >= max_load:
+        reasons.append(f"load {load:.2f} >= {max_load}")
+    return {"ok": not reasons, "used": used, "max": max_slots, "workers": len(workers), "review": reviews,
+            "plus": plus, "free_mb": mb, "min_free_mb": min_free, "load": load, "max_load": max_load,
+            "reasons": reasons}
+
+
+def line(r):
+    s = (f"slots {r['used']}/{r['max']} ({r['review']} review), free {r['free_mb']} MB (min {r['min_free_mb']}), "
+         f"load {r['load']:.2f} (max {r['max_load']})")
+    return s if r["ok"] else s + "\nno slot: " + "; ".join(r["reasons"])
+
+
+def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    if argv[:1] == ["--selftest"]:
+        test = os.path.join(os.path.dirname(os.path.realpath(__file__)), "..", "tests", "spawnwatch",
+                            "test_spawnwatch.py")
+        return subprocess.call([sys.executable, test, "-k", "Limits"])
+    herd = anchor = None
+    plus, as_json = 0, False
+    rest = list(argv)
+    while rest:
+        a = rest.pop(0)
+        if a == "--anchor" and rest:
+            anchor = rest.pop(0)
+        elif a == "--plus" and rest:
+            plus = int(rest.pop(0))
+        elif a == "--json":
+            as_json = True
+        elif not a.startswith("-") and herd is None:
+            herd = a
+        else:
+            print(f"herd-limits: unknown argument {a!r} (see --help)", file=sys.stderr)
+            return 2
+    anchor = anchor or os.environ.get("HERD_ANCHOR") or os.environ.get("HERD_ORCH_PANE") or \
+        os.environ.get("HERDR_PANE_ID") or None
+    try:
+        r = check(herd, anchor, plus)
+    except (RuntimeError, OSError, ValueError, KeyError, subprocess.TimeoutExpired) as e:
+        print(f"herd-limits: cannot measure ({e}) — treating as no slot", file=sys.stderr)
+        return 2
+    print(json.dumps(r) if as_json else line(r))
+    return 0 if r["ok"] else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

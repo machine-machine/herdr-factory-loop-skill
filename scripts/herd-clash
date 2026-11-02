@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""herd-clash — overlapping files between live slices, per repo (docs/herd-flow-v2.md §1, §4).
+
+  herd-clash <herd> [--slice NAME] [--json]
+  herd-clash --selftest
+
+A slice is live when its last phase is neither `merged` nor `parked` and its worktree exists. For each
+`<slice>.repos` line `repo branch base` the changed files are `git diff --name-only <base>...HEAD` in
+that slice's worktree; test files are excluded. Two live slices clash when their sets intersect in the
+same repo. `--slice` keeps only the pairs that involve that slice. Exit 0 also when clashes exist.
+
+Worktree of (slice, repo): the `wt` list of the slice's latest `working` event (a path whose parts
+contain the repo name, a `repo=path` string or a {"repo", "path"} object), else
+`$HERD_WT_ROOT/<repo>/<slice>` (default ~/.herdr/worktrees).
+
+Helpers used by herd-merge and herd-context (loaded from this file): worktree_for, resolve_base,
+changed_files, is_test, collect, clashes, git.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import herd_events as he  # noqa: E402
+
+DEAD = ("merged", "parked")
+
+# a path component that marks a test tree, or a file name that marks a test file
+TEST_DIR_RE = re.compile(r"(^|/)(tests?|__tests__|spec|specs|e2e|testdata|fixtures)/")
+TEST_FILE_RE = re.compile(r"(^|/)(test_[^/]+\.py|[^/]+_test\.(py|go|rs)|conftest\.py|"
+                          r"[^/]+\.(test|spec)\.[cm]?[jt]sx?|[^/]+\.snap)$")
+
+
+def is_test(path):
+    extra = os.environ.get("HERD_CLASH_EXCLUDE")
+    if extra and re.search(extra, path):
+        return True
+    return bool(TEST_DIR_RE.search(path) or TEST_FILE_RE.search(path))
+
+
+def git(wt, *args, check=True):
+    p = subprocess.run(["git", "-C", wt, *args], capture_output=True, text=True)
+    if check and p.returncode != 0:
+        raise RuntimeError(f"git -C {wt} {' '.join(args)}: {(p.stderr or p.stdout).strip()}")
+    return p
+
+
+def repo_short(repo):
+    return repo.rstrip("/").split("/")[-1]
+
+
+def _latest_wt(herd, slice_name):
+    for ev in reversed(he.read(herd)):
+        if ev["slice"] == slice_name and ev["phase"] == "working" and ev.get("wt"):
+            wt = ev["wt"]
+            return wt if isinstance(wt, list) else [wt]
+    return []
+
+
+def _origin_matches(path, repo):
+    p = subprocess.run(["git", "-C", path, "remote", "get-url", "origin"], capture_output=True, text=True)
+    url = re.sub(r"\.git$", "", p.stdout.strip().rstrip("/"))
+    if not url:
+        return False
+    return re.split(r"[/:]", url)[-1] == repo_short(repo)
+
+
+def worktree_for(herd, slice_name, repo):
+    """Worktree path of a slice for a repo, or None when it does not exist."""
+    short = repo_short(repo)
+    paths = []
+    for w in _latest_wt(herd, slice_name):
+        if isinstance(w, dict):
+            if repo_short(str(w.get("repo", ""))) == short and w.get("path"):
+                return w["path"] if os.path.isdir(w["path"]) else None
+            continue
+        w = str(w)
+        if "=" in w and not os.path.isdir(w):
+            r, p = w.split("=", 1)
+            if repo_short(r) == short:
+                return p if os.path.isdir(p) else None
+            continue
+        paths.append(w)
+    for p in paths:
+        if short in os.path.normpath(p).split(os.sep) and os.path.isdir(p):
+            return p
+    for p in paths:
+        if os.path.isdir(p) and _origin_matches(p, repo):
+            return p
+    root = os.environ.get("HERD_WT_ROOT") or os.path.expanduser("~/.herdr/worktrees")
+    p = os.path.join(root, short, slice_name)
+    return p if os.path.isdir(p) else None
+
+
+def resolve_base(wt, base):
+    """The .repos base as a commit-ish that exists in the worktree (`x` falls back to `origin/x`)."""
+    for cand in (base, f"origin/{base}" if not base.startswith("origin/") else None):
+        if cand and git(wt, "rev-parse", "--verify", "-q", f"{cand}^{{commit}}", check=False).returncode == 0:
+            return cand
+    raise RuntimeError(f"base {base!r} does not resolve in {wt}")
+
+
+def changed_files(wt, base, tests=False):
+    out = git(wt, "diff", "--name-only", f"{resolve_base(wt, base)}...HEAD").stdout.split("\n")
+    return sorted(f for f in out if f and (tests or not is_test(f)))
+
+
+def live_slices(herd):
+    return {s: ev for s, ev in he.state(herd).items() if ev["phase"] not in DEAD}
+
+
+def collect(herd, slices=None):
+    """-> (files, skipped): files[repo][slice] = sorted non-test changed files."""
+    files, skipped = {}, []
+    for s in sorted(slices if slices is not None else live_slices(herd)):
+        try:
+            lines = he.repos(herd, s)
+        except ValueError as e:
+            skipped.append({"slice": s, "repo": None, "reason": str(e)})
+            continue
+        if not lines:
+            skipped.append({"slice": s, "repo": None, "reason": f"no {s}.repos"})
+        for r in lines:
+            wt = worktree_for(herd, s, r["repo"])
+            if not wt:
+                skipped.append({"slice": s, "repo": r["repo"], "reason": "no worktree"})
+                continue
+            try:
+                files.setdefault(r["repo"], {})[s] = changed_files(wt, r["base"])
+            except RuntimeError as e:
+                skipped.append({"slice": s, "repo": r["repo"], "reason": str(e)})
+    return files, skipped
+
+
+def relation(herd, a, b):
+    ha, hb = he.task_header(herd, a), he.task_header(herd, b)
+    if ha.get("stacked_on") == b or hb.get("stacked_on") == a:
+        return "stacked"
+    if b in he.package(herd, a):
+        return "package"
+    return None
+
+
+def clashes(herd, only=None):
+    files, skipped = collect(herd)
+    pairs = []
+    for repo in sorted(files):
+        names = sorted(files[repo])
+        for i, a in enumerate(names):
+            for b in names[i + 1:]:
+                if only and only not in (a, b):
+                    continue
+                common = sorted(set(files[repo][a]) & set(files[repo][b]))
+                if common:
+                    pairs.append({"repo": repo, "slices": [a, b], "files": common,
+                                  "relation": relation(herd, a, b)})
+    by_slice = {}
+    for p in pairs:
+        a, b = p["slices"]
+        for me, other in ((a, b), (b, a)):
+            by_slice.setdefault(me, []).append({"other": other, "repo": p["repo"], "files": p["files"],
+                                                "relation": p["relation"]})
+    if only:
+        skipped = [x for x in skipped if x["slice"] == only]
+        files = {r: {s: f for s, f in v.items() if s == only} for r, v in files.items()}
+        files = {r: v for r, v in files.items() if v}
+    return {"pairs": pairs, "by_slice": by_slice, "changed": files, "skipped": skipped}
+
+
+def render(res):
+    lines = []
+    for p in res["pairs"]:
+        rel = f" ({p['relation']})" if p["relation"] else ""
+        lines.append(f"{p['repo']}: {p['slices'][0]} ⇄ {p['slices'][1]}{rel}: {', '.join(p['files'])}")
+    if not res["pairs"]:
+        lines.append("no overlapping files between live slices")
+    for s in res["skipped"]:
+        lines.append(f"skipped {s['slice']}" + (f" {s['repo']}" if s["repo"] else "") + f": {s['reason']}")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------------------- selftest
+
+def selftest():
+    import shutil
+    import tempfile
+    tmp = tempfile.mkdtemp(prefix="herd-clash-selftest-")
+    ok = fail = 0
+
+    def check(cond, what):
+        nonlocal ok, fail
+        if cond:
+            ok += 1
+        else:
+            fail += 1
+            print(f"FAIL {what}", file=sys.stderr)
+
+    def sh(cwd, *args):
+        subprocess.run(args, cwd=cwd, check=True, capture_output=True, text=True)
+
+    try:
+        env_keep = {k: os.environ.get(k) for k in ("HERD_WT_ROOT", "GIT_CONFIG_NOSYSTEM")}
+        os.environ["HERD_WT_ROOT"] = os.path.join(tmp, "wt")
+        os.environ["GIT_CONFIG_NOSYSTEM"] = "1"
+        ident = ["-c", "user.name=t", "-c", "user.email=t@t", "-c", "init.defaultBranch=main"]
+        bare = os.path.join(tmp, "api.git")
+        sh(tmp, "git", *ident, "init", "-q", "--bare", bare)
+        seed = os.path.join(tmp, "seed")
+        sh(tmp, "git", *ident, "clone", "-q", bare, seed)
+        os.makedirs(os.path.join(seed, "src"))
+        os.makedirs(os.path.join(seed, "tests"))
+        for f in ("src/x.py", "src/y.py", "tests/test_x.py", "README.md"):
+            with open(os.path.join(seed, f), "w") as fh:
+                fh.write("seed\n")
+        sh(seed, "git", *ident, "add", "-A")
+        sh(seed, "git", *ident, "commit", "-qm", "seed")
+        sh(seed, "git", *ident, "push", "-q", "origin", "HEAD:main")
+        herd = os.path.join(tmp, "herd")
+        os.makedirs(herd)
+        touched = {"a": ["src/x.py", "tests/test_x.py", "README.md"], "b": ["src/x.py", "tests/test_x.py"],
+                   "c": ["src/y.py"], "d": ["src/x.py"]}
+        for s, fs in touched.items():
+            wt = os.path.join(tmp, "wt", "api", s)
+            sh(tmp, "git", *ident, "clone", "-q", bare, wt)
+            sh(wt, "git", *ident, "checkout", "-qb", f"feat-{s}")
+            for f in fs:
+                with open(os.path.join(wt, f), "a") as fh:
+                    fh.write(f"{s}\n")
+            sh(wt, "git", *ident, "commit", "-qam", s)
+            with open(os.path.join(herd, f"{s}.repos"), "w") as fh:
+                fh.write(f"api feat-{s} origin/main\n")
+            with open(os.path.join(herd, f"{s}.task.md"), "w") as fh:
+                fh.write("model: claude-opus-5-5\n\n# task\n")
+            he.append(herd, s, "working")
+        he.append(herd, "d", "parked", reason="x")
+        res = clashes(herd)
+        check([p["slices"] for p in res["pairs"]] == [["a", "b"]], f"pairs a⇄b only, got {res['pairs']}")
+        check(res["pairs"] and res["pairs"][0]["files"] == ["src/x.py"], "test files excluded")
+        check(res["by_slice"].get("b", [{}])[0].get("other") == "a", "by_slice names the other slice")
+        check("d" not in res["changed"].get("api", {}), "parked slice is not live")
+        check(clashes(herd, only="c")["pairs"] == [], "--slice c has no pairs")
+        check(is_test("web/src/a.test.tsx") and is_test("pkg/foo_test.go") and not is_test("src/testing.py"),
+              "is_test patterns")
+        with open(os.path.join(herd, "e.repos"), "w") as fh:
+            fh.write("api feat-e origin/main\n")
+        he.append(herd, "e", "working")
+        check(any(x["slice"] == "e" and x["reason"] == "no worktree" for x in clashes(herd)["skipped"]),
+              "missing worktree is skipped with a reason")
+        for k, v in env_keep.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    print(f"herd-clash selftest: {ok} passed, {fail} failed")
+    return 1 if fail else 0
+
+
+def main():
+    if "--selftest" in sys.argv[1:]:
+        return selftest()
+    ap = argparse.ArgumentParser(prog="herd-clash", description=__doc__.split("\n\n")[0],
+                                 epilog="See the module docstring (head of this file) for the rules.")
+    ap.add_argument("herd")
+    ap.add_argument("--slice", help="only pairs that involve this slice")
+    ap.add_argument("--json", action="store_true", help="machine output for the board")
+    ap.add_argument("--selftest", action="store_true", help="run the offline self test and exit")
+    a = ap.parse_args()
+    if not os.path.isdir(a.herd):
+        print(f"herd-clash: no herd dir {a.herd}", file=sys.stderr)
+        return 2
+    res = clashes(a.herd, only=a.slice)
+    print(json.dumps(res, ensure_ascii=False, indent=1) if a.json else render(res))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
