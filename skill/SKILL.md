@@ -1,7 +1,7 @@
 ---
 name: herdr
-version: 2.8.0
-description: Orchestrate a fleet of AI coding agents through herdr — the terminal workspace manager (workspaces → tabs → panes) running on this machine. Spawn agents, dispatch work, watch lifecycle state (idle/working/blocked), unblock approval prompts, fan out and converge multi-agent work, and manage agent integrations. Trigger when the user mentions herdr, "the fleet", "orchestrate agents", "spawn an agent", "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or wants an agent to drive other coding agents (claude/codex/cursor/opencode/etc.) running in herdr. ALSO trigger when an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the right response is to spin up a parallel herdr "herd" of codex (or mixed) workers to achieve the goal — understand the intent first, then fan out concurrent workers, converge results, and report back on the same channel. ALSO trigger for spec-driven development (SDD) — when the user mentions spec-kit, /speckit.* commands, "factory loop", "SDD", spec→plan→tasks→implement, or wants to onboard the factory (choose Claude Code, Hermes, or Cursor as orchestrator). ALSO trigger for meta-orchestration — when the user wants to be the "meta-orchestrator" / "orchestrator of orchestrators", oversee or launch multiple orchestrators (each driving its own herd of workers) across several missions/repos, or drive a portfolio of parallel missions with /goal-based autonomy (fleet-loop.sh / fleet-control). ALSO trigger for m2herd — the Claude Code (Fable) main-orchestrator context fabric — when the user mentions m2herd, .m2herd, "context fabric", wants to offload context into the repo folder (the folder holds the context, the orchestrator holds pointers), refile or archive notes/areas, push a project gist to fleet memory, or come back to a project via the resume file (RESUME.md).
+version: 2.10.0
+description: 'Orchestrate a fleet of parallel AI coding agents with herdr, the terminal workspace manager (workspaces/tabs/panes) on this machine: spawn agents (claude/codex/cursor/opencode/etc.), dispatch work, watch lifecycle (idle/working/blocked), unblock approvals, fan out and converge herds; manage agent integrations. Triggers: herdr, "the fleet", orchestrate agents, spawn an agent, "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or driving agents in herdr panes. Also triggers: chat-channel intents (Mattermost/Discord/Slack) needing parallel workers, report back on the same channel; SDD/factory loop (spec-kit, /speckit.*, onboard the factory, spec→plan→tasks→implement); meta-orchestration (meta-orchestrator, fleet-loop/fleet-control, multi-mission /goal portfolios); m2herd — the Claude main-orchestrator context fabric (.m2herd dir; the folder holds the context, the orchestrator holds pointers; refile/notes/areas, fleet-memory gists, RESUME.md).'
 ---
 
 # herdr Skill
@@ -79,7 +79,33 @@ herdr agent start claude --cwd ~/.herdr/worktrees/<repo>/feature-x --no-focus --
 ```
 `agent start` returns the new pane/agent identifiers in its JSON result — capture them.
 
+> **herdr ≥ 0.9 changed this surface** (check `herdr agent start --help`). `agent start` no
+> longer creates panes: it needs an existing shell pane and a `--kind`, and `--kind` picks the
+> canonical binary — so everything after `--` is FLAGS only. Passing the binary path there
+> makes it the agent's **first prompt** (a worker burned its first turn on its own path).
+> The `<NAME>` must match `^[a-z][a-z0-9_-]{0,31}$`, else `invalid_agent_name` — a bare ticket
+> number as name froze a lane router for hours. The form that works:
+> ```bash
+> P=$(herdr pane split --pane "$SELF" --direction right --cwd "$WT" --no-focus | jq -r '.result.pane.pane_id')
+> herdr agent start worker-x --kind claude --pane "$P" --timeout 120000 -- --permission-mode auto
+> ```
+> Simpler and race-free: start the TUI with its prompt as argv in a fresh shell pane —
+> `herdr pane run "$P" "claude --permission-mode auto '<one-line pointer to the task file>'"`.
+> That is what `herd-spawn` (§16.7) does. Resume a crashed worker the same way with
+> `claude --continue …`, which keeps the transcript.
+> `herd-loop.sh` and `fleet-loop.sh` detect 0.9 (`--kind` in `agent start --help`) and use
+> the pane-then-start form: herd-loop opens workers in the `herde` tab of its own workspace
+> (its own workspace per worker when run outside herdr) and closes the workspaces 0.9's
+> `worktree create` opens on the side; fleet-loop gives each mission orchestrator a
+> workspace labelled with the mission, so each mission's herd gets its own `herde` tab.
+
 ### 4. Dispatch work to an agent
+> **herdr ≥ 0.9:** `agent send` is gone — `herdr agent prompt <target> "<text>"` submits by
+> itself (no Enter, no settle). A script that still calls `agent send … || true` logs success
+> while the worker sits at an empty prompt; after any dispatch, check `herdr agent list` —
+> `idle` right after dispatch means *never started*, not *ready*. The recipe below is for
+> older herdr builds.
+
 `agent send` writes **literal text** (no submit). To submit a prompt to a TUI agent, send the text, **let it settle (~1s), then** press Enter:
 ```bash
 herdr agent send <target> "Refactor the auth module. Report back when done."
@@ -117,8 +143,8 @@ Use `pane read` for *monitoring* (what is the agent doing?), the file protocol f
 ### 5. Monitor & wait
 Block until an agent changes state (the backbone of orchestration):
 ```bash
-herdr agent wait <target> --status idle    --timeout 600000   # ms; wait for it to finish
-herdr agent wait <target> --status blocked --timeout 600000   # wait until it needs you
+herdr agent wait <target> --until idle    --timeout 600000   # ms; wait for it to finish
+herdr agent wait <target> --until blocked --timeout 600000   # wait until it needs you
 herdr wait output <pane_id> --match "BUILD OK" --regex --timeout 120000
 ```
 Read what an agent produced:
@@ -151,7 +177,7 @@ for t in task_a task_b task_c; do
 done
 # converge: poll each to idle, then collect
 while read kv; do t=${kv%=*}; p=${kv#*=}
-  herdr agent wait $p --status idle --timeout 1800000
+  herdr agent wait $p --until idle --timeout 1800000
   herdr pane read $p --source recent-unwrapped --lines 300 > /tmp/$t.out
 done < /tmp/fleet.map
 ```
@@ -249,7 +275,7 @@ Or poll per-worker (simpler, fine for ≤10 workers):
 while read line; do
   t=${line%%=*}; rest=${line#*=}; p=${rest%%=*}; wt=${rest#*=}
   echo ">> $t: waiting…"
-  if ! herdr agent wait "$p" --status idle --timeout 1800000; then
+  if ! herdr agent wait "$p" --until idle --timeout 1800000; then
     echo "!! $t: timed out / errored"; continue
   fi
   if [ "$(herdr agent get "$p" | jq -r '.result.pane.agent_status')" = "blocked" ]; then
@@ -858,6 +884,7 @@ m2herd.sh evolve <analyze|proposals|show|apply|reject> …   # the factory learn
 m2herd.sh dashboard [--dir P] [--watch [--interval N]]     # read-only tier-1 TUI: a pure renderer over existing state — no new state, no fabric writes; --watch = flicker-free repaint loop (prefers the Go m2herd-tui when installed; M2HERD_NO_TUI=1 forces the bash renderer)
 m2herd.sh self-update [--check]           # ff-only pull of the engine repo; --check caches the behind-count for the dashboard header
 m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync → status → resume (+ next cases, config, dashboard smoke); asserts schema fields with jq
+m2herd-up.sh selftest                     # herdr-free Pi CLI compatibility + detached-worker PID check
 ```
 
 `next` is the pulse of the agentic loop — it walks a fixed priority ladder and prints exactly
@@ -954,7 +981,10 @@ pane `--direction right --ratio 0.5` (50/50), each further worker splits the LAS
 `--direction down --ratio 0.5` (2 workers → 25/25 stacked right, then 12.5/12.5, …). The new
 pane is resolved by cwd from `herdr pane list`, the worker binary launched via `pane run`.
 When the orchestrator pane cannot be resolved, dispatch falls back to the original
-`agent start … --no-focus` path and says why.
+`agent start … --no-focus` path and says why. Full TUIs stacked in a half-width column shrink
+to their status bar once there are more than two or three; when a human watches the
+orchestrator tab, run the herd through §16.7 instead (TUIs in their own tab, one board beside
+the orchestrator).
 
 **Not-inside-herdr guard.** `up` and TUI `dispatch` detect whether they run inside a herdr
 pane (bounded ancestor-process walk matching a `herdr` ancestor — HERDR_* env vars are
@@ -1043,12 +1073,11 @@ Keys the **engine** (`m2herd.sh config`) owns: `orchestrator.agent`/`orchestrato
 an array of `{pattern, agent}` rules (optional `runner`); agents `claude|codex|cursor|opencode|pi|prime`,
 runners `pane|headless`.
 
-**pi workers (2.7.2).** `pi` (`@earendil-works/pi-coding-agent`) is a full worker agent:
-pane mode runs `pi -a` — `-a/--approve` is mandatory, since an interactive pi stops on the
-project-trust prompt in a fresh worktree and the worker never starts. Headless runs
-`pi -p -a --session-id <uuid> --mode json`, and because `--session-id` uses an exact id
-(creating it when missing), pi has the same pre-generated-uuid resume story as claude —
-`watch` resumes a crashed pi worker with the recorded id. `collect` salvages the report from
+**pi workers (2.7.2).** `pi` (`@earendil-works/pi-coding-agent`) is a full worker agent.
+Because Pi's CLI changed across releases, dispatch inspects `pi --help`: it passes
+`--approve` only when advertised and selects `--session-id` or `--session` for exact-session
+resume. If neither session form exists, the worker still runs but resume is disabled loudly.
+`collect` salvages the report from
 the JSONL log's `agent_end` event and sums `turn_end` usage into `workers[]`. Note the
 headless model default `sonnet` is claude-only: pi resolves its own default (on this host
 that is a local `spark-glm` model, so pi workers cost $0 and do not draw on the Anthropic
@@ -1072,6 +1101,104 @@ must be set in the file directly.
 the read-only dashboard doctrine: it edits **the config file only** (`.m2herd/settings.json`,
 validated, atomic tmp+rename), never `overview.json` or any other state. Steering still goes
 through `inbox/STEER.md`; state stays orchestrator-only.
+
+#### 16.7 The herd view and the v2 herd flow
+
+The human watches the **orchestrator's tab**: the orchestrator (left 2/3) and ONE `herd-board`
+(right 1/3). Worker TUIs live in their own tab `herde`, where the human drops in only to talk to a
+worker. Since 2.10.0 a herd runs on one schema, `docs/herd-flow-v2.md` (the build contract; it
+wins over this summary):
+
+    triage → plan + queue (no clashing goals, overlaps visible) → worker reports → orchestrator
+    accepts → review loop → ✓ clean (or ! findings → back to the TOP of the queue) → merge on the
+    human's go
+
+**One source of state.** `<herd>/herd.events.jsonl`, append-only, written only through
+`herd-phase` (flock). A slice's state is its last `phase` event: `queued → working → accepted →
+review_running → review_ok | review_befund → fix_queued → working …`, `merged`, `parked`. Every
+live fact (PR open, head sha, pane alive, file overlap, `reported`, `stale`) is computed, never
+stored. Retired: `herd.map`, `active.txt`, `done.txt`, `<slice>.started`, `<slice>.freigabe`,
+`review-state.json`, `herd-review-mark` — `herd-recover` reads them once.
+
+**Declaring a slice.** `<slice>.task.md` starts with a `key: value` header (`tickets`,
+`together_with` = merged as one package, `stacked_on` = base slice, `model`, `effort`,
+`needs_memory`, `keywords`) — template `templates/herd/task.md.example`. `<slice>.repos` has one
+line `repo branch base` per repo; the base column is required.
+
+**Rules per role, not per herd** (structure adapted from the MIT-licensed BMAD method, see `NOTICE`). `templates/herd/rules/ORCHESTRATOR.md`, `HERD-CUT.md`, `WORKER.md`, `REVIEWER.md`, `FIXER.md`, `STEER.md`
+replace the per-herd COMMON chains; `MODELS.md` says which model and effort for which task. A
+project overrides them in `.m2herd/rules/`. Per-herd values (orchestrator name, ports, test
+commands, what is unreachable) go into `<herd>/ctx.env`; `herd-context <role> <herd> [<slice>]`
+fills them in and writes `<slice>.ctx.<role>.md` with the rules, task, report, findings, clash
+list, memory files and a register excerpt — the one file an agent starts from.
+
+    herd-phase <herd> <slice> <phase> [--field k=v …] [--note …]   # the only writer; --state [--json] reads
+    herd-spawn <herd> <slice> [--resume]     # worker TUI → tab herde; model/effort from the header; refuses without a slot
+    herd-watch <herd>                        # long-running: starts fix_queued before queued, respects stacked_on, wakes $HERD_ORCH_PANE
+    herd-limits [<herd>]                     # one budget for workers AND review agents (slots, free MB, load)
+    herd-clash <herd> [--json]               # files two live slices both touch → ⇄ on the board
+    herd-context <role> <herd> [<slice>]     # worker|reviewer|fixer per slice; orchestrator|herd-cut per herd
+    herd-merge <herd> <package> --go "<the human's words>"   # squash-merge in stacked_on order, restack children
+    herd-recover <herd>                      # after a crash: reconcile events with panes, sessions, GitHub
+    herd-board [--anchor <pane>] [<herd> …]  # the panel; --open splits the anchor's right third
+    m2herd-migrate <.m2herd> [--readers d,d] # dry run of the .m2herd v2 layout; --apply moves, never deletes
+    m2herd-purge <.m2herd> [--apply]          # weekly (templates/systemd): run data out + old, archive unused, never delete docs
+    m2herd-steer list|ack|defer|verify|compact # STEER inbox → deduped items + ledger; the gate hook nudges, verify checks
+
+**The worker's side.** Keep `<herd>/<slice>.status.json` current (`sentence`, `step`/`of`,
+`missing` — `blocked:` when stuck —, `short`, `pr`; German keys are read too), stop its own
+processes, write `<slice>.out.md`, report to the orchestrator. It never writes events: the board
+shows it as *reported* (✓ "checking") once the report exists, the agent is idle and no process is
+left in its worktrees.
+
+**The orchestrator's side.** Reads the report, then `herd-phase … accepted --field prs=… --field
+checks=…` (or sends it back: `accepted → working`). When every slice of a package is accepted it
+picks the moment for the review loop (`templates/herd/workflows/review-fix-loop.js`, Workflow
+tool). The loop writes `review_running`, then `review_ok` with every PR and main sha, or
+`review_befund` + `fix_queued` with `<slice>.befunde-<sha7>.md`; by default (loop arg `fixBy: "worker"`)
+the findings go back to the original worker's session (`herd-spawn --resume`). The main reviewer
+is the model the worker did not use. Low findings go to `<herd>/NACH-MERGE.md`.
+
+**Merging.** Only on the human's go, only with `herd-merge`: it refuses unless every slice of the
+package is `review_ok`, not stale and MERGEABLE against `main` (re-read just before), merges API
+before UI (`HERD_MERGE_ORDER`), restacks each stacked child (`rebase --onto`, `range-diff` only
+`=` lines, retarget via REST, only then delete the parent branch), records the go verbatim, and
+stops at the first failure. Any merge on a repo's main makes every other `review_ok` package of
+that repo *stale* (yellow) until it is re-probed. In auto mode the merge needs the human's merge
+instruction in the current turn — a reviewer's ✓ is not one.
+
+**What the board shows.** Lanes, each only when non-empty: **Queue** (! fix rounds first, then ◌ queued with why it waits),
+**Working** (? blocked first, ● working, ⧗ tests running, ↺ fix round, ✓ reported, ⚠ still, ✕ gone, ◆ the
+orchestrator's own subagents), **Ready to merge** (◇ accepted + why the review waits, … review
+round n/3, ✓ rev'd ✓ + the exact merge word @sha7, ⟳ stale, ! findings), **Merged today**. Header: `slots n/m (k
+review)`, free RAM and disk. Each row ends with model·effort (`O·hi`, `F·hi`, `S·md`).
+The icon carries the meaning, colour only reinforces it (`NO_COLOR`); lines are never cut with
+an ellipsis and overflow says `+N more`. A herd dir without events is drawn the v1 way until
+`herd-recover` migrates it.
+
+**Subagents on the board.** `hooks/herd-board-subagents.py` (PreToolUse, matcher `Agent|Task`)
+registers every main-thread subagent in `~/.cache/herd-board/<anchor>.agents/` and opens the board
+if it is not live; silent in a herd worker's pane. It never blocks the tool call.
+
+**Lifecycle.** Keep a worker pane while its PR may still need rework; right after the merge
+`herdr pane close` it (the emptied `herde` tab closes itself) and remove the worktree. Moving a
+running pane needs no restart (`herdr pane move <p> --tab <t> --target-pane <q> --split down`);
+pane ids survive, and a move steals focus, so focus `$SELF` again.
+
+**Settings.** `HERD_BOARD_LANG=de|en`, `HERD_BOARD_ORG`, `HERD_BOARD_REPOS` (board);
+`HERD_MAX_SLOTS` (6), `HERD_MIN_FREE_MB` (8000), `HERD_MAX_LOAD` (cores×2.5) in the environment or
+`<herd>/limits.env`; `HERD_ORCH_PANE` / `HERD_ORCH_NAME` (who gets woken and reported to);
+`HERD_SPAWN_TAB`, `HERD_SPAWN_UNSET_KEYS`, `HERD_SPAWN_ENV`, `HERD_SPAWN_CONTEXT=0` (no ctx
+regeneration), `HERD_GIT_NAME`/`HERD_GIT_EMAIL` (spawn); the review loop's args `fixBy` (`worker`|`fixer`), `reviewModel` (`other`|`same`),
+`stale` (`delta`|`full`) — the spec's `HERD_FIX_BY`, `HERD_REVIEW_MODEL`, `HERD_STALE`. `scripts/install.sh` links every tool above into `~/.local/bin` (`--uninstall`
+removes only the links it made) and registers the hook (skipped with `--no-m2herd-hooks`).
+
+**Moving an existing fabric.** `m2herd-migrate <project>/.m2herd --readers ~/.local/bin,~/.claude/hooks,~/.claude/skills`
+prints every move (herd dirs → `herden/`, old dispatch → `archives/dispatch/<YYYY-MM>/`, run data
+→ `~/.cache/m2herd/<project>/`, runtime state → `~/.m2herd/state/<project>/`, older NOTES months →
+`archives/notes/`, the RESUME tail → `archives/<date>/`) and every script that still names an old
+path. `--apply` refuses while such readers exist (`--force-readers` overrides), keeps live herds
+in place, writes `archives/<date>/INDEX.md` and deletes nothing but `__pycache__`.
 
 ### 17. evolve — the factory learns
 
@@ -1167,6 +1294,15 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 - **Heuristic vs authoritative** — agents without an installed integration are detected from the screen and can misreport. Prefer installing the integration for any agent you orchestrate heavily.
 - **Worktree isolation** prevents parallel agents from clobbering each other's working tree; default root `~/.herdr/worktrees/<repo>/<branch-slug>`.
 - Use a stable, namespaced `--source` (e.g. `orchestrator:<task>`) whenever you report agent/metadata, so you can later `release-agent` cleanly.
+- **A stale `ANTHROPIC_API_KEY` beats a working claude.ai login.** Workers inherit the orchestrator's env; with an invalid key in it every `claude -p` / TUI worker exits with `401 API key is invalid` while pane, worktree and branch look healthy. The hint is in the worker's stderr ("claude.ai connectors are disabled because ANTHROPIC_API_KEY … takes precedence") — treat it as an error. Unset both `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` in the dispatch command when the fleet runs on a login (`HERD_SPAWN_UNSET_KEYS=1` for `herd-spawn`).
+- **"working" can be a retry loop.** Workers sometimes loop on `Connection refused — a firewall or proxy may be blocking it · Retrying` and herdr still reports `working`. Check `herdr pane read <p> --source visible | grep -c 'Connection refused'` before trusting a long working state. Recover with `pane send-keys <p> Escape`, wait ~3 s, re-prompt with a "continue with your task file" pointer. Typing `/model …` during the retry is swallowed — switch models only when the pane is idle.
+- **Codex workers stall on the update prompt** ("Update available … Skip until next version") and show as `blocked`; a prompt sent then is never taken. Set `check_for_update_on_startup = false` at the top of `~/.codex/config.toml` on fleet machines.
+- **Spawn workers with `claude --permission-mode auto`, not `--dangerously-skip-permissions`,** when the orchestrator itself runs in Claude Code auto mode: the classifier blocks the latter as unsafe agent creation.
+- **Memory is the real worker cap.** One Claude Code TUI grows to ~1.4 GB RSS within ~40 min; eight of them pushed a 16 GB VM into near-OOM (load 53) and two resets. Gate new workers on free memory and load (`MemAvailable` > 5 GB, load < cores), not on a fixed count, and `/exit` finished workers — kill their orphan dev servers too.
+- **After a herdr server restart nothing progresses although everything looks alive.** Restored Claude panes come back idle mid-task (and in auto mode, not with their old flags); every child process got SIGHUP (test runs, dev servers); in-process subagents of every session are gone; panes squeezed to 0 rows fail to restore (`pane read` → `pane_not_found` while `agent list` still lists them); the orchestrator's own session name changes, so workers told to message the old name report into the void. Recover: per worker `/exit` + `pane run "claude --continue '<restart note>'"`, replace 0-row panes, look up your new name and tell the workers. Don't stack more than ~5 panes in one column.
+- **`herdr update` refuses to run inside a herdr pane** ("run `herdr update` outside herdr after detaching"). Every agent lives in a pane, so the human has to detach and run it. Afterwards re-check `agent start`/`pane split` against `--help` — CLI drift has broken dispatch silently more than once.
+- **Merging in Claude Code auto mode needs the human's merge word in the current turn.** An earlier go-ahead plus your own reviewer subagents does not count; `gh pr merge` gets blocked as "merge without review". Ask for "merge" in the same reply that presents the review result; never route around the block.
+- **Reviewer subagents: local evidence only.** Tell them to check tests and files in the worktree and never read credentials or call staging. A reviewer that reached for a token got blocked as credential exploration, and after three blocks in a row auto mode escalated the next harmless command to the human.
 
 ## Quick reference
 
@@ -1176,8 +1312,8 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 | Spawn | `herdr agent start <name> --cwd P --no-focus -- "$(command -v <bin>)" <flags>` |
 | Dispatch | `herdr agent send <t> "…"` → `sleep 1` → `herdr pane send-keys <p> Enter` |
 | Deliverables | file protocol: prompt file → one-line pointer → `wait output --match <sentinel>` → read answer file (§4) |
-| Wait done | `herdr agent wait <t> --status idle --timeout MS` |
-| Wait needs-me | `herdr agent wait <t> --status blocked --timeout MS` |
+| Wait done | `herdr agent wait <t> --until idle --timeout MS` |
+| Wait needs-me | `herdr agent wait <t> --until blocked --timeout MS` |
 | Read output | `herdr agent read <t> --source recent --lines N` |
 | Unblock | read visible → `herdr pane send-keys <p> Enter` |
 | Worktree | `herdr worktree create --cwd P --branch B --base main` |
@@ -1195,6 +1331,7 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 | m2herd context fabric | `m2herd boot\|note\|refile\|resume\|sync --check\|archive\|gist --push\|next\|dashboard` over the repo's `.m2herd/`; `m2herd-up up\|dispatch\|collect\|down` for the 1-orchestrator + 1-machineroom workspace (machineroom pane runs `m2herd dashboard --watch`) — folder holds the context, orchestrator holds pointers, `next` is the machine's own next move, the dashboard is read-only (§16) |
 | m2herd settings | `m2herd config list\|get\|set` over `.m2herd/settings.json` (defaults + validation); `,` in `m2herd-tui` opens the settings editor — config file only, never state (§16.6) |
 | Tear down / retry a worker | `m2herd-up down --slice S [--force]` (pane + worktree + merged branch, idempotent), then re-dispatch; `--all` sweeps every worker (§16.3) |
+| Herd view | `herd-spawn <herd-dir> <slice> <worktree>` puts the worker TUI in tab `herde`; `herd-board` in the right third of the orchestrator tab shows workers + subagents + ready-to-merge PRs; the PreToolUse hook adds every Agent/Task subagent to it (§16.7) |
 | Factory learns | `m2herd evolve analyze` → `proposals` → `show <id>` → `apply <id> [--ack-repo]`\|`reject <id>`; accepted lessons land in `.m2herd/evolver/LESSONS.md` and auto-annotate every dispatch pointer (§17) |
 
 Full CLI + socket reference: [reference.md](reference.md).

@@ -12,7 +12,7 @@ LDFLAGS    := -s -w
 REPRO      := -trimpath -buildvcs=false
 TARGETS    := darwin-amd64 darwin-arm64 linux-amd64 linux-arm64
 
-.PHONY: tui tui-release release-check prebuilt-check check-go lint test ci
+.PHONY: tui tui-release release-check prebuilt-check check-go lint test test-herd ci
 
 check-go:
 	@command -v go >/dev/null 2>&1 || { echo "error: go not found on PATH — install Go (https://go.dev/dl/) to build the TUI"; exit 1; }
@@ -35,7 +35,8 @@ tui-release: check-go
 # prebuilt-rot guard, for real this time: rebuild every target into a scratch dir
 # and byte-compare against the committed set. This is what makes `prebuilt/` a
 # verifiable artifact rather than a promise — it only works because $(REPRO)
-# makes the build reproducible across machines and paths.
+# makes the build reproducible across machines and paths and CI uses the compiler
+# version pinned in .go-version.
 prebuilt-check: check-go
 	@set -e; \
 	tmp=$$(mktemp -d); \
@@ -74,6 +75,27 @@ lint:
 
 test:
 	bash scripts/m2herd.sh selftest
+	bash scripts/m2herd-up.sh selftest
+	python3 scripts/herd-board --selftest
+	$(MAKE) test-herd
+
+# herd flow v2 suites (docs/herd-flow-v2.md) — offline: temp HOME, stubbed herdr/gh/lage, no bytecode
+test-herd:
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/herd-clash --selftest
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/register-excerpt.py --selftest
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/m2herd-migrate --selftest
+	bash tests/board/test-herd-board.sh
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/spawnwatch/test_spawnwatch.py
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/mergectx/test_herd_merge.py
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/mergectx/test_herd_context.py
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/docs/test_rules_templates.py
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/docs/test_m2herd_migrate_mirror.py
+	bash tests/docs/test_install_links.sh
+	node tests/workflows/run.mjs
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/m2herd-purge --selftest
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/purge/test_m2herd_purge.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/m2herd-steer --selftest
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/steer/test_steer.py
 
 # ci — the documented pre-commit check: the same steps CI runs
 # (.github/workflows/ci.yml). Go steps run only when go is on PATH.
@@ -89,6 +111,7 @@ ci:
 	fi
 	bash scripts/lint.sh
 	bash scripts/m2herd.sh selftest
+	python3 scripts/herd-board --selftest
 	bash hooks/smoke.sh
 	@if command -v go >/dev/null 2>&1; then \
 		echo "+ go build ./... && go vet ./... && go test ./... (tui/)"; \

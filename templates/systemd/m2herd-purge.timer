@@ -1,0 +1,12 @@
+# m2herd-purge.timer — runs m2herd-purge.service once a week; Persistent=true catches up a run missed
+# while the machine was off. Enable with: systemctl --user enable --now m2herd-purge.timer
+[Unit]
+Description=m2herd weekly purge
+
+[Timer]
+OnCalendar=weekly
+Persistent=true
+RandomizedDelaySec=1h
+
+[Install]
+WantedBy=timers.target

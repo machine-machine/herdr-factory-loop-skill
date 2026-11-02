@@ -4,6 +4,207 @@ All notable changes to this skill are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project
 adheres to [Semantic Versioning](https://semver.org/).
 
+## [2.10.0] - 2026-10-23
+
+### Added
+- **STEER: intelligent determinism** (`docs/herd-flow-v2.md` §8): `scripts/m2herd-steer` folds
+  `.m2herd/inbox/STEER.md` into stable-keyed items (repeats deduped with first/last seen and count,
+  newer watcher states supersede older ones) with an append-only `inbox/steer.ledger.jsonl`
+  (`list`, `ack`, `defer`, `pending-count`, `verify`, `compact` to `archives/steer/<YYYY-MM>.md`);
+  `hooks/m2herd-steer-gate.sh` (UserPromptSubmit/Stop) injects one rate-limited line while items
+  are open; `templates/herd/rules/STEER.md` says how each item ends in exactly one action; tests in
+  `tests/steer/`.
+- **Herd flow v2** (`docs/herd-flow-v2.md`, the build contract; SKILL.md §16.7): triage → plan +
+  queue → worker reports → orchestrator accepts → review loop → clean ✓ or findings back to the
+  top of the queue → merge only on the human's go. One schema for every piece:
+  - `<herd>/herd.events.jsonl` — append-only phase events (`queued`, `working`, `accepted`,
+    `review_running`, `review_ok`, `review_befund`, `fix_queued`, `merged`, `parked`) with
+    validated transitions, written only through `scripts/herd-phase` (flock); importable core
+    `scripts/herd_events.py`. Live facts (PR heads, panes, overlaps, `reported`, `stale`) are
+    computed, never stored.
+  - Slice declaration: a `key: value` header in `<slice>.task.md` (`tickets`, `together_with`,
+    `stacked_on`, `model`, `effort`, `needs_memory`, `keywords`) and a required base column in
+    `<slice>.repos`. Template `templates/herd/task.md.example`.
+  - `scripts/herd-watch` (long-running starter: fix rounds before new starts, `stacked_on`
+    respected, failed starts stay queued, wakes only `HERD_ORCH_PANE`), `scripts/herd-limits`
+    (one budget for workers and review agents: slots, free MB, load), `scripts/herd-clash`
+    (overlapping files between live slices), `scripts/herd-context` (the one context file per
+    agent and role, with register excerpt via `scripts/register-excerpt.py`),
+    `scripts/herd-merge` (package merge on the human's verbatim go: stacked order, API before
+    UI, restack with `rebase --onto` + `range-diff`, stops at the first failure),
+    `scripts/herd-recover` (reconcile events with panes, sessions and GitHub after a crash;
+    one-time migration of v1 herd files; empty git object check).
+  - `templates/herd/workflows/` — `review-fix-loop.js` + `review-open-prs.js` moved into the
+    skill: they write the review events themselves, pin a `<slice>--review` worktree to the
+    accepted sha, run the integration probe again, pick the reviewer model the worker did not
+    use, and send findings back to the worker's own session by default.
+  - `templates/herd/rules/WORKER.md`, `REVIEWER.md`, `FIXER.md` — role rules generalised from
+    two weeks of per-herd COMMON chains (no project names; per-herd values are `{{placeholders}}`
+    that `herd-context` fills from `<herd>/ctx.env`). `MODELS.md` — which model and effort for
+    which task, with the reason for each row.
+  - `scripts/m2herd-migrate` — moves a `.m2herd` fabric into the v2 layout (herd dirs →
+    `herden/`, old dispatch → `archives/dispatch/<YYYY-MM>/`, run data → `~/.cache/m2herd/<project>/`,
+    runtime state → `~/.m2herd/state/<project>/`, older NOTES months → `archives/notes/`, the
+    RESUME tail → `archives/<date>/`). Dry run by default with sizes and every script that still
+    names an old path (`--readers` roots plus the fabric's own scripts); `--apply` refuses while
+    such readers exist unless `--force-readers`, keeps live herds and files a process holds open
+    in place, writes `archives/<date>/INDEX.md`, deletes nothing but `__pycache__`, and checks
+    the readers again. `--selftest`; `tests/docs/test_m2herd_migrate_mirror.py` applies it to an
+    emptied mirror of a real fabric and proves no file and no NOTES/RESUME line is lost.
+- `scripts/m2herd-purge` + `templates/systemd/m2herd-purge.{service,timer}` — weekly purge
+  (docs §7.1). Run data in `~/.cache/m2herd/<project>/` is deleted after `HERD_PURGE_RUN_DAYS`
+  (14); for herd run data the clock starts at the herd's last `merged` event. Run data found in the
+  fabric moves to that cache first. Inside the fabric only caches (`__pycache__`, `*.pyc`, unheld
+  locks, empty dirs) are deleted. Files unchanged for `HERD_PURGE_ARCHIVE_DAYS` (30) that no reader
+  names (the reader check is imported from `m2herd-migrate`) and that are not on the keep list move
+  to `archives/<date>/`, one `INDEX.md` line each. Dry run by default; `--apply` takes a lock and
+  writes one NOTES line when it changed something. Settings come from `rules/purge.env` or the
+  environment. `--fabrics` runs every fabric in `~/.config/m2herd/fabrics`. Tests in
+  `tests/purge/`.
+
+### Changed
+- `herd-board` follows the v2 lanes (Needs you, Queue, Working, Ready to merge, Merged today),
+  shows `slots n/m (k review)`, model·effort per row and ⇄ clash marks; v1 herd dirs are still
+  drawn the old way until `herd-recover` migrates them.
+- `herd-spawn` takes `<herd> <slice> [--resume]`: worktrees from `.repos`, model/effort from the
+  task header, a recorded session id, no start without a free slot.
+- `templates/herd/COMMON.md` is now a short pointer to `templates/herd/rules/` and the `ctx.env`
+  keys.
+- `install.sh` links `herd-phase`, `herd-watch`, `herd-limits`, `herd-recover`, `herd-clash`,
+  `herd-merge`, `herd-context` and `m2herd-migrate` into `~/.local/bin` (idempotent);
+  `--uninstall` now removes only links that point at a `scripts/` file of this skill and keeps
+  links of your own. A leftover `herd-review-mark` is noted, never touched.
+- `herd-spawn` regenerates `<slice>.ctx.worker.md` with `herd-context` before each start when the
+  herd uses it (`ctx.env` or an earlier ctx file), so a fix round started by `herd-watch` carries
+  the befunde file; `HERD_SPAWN_CONTEXT=0` turns it off. The review loop's Start step writes
+  `ctx.reviewer.md` (and `ctx.fixer.md` with `fixBy=fixer`) the same way.
+- A `review_ok` without a recorded `main` sha for one of its repos (a migrated v1 sign-off) shows
+  as stale on the board, never with a merge word — `herd-merge` refuses it.
+- `make test` runs the new offline suites (`make test-herd`); CI runs them too.
+- `__pycache__/` and `*.pyc` are ignored; the tracked bytecode files were removed.
+
+### Removed
+- Retired by v2 (read once by `herd-recover`, never written again): `herd.map`, `active.txt`,
+  `done.txt`, `<slice>.started`, `<slice>.freigabe`, `~/.cache/herd-board/review-state.json`,
+  `herd-review-mark`, hand-written sign-offs.
+
+## [2.9.0] - 2026-10-21
+
+### Added
+- **The herd view (SKILL.md §16.7)** — what a human watching the orchestrator's tab sees,
+  grown over two weeks of daily herds on a production fleet:
+  - `scripts/herd-board`: ONE panel in the right third of the orchestrator tab for herd
+    workers AND the orchestrator's own subagents. Needs-me first, then running, then
+    queued; the pane height is shared evenly (one worker → progress bar, sentence, live
+    processes in plain words and its step feed; ten workers → one line each); never cuts a
+    line with an ellipsis. Footer: *Ready to merge* (open PRs of finished workers, with
+    the orchestrator's sign-off pinned to the PR head sha) and *Merged today*. 16 theme
+    colours with one meaning each, `NO_COLOR` respected. `HERD_BOARD_LANG=de|en`,
+    `HERD_BOARD_ORG`, `HERD_BOARD_REPOS`. Closes itself after 5 idle minutes. A status file
+    that breaks the contract (`null`, a list in `missing`, a number as text) is bent into it,
+    and a failing repaint shows an error line instead of ending the board — a dead board pane
+    made every hook open another one. `herd-board --selftest` checks both (in `make test`/CI).
+  - `scripts/herd-spawn.sh`: starts a worker TUI in the tab `herde` (never as a split
+    beside the orchestrator), hands focus back, writes `herd.map`/`active.txt`, registers
+    the herd with the board. The prompt goes in as argv, so no `agent prompt` can race the
+    TUI; `--permission-mode auto` instead of `--dangerously-skip-permissions`.
+  - `hooks/herd-board-subagents.py`: Claude Code PreToolUse hook (`Agent|Task`) that puts
+    every main-thread subagent on the board; detached, never blocks the call. Silent in a
+    herd worker's pane (listed in a registered `herd.map`), so workers open no boards of their own.
+  - `templates/herd/COMMON.md`: worker rules + the `<slice>.status.json` contract.
+  - `install.sh` links `herd-board`/`herd-spawn` into `~/.local/bin` and registers the
+    hook (skipped with `--no-m2herd-hooks` or without python3).
+- Gotchas from the same fleet: stale `ANTHROPIC_API_KEY` shadowing a working login (silent
+  401 workers), `Connection refused` retry loops reported as `working`, the Codex update
+  prompt blocking workers, memory as the real worker cap (~1.4 GB RSS per Claude TUI),
+  herdr server restart recovery, `herdr update` refusing to run inside a pane, the auto-mode
+  merge gate, reviewer subagents kept off credentials.
+
+### Changed
+- §3/§4 and `reference.md` document the herdr ≥ 0.9 surface: `agent start` needs
+  `--kind` + an existing `--pane` and takes flags only (the binary path became the first
+  prompt), the agent-name pattern `^[a-z][a-z0-9_-]{0,31}$`, and `agent prompt` replacing
+  `agent send`.
+- `install.sh` moves a real file found where a bin symlink goes to `<file>.bak-<ts>`
+  instead of deleting it.
+
+### Fixed
+- `herd-loop.sh` and `fleet-loop.sh` work on herdr 0.9. Both still called the removed
+  `agent start --cwd … -- <binary>` (which on 0.9 fails, or sends the binary path as
+  the first prompt) and `agent send` (gone, failure swallowed by `|| true`, so every
+  pointer was logged as sent and never arrived). They now detect the version once and,
+  on 0.9, open the pane themselves and run `agent start <name> --kind <k> --pane <p>
+  -- <flags>`, then submit with `agent prompt`; older herdr keeps the old calls.
+  Placement follows the herd view: herd-loop workers go to the `herde` tab of the
+  loop's own workspace (a workspace of their own when the loop runs outside herdr),
+  and the workspaces 0.9's `worktree create` opens on the side are closed (the
+  worktree stays on disk); `rotate` opens the successor orchestrator beside the old
+  one; fleet-loop opens each mission orchestrator in a workspace labelled with the
+  mission. Agent names are normalised to `^[a-z][a-z0-9_-]{0,31}$` (hash suffix when
+  cut). `rotate` also never submitted its resume pointer (it sent no Enter) — fixed
+  by the same `agent prompt` path.
+- m2herd dispatch no longer leaves one herdr workspace per worker. herdr 0.9's
+  `worktree create` always opens a workspace (tab + root pane) for the new
+  worktree, and also opens the source repo as a workspace when none has it open.
+  Dispatch now passes `--no-focus`, captures both, and:
+  - pane runner: MOVES the worktree's root pane into the orchestrator tab
+    (`herdr pane move --tab --target-pane --split right|down`), which auto-closes
+    the emptied workspace; workers stay sub-panes of the orchestrator tab
+    (1st → right 50%, then each splits DOWN under the last worker). If the move
+    fails it falls back to the old `pane split` and closes the worktree workspace.
+  - headless runner: closes the worktree workspace right after creation.
+  - orchestrator-unresolved fallback: moves the root pane beside the repo
+    workspace's anchor pane (or splits + closes), and closes the worktree
+    workspace after the last-resort `agent start` too.
+  - a repo workspace that the create call opened as a side effect is closed
+    (except in the fallback, where it is the placement target).
+  Closing a workspace keeps the git worktree on disk; workspaces that existed
+  before the create call, `$HERDR_WORKSPACE_ID`, and any workspace holding
+  `$SELF` are never closed.
+- Pane workers no longer quit at Claude Code's workspace-trust dialog. A fresh
+  worktree is an unseen folder, so Claude opens with "No, exit" preselected; the
+  fixed `sleep 2` let the pointer's Enter pick it, the agent exited, and the retry
+  typed the task line into the bare shell (`bash: syntax error near unexpected
+  token`). Dispatch now waits (≤`M2HERD_BOOT_TIMEOUT`, default 30 s) for the agent
+  to register in its pane, answers the trust prompt only for worktrees it created
+  under `~/.herdr/worktrees`, and records `state=spawned-no-agent` without typing
+  anything when no agent comes up. `submit_pointer` refuses to inject into a pane
+  with no registered agent (except prime, which has no herdr integration).
+- Pane collect works on herdr 0.9: `agent wait --status` was renamed to
+  `--until` (the old flag exits 2 at once, so every pane collect reported a
+  timeout and marked a finished worker failed). Collect now waits
+  `--until idle --until done`, falling back to `--status idle` on older herdr.
+  SKILL.md / reference.md examples updated.
+
+## [2.8.2] - 2026-09-15
+
+### Fixed
+- Compact the `SKILL.md` frontmatter `description` from 1,878 to 978 characters.
+  The value is single-quoted: the compacted text contains `: ` sequences
+  (`machine: spawn`, `Triggers: …`) that YAML would otherwise read as nested
+  mappings, so the plain-scalar form failed to parse.
+  It had grown past the host's 1,024-char skill-description cap (hosts emit a
+  validation warning and load ~2x the description tokens every session). Every
+  trigger phrase from the original is preserved verbatim — section names, the
+  chat-channel/SDD/meta-orchestration/m2herd triggers, and the m2herd doctrine line.
+
+## [2.8.1] - 2026-09-14
+
+### Fixed
+- Detect Pi's installed project-trust and exact-session flags instead of always
+  passing `-a` and `--session-id`; this supports both older `--session` builds
+  and newer Pi releases that advertise `--approve`/`--session-id`.
+- Record the actual detached headless worker PID. Backgrounding the former
+  `cd && nohup ...` compound list could record a short-lived shell wrapper and
+  leave collection observing the wrong process. Detached workers also receive
+  `/dev/null` as stdin so Codex cannot inherit a launcher pipe that disappears
+  before startup completes.
+- Add a herdr-free `m2herd-up selftest` covering both Pi CLI generations and
+  proving the recorded PID belongs to the launched command.
+- Pin CI and release builds to the Go 1.26.5 toolchain used by the committed
+  prebuilts; a floating `stable` compiler made byte-for-byte checks fail whenever
+  Go released a patch update.
+
 ## [2.8.0] - 2026-08-07
 
 Adds **Prime Agent** (Prime Intellect's open-source harness) to the worker selection.

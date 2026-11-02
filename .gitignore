@@ -6,3 +6,5 @@
 .m2herd/
 tui/m2herd-tui
 tui/m2herd-tui-*
+__pycache__/
+*.pyc

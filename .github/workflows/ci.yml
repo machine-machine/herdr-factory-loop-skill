@@ -26,7 +26,13 @@ jobs:
         run: bash scripts/lint.sh
 
       - name: selftest (herdr-free tmpdir end-to-end)
-        run: bash scripts/m2herd.sh selftest
+        run: |
+          bash scripts/m2herd.sh selftest
+          bash scripts/m2herd-up.sh selftest
+          python3 scripts/herd-board --selftest
+
+      - name: herd flow v2 suites (offline)
+        run: make test-herd
 
       - name: hook contract smokes
         run: bash hooks/smoke.sh
@@ -48,7 +54,7 @@ jobs:
 
       - uses: actions/setup-go@v7
         with:
-          go-version: stable
+          go-version-file: .go-version
           cache-dependency-path: tui/go.sum
 
       - name: go build

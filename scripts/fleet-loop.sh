@@ -245,9 +245,8 @@ submit_pane() {
   [ -n "$pane" ] && [ "$pane" != "-" ] && [ "$pane" != "DRYRUN" ] || return 0
   is_self "$pane" && return 0
   if [ "$DRY_RUN" -eq 1 ]; then log "[dry-run] would send to pane $pane: $text"; return 0; fi
-  herdr agent send "$pane" "$text" >/dev/null 2>&1 || true
-  sleep "$SUBMIT_SETTLE"
-  herdr pane send-keys "$pane" Enter >/dev/null 2>&1 || true
+  prompt_agent "$pane" "$text" \
+    || log "! text to pane $pane not accepted (agent blocked or gone?) — the nudge retries next tick"
 }
 
 # Binding rule (mirrors m2herd-up.sh): the pane_id `agent start` returns can be off
@@ -266,6 +265,52 @@ resolve_pane_by_cwd() { # resolve_pane_by_cwd <cwd> [name] -> pane_id (retries; 
     sleep 1
   done
   printf '%s' "$pane"
+}
+
+# ---------- herdr 0.9 shims ------------------------------------------------------
+# herdr 0.9 changed both verbs this loop drives. `agent start` no longer makes a pane:
+# it needs an existing pane at a shell prompt (--pane), picks the binary itself from
+# --kind, and a binary path after `--` would become the agent's first prompt. `agent
+# send` is gone; `agent prompt` types AND submits. Older builds keep the old forms, so
+# detect once and branch. Names must match ^[a-z][a-z0-9_-]{0,31}$ on 0.9 — a name
+# outside it is rejected (a bare ticket number froze a router pane once).
+HERDR_V09=""
+herdr_v09() {
+  if [ -z "$HERDR_V09" ]; then
+    if herdr agent start --help 2>&1 | grep -q -- '--kind'; then HERDR_V09=1; else HERDR_V09=0; fi
+  fi
+  [ "$HERDR_V09" = 1 ]
+}
+agent_name() { # agent_name <raw> -> a name herdr accepts (lowercased, [a-z0-9_-], ≤32, hash-suffixed when cut)
+  local n; n="$(printf '%s' "$1" | tr 'A-Z' 'a-z' | tr -c 'a-z0-9_-' '-')"
+  case "$n" in [a-z]*) ;; *) n="a-$n" ;; esac
+  [ "${#n}" -le 32 ] || n="${n:0:27}-$(printf '%s' "$1" | cksum | cut -c1-4)"
+  printf '%s' "$n"
+}
+agent_kind() { # agent_kind <bin> -> herdr --kind, or empty when herdr has no such kind
+  local k; k="$(basename "$1")"; [ "$k" = cursor-agent ] && k=cursor
+  herdr agent start --help 2>&1 | grep -o 'possible values: [^]]*' | head -1 \
+    | sed 's/possible values: //' | tr -d ' ' | tr ',' '\n' | grep -qx "$k" && printf '%s' "$k" || true
+}
+# start_agent <pane> <name> <bin> [flag] — 0.9 only: bring the agent up in an existing pane.
+# A kind herdr does not know is run as a plain command; detection still lists it.
+start_agent() {
+  local pane="$1" name="$2" bin="$3" flag="${4:-}" kind
+  kind="$(agent_kind "$bin")"
+  if [ -n "$kind" ]; then
+    # shellcheck disable=SC2086  # $flag is a flag list, split on purpose
+    herdr agent start "$name" --kind "$kind" --pane "$pane" -- $flag >/dev/null 2>&1
+  else
+    herdr pane run "$pane" "$(command -v "$bin")${flag:+ $flag}" >/dev/null 2>&1
+  fi
+}
+# prompt_agent <pane> <text> — submit one line. `agent prompt` submits by itself; the
+# pre-0.9 `agent send` only types, so that path still settles and presses Enter.
+prompt_agent() {
+  herdr agent prompt "$1" "$2" >/dev/null 2>&1 && return 0
+  herdr agent send "$1" "$2" >/dev/null 2>&1 || return 1
+  sleep "$SUBMIT_SETTLE"
+  herdr pane send-keys "$1" Enter >/dev/null 2>&1 || true
 }
 
 # ---------- inbox / steering (same vocabulary as herd-loop.sh) ----------------
@@ -386,12 +431,24 @@ launch_mission() {
   fi
   # launch the orchestrator agent in its repo (NOT a worktree — the orchestrator itself
   # creates per-worker worktrees via its herd-loop). Unique herdr name per mission.
-  local reported pane
-  reported="$(herdr agent start "$orch-orch-$mission" --cwd "$repo" --no-focus -- "$(command -v "$bin")" $flag 2>/dev/null | jq -r '.result.agent.pane_id // empty')"
-  pane="$(resolve_pane_by_cwd "$repo" "$orch-orch-$mission")"
-  if [ -z "$pane" ]; then
-    pane="$reported"
-    [ -n "$pane" ] && [ "$pane" != "null" ] && log "! $mission: could not re-resolve pane by cwd — falling back to reported id $pane"
+  local reported pane name; name="$(agent_name "$orch-orch-$mission")"
+  if herdr_v09; then
+    # 0.9: one workspace per mission, labelled with it. The mission orchestrator's own
+    # herd-loop then opens its workers in that workspace's "herde" tab, so missions
+    # never share a tab. The pane is ours, so its id is authoritative.
+    pane="$(herdr workspace create --cwd "$repo" --label "$mission" --no-focus 2>/dev/null | jq -r '.result.root_pane.pane_id // empty' || true)"
+    if [ -n "$pane" ] && ! start_agent "$pane" "$name" "$bin" "$flag"; then
+      log "! $mission: agent start failed in pane $pane — closing its workspace"
+      herdr workspace close "${pane%%:*}" >/dev/null 2>&1 || true
+      pane=""
+    fi
+  else
+    reported="$(herdr agent start "$name" --cwd "$repo" --no-focus -- "$(command -v "$bin")" $flag 2>/dev/null | jq -r '.result.agent.pane_id // empty')"
+    pane="$(resolve_pane_by_cwd "$repo" "$name")"
+    if [ -z "$pane" ]; then
+      pane="$reported"
+      [ -n "$pane" ] && [ "$pane" != "null" ] && log "! $mission: could not re-resolve pane by cwd — falling back to reported id $pane"
+    fi
   fi
   [ -n "$pane" ] && [ "$pane" != "null" ] || { log "! $mission: orchestrator start failed"; ledger_add "$mission" "$orch" "" "$repo" "$herd_ws" "no" "error" "no"; return; }
   local brief; brief="$(gen_brief "$mission" "$repo" "$herd_ws" "$intent" "$done_when")"

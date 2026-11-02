@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""herd-watch — the herd's long-running starter and watcher (docs/herd-flow-v2.md §4).
+
+  herd-watch <herd> [--once] [--interval S]
+  herd-watch --selftest
+
+Runs until killed (one tick every HERD_WATCH_INTERVAL s, default 60); it never exits on an event. Each tick:
+
+1. Watches every slice whose last phase is `working` (pane from its event, status from `herdr agent list`):
+   - reported: `<slice>.out.md` written after the working event, herdr status `idle` or `done`, and no
+     process left in its worktrees (claude and MCP servers excluded) — or the pane closed after the report;
+   - blocked: herdr status `blocked`;
+   - gone: the pane is neither in `herdr agent list` nor in `herdr pane list`, HERD_WATCH_GRACE s
+     (default 180) after the start, without a report (a disturbance the orchestrator must see too).
+   Each transition wakes the orchestrator with ONE `herdr agent prompt` to the pane in HERD_ORCH_PANE (no
+   variable: logged only). De-duplicated per working round: `reported`/`gone` once, `blocked` once per
+   episode (unblocked and blocked again wakes again). A failed prompt is retried next tick.
+2. Starts at most one slice per tick (each start is a memory spike; herdr also needs a moment to show
+   the new agent to herd-limits): `fix_queued` first (oldest first, resumed in their session), then
+   `queued` (by `pos`, then age). A queued slice with `stacked_on` waits until every base slice is at
+   least `accepted` (accepted, review_running, review_ok or merged). The budget is `herd-limits`. A start
+   that fails stays queued: the error goes to the log and the slice is retried next tick, while the next
+   candidate gets its chance. A queued slice that already ran (a working event with a session_id in its
+   history, e.g. parked after a crash and re-queued) is resumed with --resume.
+
+The herde tab is found by its label inside herd-spawn/herd-limits (HERD_SPAWN_TAB), never by id.
+Log: <herd>/watch.log (HERD_WATCH_LOG). Wake de-dup state and the one-watcher lock live in
+HERD_STATE_DIR (default ~/.m2herd/state/herd-watch). HERD_SPAWN_CMD replaces `herd-spawn.sh` (tests).
+"""
+import calendar
+import fcntl
+import hashlib
+import json
+import os
+import re
+import shlex
+import signal
+import subprocess
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import herd_events as he  # noqa: E402
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+AT_LEAST_ACCEPTED = {"accepted", "review_running", "review_ok", "merged"}
+IDLE = {"idle", "done"}
+
+
+def log(herd, msg):
+    line = f"{time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())} {msg}"
+    print(line, flush=True)
+    try:
+        with open(os.environ.get("HERD_WATCH_LOG") or os.path.join(herd, "watch.log"), "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+
+
+def herdr(*args, timeout=10):
+    r = subprocess.run(["herdr", *args], capture_output=True, text=True, timeout=timeout)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or r.stdout).strip()[:300] or f"exit {r.returncode}")
+    return r.stdout
+
+
+def live_view():
+    """(agents by pane, set of pane ids) or (None, None) when herdr cannot be read — then nothing is 'gone'."""
+    try:
+        agents = {a["pane_id"]: a for a in json.loads(herdr("agent", "list"))["result"]["agents"]}
+        panes = {p["pane_id"] for p in json.loads(herdr("pane", "list"))["result"]["panes"]}
+        return agents, panes
+    except (RuntimeError, ValueError, KeyError, OSError, subprocess.TimeoutExpired):
+        return None, None
+
+
+def procs_in(roots):
+    """Command lines of processes whose cwd lies in one of the worktrees (claude itself and MCP excluded)."""
+    roots = [r.rstrip("/") for r in roots if r]
+    found = []
+    if not roots:
+        return found
+    for pid in os.listdir("/proc"):
+        if not pid.isdigit():
+            continue
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+            if not any(cwd == r or cwd.startswith(r + "/") for r in roots):
+                continue
+            args = open(f"/proc/{pid}/cmdline", "rb").read().replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:
+            continue
+        first = os.path.basename(args.split(" ")[0]) if args else ""
+        if not args or "claude" in first or re.search(r"mcp|hermes", args) or first in ("bash", "sh", "zsh", "fish"):
+            continue
+        found.append(args)
+    return found
+
+
+def ts_epoch(ts):
+    try:
+        return float(calendar.timegm(time.strptime(ts, "%Y-%m-%dT%H:%M:%SZ")))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+class Watch:
+    def __init__(self, herd):
+        self.herd = os.path.abspath(herd)
+        self.name = os.path.basename(self.herd)
+        sdir = os.path.expanduser(os.environ.get("HERD_STATE_DIR") or "~/.m2herd/state/herd-watch")
+        os.makedirs(sdir, exist_ok=True)
+        key = f"{self.name}-{hashlib.sha1(self.herd.encode()).hexdigest()[:8]}"
+        self.state_file = os.path.join(sdir, key + ".json")
+        self.lock_file = os.path.join(sdir, key + ".lock")
+        self.grace = float(os.environ.get("HERD_WATCH_GRACE", "180"))
+        self.orch = os.environ.get("HERD_ORCH_PANE", "")
+        self.last_wait = None
+        try:
+            self.mem = json.load(open(self.state_file, encoding="utf-8"))
+        except (OSError, ValueError):
+            self.mem = {}
+        self.mem.setdefault("woken", {})     # "slice|kind|round" -> ts
+        self.mem.setdefault("blocked", [])   # "slice|round" currently blocked (already woken)
+
+    def save(self):
+        tmp = self.state_file + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.mem, f, indent=1)
+        os.replace(tmp, self.state_file)
+
+    # --- waking -------------------------------------------------------------------------------------------------
+    def wake(self, s, kind, text):
+        if not self.orch:
+            log(self.herd, f"{kind.upper()} {s}: {text} (HERD_ORCH_PANE unset, nobody woken)")
+            return True
+        msg = f"herd-watch {self.name}: {s} {kind} — {text}"
+        try:
+            herdr("agent", "prompt", self.orch, msg, timeout=20)
+        except (RuntimeError, OSError, subprocess.TimeoutExpired) as e:
+            log(self.herd, f"WAKE FAILED {s} {kind} to {self.orch}: {e} (retry next tick)")
+            return False
+        log(self.herd, f"{kind.upper()} {s}: woke {self.orch}")
+        return True
+
+    def once(self, s, kind, rnd, text):
+        key = f"{s}|{kind}|{rnd}"
+        if key in self.mem["woken"]:
+            return
+        if self.wake(s, kind, text):
+            self.mem["woken"][key] = he.now()
+
+    def observe(self, st, agents, panes):
+        if agents is None:
+            log(self.herd, "herdr unreadable this tick — nothing judged gone")
+        blocked_now = set()
+        for s, ev in sorted(st.items()):
+            if ev["phase"] != "working":
+                continue
+            # a migrated v1 round started before its event was written: started_at keeps the real start
+            rnd, pane = ev.get("started_at") or ev.get("ts", ""), ev.get("pane", "")
+            out = os.path.join(self.herd, f"{s}.out.md")
+            reported = os.path.exists(out) and os.path.getmtime(out) >= ts_epoch(rnd)
+            if agents is None:
+                continue
+            a = agents.get(pane)
+            status = a.get("agent_status") if a else None
+            if status == "blocked":
+                blocked_now.add(f"{s}|{rnd}")
+                if f"{s}|{rnd}" not in self.mem["blocked"]:
+                    if self.wake(s, "blocked", f"herdr reports blocked in {pane}; answer it there"):
+                        self.mem["blocked"].append(f"{s}|{rnd}")
+                    else:
+                        blocked_now.discard(f"{s}|{rnd}")
+                continue
+            if reported and (status in IDLE or (a is None and pane not in panes)):
+                busy = procs_in(ev.get("wt") or []) if a else []
+                if not busy:
+                    self.once(s, "reported", rnd, f"{s}.out.md written, agent {status or 'pane closed'}; read it and accept or send back")
+                continue
+            if a is None and pane not in panes and time.time() - ts_epoch(rnd) > self.grace:
+                self.once(s, "gone", rnd, f"pane {pane} is gone without a report; run herd-recover {self.herd} "
+                          "(parks and re-queues it; herd-watch then resumes its session)")
+        # an episode ends when the agent is no longer blocked: the next block wakes again
+        if agents is not None:
+            self.mem["blocked"] = [k for k in self.mem["blocked"] if k in blocked_now]
+        # de-dup keys only matter for the current working round of a slice
+        live = {f"{s}|{ev.get('started_at') or ev.get('ts', '')}" for s, ev in st.items() if ev["phase"] == "working"}
+        self.mem["woken"] = {k: v for k, v in self.mem["woken"].items()
+                             if f"{k.split('|')[0]}|{k.split('|', 2)[2]}" in live}
+
+    # --- starting -----------------------------------------------------------------------------------------------
+    def candidates(self, st):
+        fixq = sorted((ev.get("since") or "", s) for s, ev in st.items() if ev["phase"] == "fix_queued")
+        q = sorted(((ev.get("pos") if isinstance(ev.get("pos"), int) else 1 << 30), ev.get("since") or "", s)
+                   for s, ev in st.items() if ev["phase"] == "queued")
+        return [(s, "fix_queued") for _, s in fixq] + [(s, "queued") for _, _, s in q]
+
+    def gate(self, st, s, phase):
+        """None when the slice may start, else the reason it waits."""
+        if phase == "fix_queued":
+            return None
+        bases = [b.strip() for b in he.task_header(self.herd, s).get("stacked_on", "").split(",") if b.strip()]
+        for b in bases:
+            bp = (st.get(b) or {}).get("phase")
+            if bp not in AT_LEAST_ACCEPTED:
+                return f"base {b} is {bp or 'not started'}, needs at least accepted"
+        return None
+
+    def spawn_cmd(self, s, resume):
+        base = shlex.split(os.environ["HERD_SPAWN_CMD"]) if os.environ.get("HERD_SPAWN_CMD") else \
+            [os.path.join(HERE, "herd-spawn.sh")]
+        return base + [self.herd, s] + (["--resume"] if resume else [])
+
+    def start_next(self, st):
+        waits = []
+        for s, phase in self.candidates(st):
+            why = self.gate(st, s, phase)
+            if why:
+                waits.append(f"{s}: {why}")
+                continue
+            lim = subprocess.run([os.path.join(HERE, "herd-limits"), self.herd], capture_output=True, text=True)
+            if lim.returncode != 0:
+                waits.append(f"{s}: {' '.join((lim.stdout + lim.stderr).split())}")
+                break   # no slot for anyone
+            resume = phase == "fix_queued" or any(
+                e["slice"] == s and e["phase"] == "working" and e.get("session_id") for e in he.read(self.herd))
+            env = dict(os.environ, HERD_SPAWN_BY="watch")
+            r = subprocess.run(self.spawn_cmd(s, resume), capture_output=True, text=True, env=env, timeout=600)
+            if r.returncode == 0:
+                log(self.herd, f"STARTED {s} ({phase}{', resume' if resume else ''}): {r.stdout.strip()[-300:]}")
+                self.last_wait = None
+                return s
+            log(self.herd, f"START FAILED {s} (exit {r.returncode}, stays {phase}, retry next tick): "
+                           f"{' '.join((r.stderr or r.stdout).split())[-400:]}")
+        wait = "; ".join(waits)
+        if wait and wait != self.last_wait:
+            log(self.herd, f"WAITING {wait}")
+        self.last_wait = wait
+        return None
+
+    def tick(self):
+        st = he.state(self.herd)
+        agents, panes = live_view()
+        self.observe(st, agents, panes)
+        self.start_next(st)
+        self.save()
+
+
+def main(argv):
+    if argv[:1] in (["-h"], ["--help"]):
+        print(__doc__.strip())
+        return 0
+    if argv[:1] == ["--selftest"]:
+        return subprocess.call([sys.executable, os.path.join(HERE, "..", "tests", "spawnwatch", "test_spawnwatch.py"),
+                                "-k", "Watch"])
+    herd, once = None, False
+    interval = float(os.environ.get("HERD_WATCH_INTERVAL", "60"))
+    rest = list(argv)
+    while rest:
+        a = rest.pop(0)
+        if a == "--once":
+            once = True
+        elif a == "--interval" and rest:
+            interval = float(rest.pop(0))
+        elif not a.startswith("-") and herd is None:
+            herd = a
+        else:
+            print(f"herd-watch: unknown argument {a!r} (see --help)", file=sys.stderr)
+            return 2
+    if not herd or not os.path.isdir(herd):
+        print("herd-watch: usage: herd-watch <herd> [--once] [--interval S]", file=sys.stderr)
+        return 2
+    w = Watch(herd)
+    lock = open(w.lock_file, "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print(f"herd-watch: another herd-watch already watches {w.herd}", file=sys.stderr)
+        return 3
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
+    log(w.herd, f"herd-watch up (interval {interval:g}s, orchestrator {w.orch or 'none'})")
+    while True:
+        try:
+            w.tick()
+        except Exception as e:  # one bad tick is logged, the watcher keeps running
+            log(w.herd, f"TICK ERROR {type(e).__name__}: {e}")
+        if once:
+            return 0
+        time.sleep(interval)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except KeyboardInterrupt:
+        sys.exit(0)

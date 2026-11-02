@@ -595,3 +595,22 @@ orchestrator's, at collect time.
 - templates/m2herd/ ships RESUME.md, NOTES.md, overview.json seeds with a `<!-- marker -->` line
   separating template boilerplate from live content (same pattern as STEER.md).
 - Run your selftest/smoke BEFORE committing; commit on your branch with message `m2herd/<slice>: <summary>`.
+
+## Amendment v2.10 — herd flow v2 (pointer, 2026-10-23)
+
+The herd pieces (events, slice header, board lanes, spawn/watch/limits/clash/context/merge/recover,
+review loop, role rules, model table, `.m2herd` layout v2 and `m2herd-migrate`) are specified in
+**`docs/herd-flow-v2.md`**, which is binding for them and is not repeated here. What it changes for
+this contract:
+
+- Herd state is `<herd>/herd.events.jsonl`, written only through `herd-phase`; the v1 herd files
+  (`herd.map`, `active.txt`, `done.txt`, `<slice>.started`, `<slice>.freigabe`) are retired and read
+  once by `herd-recover`.
+- Herd dirs move from `.m2herd/dispatch/<herd>/` to `.m2herd/herden/<herd>/`; run data and runtime
+  state leave the fabric for `~/.cache/m2herd/<project>/` and `~/.m2herd/state/<project>/`.
+  Single-slice dispatch (`.m2herd/dispatch/<slice>.task.md`, above) is unchanged. The trace bundles
+  `.m2herd/runs/` (Amendment v2.1 §1) are run data in the v2 layout, but `m2herd-up.sh` and
+  `m2herd.sh evolve` still name that path, so `m2herd-migrate` lists them as readers and refuses to
+  move `runs/` until the engine reads it from the cache (or `--force-readers`).
+- Worker rules come from `templates/herd/rules/` (project overrides in `.m2herd/rules/`), filled by
+  `herd-context`; per-herd COMMON chains are no longer written.
