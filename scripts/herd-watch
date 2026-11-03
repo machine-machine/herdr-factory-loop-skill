@@ -23,7 +23,7 @@ Runs until killed (one tick every HERD_WATCH_INTERVAL s, default 60); it never e
    candidate gets its chance. A queued slice that already ran (a working event with a session_id in its
    history, e.g. parked after a crash and re-queued) is resumed with --resume.
 
-The herde tab is found by its label inside herd-spawn/herd-limits (HERD_SPAWN_TAB), never by id.
+The herd tab is found by its label inside herd-spawn/herd-limits (HERD_SPAWN_TAB), never by id.
 Log: <herd>/watch.log (HERD_WATCH_LOG). Wake de-dup state and the one-watcher lock live in
 HERD_STATE_DIR (default ~/.m2herd/state/herd-watch). HERD_SPAWN_CMD replaces `herd-spawn.sh` (tests).
 """

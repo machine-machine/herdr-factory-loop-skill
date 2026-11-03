@@ -80,7 +80,7 @@ board() { HERD_BOARD_DETAIL=1 PATH="$T/fake:$BASEPATH" "$T/board/herd-board" "$@
 phase() { PATH="$T/fake:$BASEPATH" "$T/board/herd-phase" "$@" >/dev/null; }
 
 # --- a v2 herd written through herd-phase ----------------------------------------------------------------------
-H="$T/herde-v2"; mkdir -p "$H"
+H="$T/herd-v2"; mkdir -p "$H"
 for s in run blk rep; do mkdir -p "$T/wt/acme-api/$s"; done
 phase "$H" q1 queued --field pos=1
 phase "$H" run working --field pane=w1:p1 --field model=claude-opus-5-5 --field effort=high \
@@ -100,7 +100,7 @@ phase "$H" fx review_befund --field befunde_file=fx.befunde-abc1234.md; phase "$
 if phase "$H" q1 merged 2>/dev/null; then bad "herd-phase refuses queued -> merged"; else ok "herd-phase refuses queued -> merged"; fi
 
 # --- a v1 herd: herd.map only ----------------------------------------------------------------------------------
-V1="$T/herde-v1"; mkdir -p "$V1"
+V1="$T/herd-v1"; mkdir -p "$V1"
 echo "old=w0:p9" >"$V1/herd.map"
 echo '{"satz": "alter Worker", "schritt": 2, "von": 4}' >"$V1/old.status.json"
 
@@ -122,7 +122,7 @@ has "working: progress bar" "███░░░░░░░ 1/3"
 has "reported: thin ✓" "✓ rep prüfe ich S·md"
 has "ready: stale by PR head" "⟳ stp veraltet: api#30 hat neue Commits"
 has "merged today from the search" "Heute gemergt 77"
-has "v1 fallback line" "herde-v1: v1-Herde — herd-recover migriert"
+has "v1 fallback line" "herd-v1: v1-Herd — herd-recover migriert"
 has "v1 row the old way" "● old alter Worker"
 if grep -q $'\033' <<<"$OUT"; then bad "NO_COLOR: no escape codes"; else ok "NO_COLOR: no escape codes"; fi
 if grep -v '^herdr agent list$' "$T/calls.log" | grep -q '^herdr'; then

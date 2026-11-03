@@ -36,13 +36,13 @@ fi
 # 5. version field, if present, looks like semver
 if grep -q '^version:' skill/SKILL.md; then
   VER=$(awk '/^---$/{c++; next} c==1 && /^version:/{print $2}' skill/SKILL.md | tr -d '"' | tr -d "'")
-  if ! echo "$VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
-    err "version '$VER' is not valid semver (X.Y.Z)"
+  if ! echo "$VER" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$'; then
+    err "version '$VER' is not valid semver (X.Y.Z or X.Y.Z-pre)"
   fi
   ok "version field is valid semver: $VER"
   # If CHANGELOG exists, the most recent version header should match
   if [ -f CHANGELOG.md ]; then
-    LATEST=$(grep -E '^## \[[0-9]+\.[0-9]+\.[0-9]+\]' CHANGELOG.md | head -1 | sed -E 's/^## \[([^]]+)\].*/\1/' || true)
+    LATEST=$(grep -E '^## \[[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?\]' CHANGELOG.md | head -1 | sed -E 's/^## \[([^]]+)\].*/\1/' || true)
     if [ -z "$LATEST" ]; then
       err "CHANGELOG.md has no '## [x.y.z]' version header — add one (latest release first) matching skill version $VER"
     fi

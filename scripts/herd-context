@@ -50,7 +50,7 @@ ROLES = ("worker", "reviewer", "fixer")
 HERD_ROLES = ("orchestrator", "herd-cut")
 STOP = {"the", "and", "for", "with", "from", "into", "that", "this", "eine", "einer", "einen", "einem", "und",
         "oder", "der", "die", "das", "den", "dem", "des", "mit", "für", "von", "auf", "aus", "bei", "nach",
-        "ist", "sind", "wird", "werden", "nicht", "auch", "noch", "task", "slice", "herde", "worker"}
+        "ist", "sind", "wird", "werden", "nicht", "auch", "noch", "task", "slice", "herd", "herde", "worker"}
 
 
 def sh(cmd, cwd=None, timeout=60):

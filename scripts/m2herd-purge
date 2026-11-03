@@ -981,13 +981,13 @@ def selftest():
         w("dispatch/screens/s-old/1.png", "png", old)
         w("dispatch/screens/s-mid/1.png", "png", mid)
         w("dispatch/screens/s-new/1.png", "png")
-        w("dispatch/herde-0101/a.task.md", "t\n", old)                # merged 20 d ago
-        w("dispatch/herde-0101/herd.events.jsonl",
+        w("dispatch/herd-0101/a.task.md", "t\n", old)                # merged 20 d ago
+        w("dispatch/herd-0101/herd.events.jsonl",
           json_line(slice="a", phase="merged", ts=iso(now - 20 * 86400)), old)
-        w("dispatch/herde-0101/screens/x.png", "png", mid)
-        w("dispatch/herde-0202/a.task.md", "needs dispatch/live-ref.md\n", old)     # still working
-        w("dispatch/herde-0202/herd.events.jsonl", json_line(slice="a", phase="working", ts=iso(old)), old)
-        w("dispatch/herde-0202/screens/y.png", "png", old)
+        w("dispatch/herd-0101/screens/x.png", "png", mid)
+        w("dispatch/herd-0202/a.task.md", "needs dispatch/live-ref.md\n", old)     # still working
+        w("dispatch/herd-0202/herd.events.jsonl", json_line(slice="a", phase="working", ts=iso(old)), old)
+        w("dispatch/herd-0202/screens/y.png", "png", old)
         w("dispatch/live-ref.md", "r\n", old)
         w("stale.lock", "", old)
         os.makedirs(os.path.join(m, "empty-old"))
@@ -1015,8 +1015,8 @@ def selftest():
         check("old screens deleted in place", "DELETE  dispatch/screens/s-old/" in txt, txt)
         check("mid screens move", "MOVE    dispatch/screens/s-mid/ -> " in txt and "cache/proj/screens/s-mid/" in txt, txt)
         check("fresh screens stay", "s-new" not in txt, txt)
-        check("merged herd screens deleted", "DELETE  dispatch/herde-0101/screens/x.png" in txt, txt)
-        check("live herd untouched", "herde-0202" not in txt.split("totals")[0], txt)
+        check("merged herd screens deleted", "DELETE  dispatch/herd-0101/screens/x.png" in txt, txt)
+        check("live herd untouched", "herd-0202" not in txt.split("totals")[0], txt)
         check("cache old deleted, new kept", "c-old/" in txt and "c-new" not in txt and "README" not in txt, txt)
         check("pycache, stale lock, empty dir", "dispatch/__pycache__/" in txt and "DELETE  stale.lock" in txt
               and "RMDIR   empty-old/" in txt, txt)

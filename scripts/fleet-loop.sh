@@ -434,7 +434,7 @@ launch_mission() {
   local reported pane name; name="$(agent_name "$orch-orch-$mission")"
   if herdr_v09; then
     # 0.9: one workspace per mission, labelled with it. The mission orchestrator's own
-    # herd-loop then opens its workers in that workspace's "herde" tab, so missions
+    # herd-loop then opens its workers in that workspace's "herd" tab, so missions
     # never share a tab. The pane is ours, so its id is authoritative.
     pane="$(herdr workspace create --cwd "$repo" --label "$mission" --no-focus 2>/dev/null | jq -r '.result.root_pane.pane_id // empty' || true)"
     if [ -n "$pane" ] && ! start_agent "$pane" "$name" "$bin" "$flag"; then
@@ -611,13 +611,17 @@ tick() {
         abandoned) : ;;
       esac
     done < <(awk -F'\t' 'NR>1' "$(LEDGER)")
-    # complete when every desired (well-formed) mission is collected (or terminal)
+    # complete when every desired (well-formed) mission is collected (or terminal). An empty
+    # missions.tsv is not a finished portfolio: it waits for the human/meta to define the missions.
     complete=1
+    local desired=0
     while IFS=$'\t' read -r mission _; do
       [ -n "$mission" ] || continue
+      desired=$((desired + 1))
       local c s; c="$(ledger_get "$mission" 8)"; s="$(ledger_get "$mission" 7)"
       [ "$c" = "yes" ] || [ "$s" = "abandoned" ] || [ "$s" = "error" ] || complete=0
     done < <(grep -vE '^\s*#|^\s*$' "$missions" | awk -F'\t' 'NF>=5')
+    if [ "$desired" -eq 0 ]; then echo "STATUS: AWAITING_SOLO (fill missions.tsv)"; return 0; fi
     if [ -f "$(FLEET_STATE)/.needs_review" ]; then echo "STATUS: NEEDS_REVIEW"; return 0; fi
     [ "$complete" -eq 1 ] || { echo "STATUS: RECONCILED"; return 0; }
   else

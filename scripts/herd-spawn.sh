@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # herd-spawn <herd> <slice> [--resume] [--no-limits]   (docs/herd-flow-v2.md §4)
 #
-# Starts one herd worker ALWAYS in the tab "herde" of the anchor's workspace, never as a split in the
+# Starts one herd worker ALWAYS in the tab "herd" of the anchor's workspace, never as a split in the
 # orchestrator tab (that tab holds only the orchestrator and its herd-board). The tab is found by its label and
 # created when missing; further workers split the TALLEST pane of the tab (down, or right once it has < 24
 # rows — splitting under the last worker shrank panes to 0 rows, and 0-row panes cannot resume after a herdr
@@ -25,7 +25,7 @@
 #
 # Environment:
 #   HERD_ANCHOR             orchestrator pane (default: HERD_ORCH_PANE, then HERDR_PANE_ID)
-#   HERD_SPAWN_TAB          tab label (default: herde)
+#   HERD_SPAWN_TAB          tab label (default: herd; an existing pre-3.0 `herde` tab is reused)
 #   HERD_SPAWN_BY           `by` of the working event (default orchestrator; herd-watch sets watch)
 #   HERD_WT_ROOT            worktree root (default ~/.herdr/worktrees)
 #   HERD_SETUP              worktree setup command (see above)
@@ -62,7 +62,8 @@ herd=$(cd "$herd" && pwd)   # panes and the board need absolute paths
 anchor=${HERD_ANCHOR:-${HERD_ORCH_PANE:-${HERDR_PANE_ID:-}}}
 [ -n "$anchor" ] || die "no anchor pane: run from inside a herdr pane or set HERD_ANCHOR"
 ws=${anchor%%:*}
-label=${HERD_SPAWN_TAB:-herde}
+label=${HERD_SPAWN_TAB:-herd}
+legacy=""; [ -n "${HERD_SPAWN_TAB:-}" ] || legacy=herde   # `herde` is the pre-3.0 label
 [ -f "$herd/$slice.task.md" ] || die "$slice.task.md missing in $herd"
 
 # --- the slice as declared + its event history (via herd_events, never parsed twice) ---------------------------
@@ -198,15 +199,16 @@ if [ "$resume" = 1 ] && [ -n "$last_pane" ]; then
   fi
 fi
 
-# --- otherwise place a new pane in the herde tab ---------------------------------------------------------------
+# --- otherwise place a new pane in the herd tab -----------------------------------------------------------------
 created=0
 if [ -z "$pane" ]; then
-  tab=$(hj tab list | jq -r --arg ws "$ws" --arg l "$label" '.result.tabs[] | select(.workspace_id==$ws and .label==$l) | .tab_id' | head -1)
+  tab=$(hj tab list | jq -r --arg ws "$ws" --arg l "$label" --arg o "$legacy" \
+    '[.result.tabs[] | select(.workspace_id==$ws and (.label==$l or ($o != "" and .label==$o)))] | sort_by(.label != $l) | .[0].tab_id // empty')
   big=""; rows=0
   if [ -n "$tab" ]; then
     read -r big rows < <(hj pane list | jq -r --arg t "$tab" '[.result.panes[] | select(.tab_id==$t)] | max_by(.scroll.viewport_rows // 0) | if . then "\(.pane_id) \(.scroll.viewport_rows // 0)" else "" end') || true
   fi
-  if [ -z "$big" ]; then   # no herde tab (or an empty one about to close)
+  if [ -z "$big" ]; then   # no herd tab (or an empty one about to close)
     # first worker: open a pane next to the anchor, then move it straight into a new tab
     pane=$(hj pane split --pane "$anchor" --direction right --cwd "$first" --no-focus | jq -r '.result.pane.pane_id')
     tab=$(hj pane move "$pane" --new-tab | jq -r '.result.move_result.created_tab.tab_id')

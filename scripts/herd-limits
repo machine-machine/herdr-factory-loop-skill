@@ -14,10 +14,10 @@ what the environment leaves unset, then the defaults:
   HERD_MAX_LOAD     default cores x 2.5 (1-minute load average)
 
 What counts as a used slot:
-  - every herdr agent in the tab labelled HERD_SPAWN_TAB (default `herde`) of the anchor's workspace whose
+  - every herdr agent in the tab labelled HERD_SPAWN_TAB (default `herd`) of the anchor's workspace whose
     status is `working` or `blocked` (a blocked worker resumes as soon as it is answered, so it keeps its
     slot); `idle`/`done` workers do not count — their memory is covered by HERD_MIN_FREE_MB. Without an
-    anchor, `herde` tabs of every workspace count.
+    anchor, `herd` tabs of every workspace count. With the default label a pre-3.0 `herde` tab counts too.
   - review agents: running agents of the anchor's Workflow runs registered in
     ~/.cache/herd-board/<anchor>.agents/ (the herd-board registry: a file per run whose second line is the
     run dir; an agent runs while its journal has `started` without `result` and its transcript moved within
@@ -72,11 +72,11 @@ def herdr_json(*args):
     return json.loads(r.stdout)["result"]
 
 
-def herde_workers(anchor, label):
-    """Agents in the herde tab(s) that hold a slot: [(pane, status)]."""
+def herd_workers(anchor, labels):
+    """Agents in the herd tab(s) that hold a slot: [(pane, status)]."""
     ws = anchor.split(":", 1)[0] if anchor else None
     tabs = {t["tab_id"] for t in herdr_json("tab", "list").get("tabs", [])
-            if t.get("label") == label and (ws is None or t.get("workspace_id") == ws)}
+            if t.get("label") in labels and (ws is None or t.get("workspace_id") == ws)}
     return [(a["pane_id"], a.get("agent_status")) for a in herdr_json("agent", "list").get("agents", [])
             if a.get("tab_id") in tabs and a.get("agent_status") in ("working", "blocked")]
 
@@ -136,8 +136,9 @@ def load1():
 def check(herd=None, anchor=None, plus=0):
     """dict with the measurement and `ok`/`reasons`; raises RuntimeError when herdr cannot be read."""
     max_slots, min_free, max_load = limits(herd)
-    label = os.environ.get("HERD_SPAWN_TAB", "herde")
-    workers = herde_workers(anchor, label)
+    label = os.environ.get("HERD_SPAWN_TAB")
+    labels = {label} if label else {"herd", "herde"}   # `herde` is the pre-3.0 label
+    workers = herd_workers(anchor, labels)
     reviews = review_agents(anchor)
     used = len(workers) + reviews + plus
     mb, load = free_mb(), load1()

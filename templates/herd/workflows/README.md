@@ -39,7 +39,8 @@ and these `args` (as a JSON object, not a string):
       "tests": {"acme/api": ".venv/bin/python -m pytest -q -p no:cacheprovider", "acme/ui": "npx tsc --noEmit && npm run lint"},
       "fixBy": "worker",
       "reviewModel": "other",
-      "stale": "delta"
+      "stale": "delta",
+      "blind": false
     }
 
 - `groups` is every open package **in planned merge order** — the integration probe uses it as the
@@ -54,9 +55,16 @@ and these `args` (as a JSON object, not a string):
   a local `.env`), `HERD_REPO`, `HERD_SLICE`, `HERD_SHA`. Keys match the full repo, its basename or
   `short`. Same lookup for `tests`.
 - Optional: `herdPhase` (command, default `herd-phase`; unquoted, so `python3 /path/herd-phase` works),
-  `maxFix` (3), `models` (`{opus, fable}` ids), `hot` (`{repo: [regex]}` extra hot-file patterns),
+  `maxFix` (3), `models` (`{opus, fable, goldfish}` ids; `goldfish` defaults to the main reviewer's model rule), `hot` (`{repo: [regex]}` extra hot-file patterns),
   `rules` (one paragraph of project rules appended to every prompt), `register` (decisions register
   path), `lang` (findings language, default English), `git` (`{name, email, coauthor}` for fixer commits).
+- `blind` (default `false` in 3.0.0-alpha; the spec's env name is `HERD_REVIEW_BLIND`): `true` starts a
+  goldfish reviewer beside each main reviewer. It gets the slice's `<slice>.task.md` (requirement
+  text, acceptance criteria), the pinned diff and the repo — never the worker's report, the
+  `ctx.reviewer` file, earlier findings or the PR text (`templates/herd/rules/GOLDFISH.md`). Its
+  findings carry `source: blind` and go through the same two skeptics; one that matches a main
+  finding (same file and title) is kept once, marked `also_blind`. A goldfish that returns nothing
+  is logged and does not block.
 - `run_id`: pass something unique (a timestamp). Scripts cannot read the clock.
 
 `review-open-prs.js` can also run alone (`args` = `groups` + `setup`/`tests`, no `herd`): a read-only
@@ -74,7 +82,7 @@ review of the current PR heads, nothing recorded.
    `<wt>--review` detached at the **accepted sha** from the `accepted` event (the current head when
    resuming, after a fixer round, or on a stale re-probe). The worker's worktree is never used. The
    review worktree stays for the next round; its setup log is `<wt>--review.setup.log`.
-3. **Review** (child) — one main reviewer per PR. **Verify**: two skeptics per medium/high finding.
+3. **Review** (child) — one main reviewer per PR (plus one blind goldfish reviewer with `blind`). **Verify**: two skeptics per medium/high finding.
    A finding survives when at least one skeptic confirms and confirmations ≥ refutations; its final
    severity is the highest a confirmer gave. If no skeptic answers it is kept, marked unverified.
    Low findings get no skeptics.
@@ -104,6 +112,7 @@ Stale rule (`stale=delta`, default) for a `review_ok` slice: same head, or a reb
 |---|---|---|
 | start / pin / record script runner | Opus | low |
 | main reviewer | the model the worker did not use (`reviewModel=same`: the worker's); Opus when Fable gives no result | high, `xhigh` when hot (migration, auth/session/token/permission, SQL, Dockerfile, stacked base, `hot` patterns) |
+| goldfish (only with `blind`) | `models.goldfish`, else the same rule as the main reviewer | same as the main reviewer |
 | skeptics | one Opus + one Fable | medium |
 | integration probe | Opus | xhigh |
 | fixer | the worker's model, the other one after the 2nd orange round at the same spot | high |

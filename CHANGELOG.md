@@ -6,11 +6,99 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.0-alpha] - 2026-11-03
+
+The factory pipeline: the four side-by-side orchestration paths become one stage-gated path from
+intent to merge (SKILL.md §11, build contract `docs/factory-v3.md`, source PRD `docs/prd/factory-v3.md`).
+MAJOR because the workflow agents follow changes: §11 no longer dispatches `tasks.md` by bash, and
+§9, §12, §13 and §15 are marked legacy. The compiler (`m2herd cut`), default evals (G3) and the blind
+pass on by default follow in 3.0.0.
+
 ### Added
-- Add the objective loop layer: `m2herd eval draft|approve|status` freezes
+- **G0 triage** — `m2herd triage "<intent>" [--files …] [--track T] [--tier T] [--source chat]`
+  (`scripts/m2herd-gate`): a fixed rule table (risk words, new-system words, file areas, quick words)
+  picks quick / standard / full plus a low / medium / high risk tier, marks the answer UNSURE when
+  no rule fired, and records it. `--track` overrides and is recorded; a high-tier run below the full
+  track needs `--force --note`; a high-tier chat intent is marked `needs_approval` and `gate status`
+  sends it to the STEER inbox first (SEC-4; advisory in the alpha — no gate refuses it yet).
+- **Gate events** — `.m2herd/factory/<run>/gates.jsonl`, append-only, written only through
+  `herd_events.append_gate` under a lock: `triaged`, `design_review`, `design_ok` with validated
+  transitions (a quick run has no G1; re-triage only raises; `design_ok` is the human's, needs their
+  words verbatim and a review with no open finding). Invisible to the phase reader.
+- **G1 design review** — `m2herd gate record <run> design_review --evidence <findings> --open <n>`,
+  `m2herd gate approve <run> G1 --word "…"`, `m2herd gate status` (who acts next, per run).
+  ORCHESTRATOR.md gains step 0 "Gates before the herd"; MODELS.md rows for the goldfish and the test
+  writer.
+- **Blind pass (G4, opt-in)** — review loop arg `blind: true` (spec name `HERD_REVIEW_BLIND`) starts a
+  goldfish reviewer beside the main reviewer: task ACs, requirement text, diff and repo only, never
+  the worker's report, reviewer context, earlier findings or PR text. Its findings carry
+  `source: blind`, go through the same two skeptics, and duplicates of a main finding are kept once
+  as `also_blind`. Optional `models.goldfish`. Rules in `templates/herd/rules/GOLDFISH.md`.
+- **EGM in onboarding** — `scripts/onboard.sh` step 5 installs the `egm` plugin
+  (google/elephant-goldfish-model), compares the installed commit with `EGM_PIN`, records how the
+  orchestrator gets fresh subagents (native or a headless `claude -p` worker) and writes an `[egm]`
+  block to `~/.config/herdr-factory/config.toml`. spec-kit is pinned the same way (`SPEC_KIT_REF`): a fresh install
+  uses it; an existing `specify` is compared with it and a mismatch is warned about, never replaced
+  silently; config.toml records both `ref` and `installed`.
+- **Auto-update to the newest release** — `m2herd self-update` now moves the engine repo to the
+  newest release tag (`M2HERD_UPDATE_CHANNEL=release`, prereleases included; `stable`; `main` keeps
+  the old ff-only pull of main). Forward only: an engine at or ahead of the tag stays, one with
+  uncommitted changes or commits the tag lacks is refused. A detached engine moves to the tag, a
+  checkout of `main` is fast-forwarded to it (stays a branch), any other branch is never moved.
+  Only tags on origin count; the installer's shallow clone is unshallowed once so it is not
+  mistaken for diverged; a working branch is reported as such and never moved. A release that
+  changes `install.sh` or `hooks/` leaves `~/.cache/m2herd/relink-needed`: the dashboard and the
+  SessionStart digest show it until `install.sh` runs again, which removes it. Re-running the
+  install one-liner on a release-following (detached) engine moves it with `self-update` instead
+  of `git pull`, so it never lands on main's untagged head. `--auto` is the routine: quiet, once per
+  `M2HERD_UPDATE_INTERVAL_HOURS` (24), one runner at a time, never fails, logs to
+  `~/.cache/m2herd/update.log`; `m2herd-session.sh` starts it detached on every session
+  (`M2HERD_AUTO_UPDATE=0` opts out); `templates/systemd/m2herd-update.{service,timer}` for machines
+  without sessions. The update-status cache gains the target tag as a fourth field (readers use
+  the first three); the dashboard row names it. Tests in `tests/update/`.
+- `tests/gates/test_gates.py` in `make test-herd`; credits in README, EGM in `NOTICE`.
+- The objective loop layer (was Unreleased): `m2herd eval draft|approve|status` freezes
   checks into `.m2herd/evals/approved/<slice>/` with a checksum, and
   `m2herd loop run|status|promote` runs isolated scored attempts, records
   per-round artifacts, and promotes only the best patch into a clean checkout.
+
+### Changed
+- **The herd view is "Herd".** Worker TUIs open in the tab `herd` (was `herde`); the German board
+  title is "Herd". `herd-spawn`, `herd-limits` and `herd-loop.sh` still recognise a tab labelled
+  `herde` (a `herd` tab wins when both exist) unless `HERD_SPAWN_TAB` / `HERD_TAB` names another
+  label, so running herds keep their slots across the upgrade.
+- herd-board: the Queue lane sits under Working, so the running workers stay at the top (operator
+  request 29.10.2026; was a local patch on the installed copy until now).
+- SKILL.md §11 rewritten as "The factory pipeline" (G0–G5); the hand-rolled `tasks.md` bash dispatch
+  is gone in favour of herd-flow-v2 slices, `herd-phase … queued` and `herd-watch`. README stack map:
+  start at §11 + §16; §9, §12, §13, §15 legacy. Skill description gains triage/gate/EGM triggers.
+- The dispatch-nudge hook proposes `m2herd triage` before a herd plan.
+- `scripts/lint.sh` and the docs test accept a semver prerelease (`3.0.0-alpha`).
+- `m2herd help` prints the whole usage header (it stopped at a fixed line 58).
+
+### Fixed
+- `fleet-loop.sh tick` reported `MISSION_COMPLETE` for an empty `missions.tsv`; it now waits with
+  `AWAITING_SOLO (fill missions.tsv)` (re-done against 3.0 from an unpushed June fix;
+  `tests/fleet/test_empty_fleet.sh`).
+- Triage: after an UNSURE triage the human's `--track` pick was refused as "lowering"; it may now
+  lower the track — or confirm the rule's answer — and `gate status` names the human as the next
+  actor of an UNSURE run until they do (found by
+  running the pipeline on its own release; confirmed by the blind review and both skeptics).
+- Default run ids carry a hash of the whole intent, so two intents sharing their first 40
+  characters no longer collapse into one run (main review, confirmed by both skeptics).
+- Found by the release review, low: a blind finding on the same spot as a main-reviewer finding
+  now keeps the higher severity; `gate record --open` must be ≥ 0; a refused event on an unknown
+  run leaves no empty run dir; file areas keep dotfiles (`.github` is not `github`).
+- onboard read the EGM install from `~/.claude` even when `CLAUDE_CONFIG_DIR` points elsewhere.
+- `m2herd-up selftest` judged the spawned pid before `nohup` had exec'd the command (CI flake).
+- `m2herd selftest` failed on any machine with `m2herd-steer` on PATH: the `next` steering line says
+  "triage steering" there, not "drain steering".
+
+### Not in this release (see `docs/factory-v3.md` §10)
+- No `factory` block in `.m2herd/settings.json` yet: the `m2herd-tui` settings editor would drop it
+  on save. It lands with the TUI change and rebuilt `prebuilt/`.
+- Gate approvals are not on `herd-board` yet; `m2herd gate status` shows them. There is no
+  "Needs you" lane (removed in 2.10); gate rows will follow the Ready-to-merge pattern.
 
 ## [2.10.0] - 2026-10-23
 

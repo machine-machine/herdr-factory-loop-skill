@@ -48,6 +48,11 @@
 #                                             # score each round, keep best patch under .m2herd/loops/<run-id>/
 #   m2herd.sh loop status [--run ID]          # render loop run summary
 #   m2herd.sh loop promote --run ID           # apply the best patch to a clean current worktree
+#   m2herd.sh triage "<intent>" [--files a,b] [--track T] [--id ID] [--dry-run]
+#                                             # G0 of the factory pipeline: quick|standard|full + risk tier from a rule
+#                                             #   table (scripts/m2herd-gate), recorded in .m2herd/factory/<id>/gates.jsonl
+#   m2herd.sh gate status|record|approve ...  # gate verdicts per run: record design_review (G1 findings file + open
+#                                             #   count), approve G1 with the human's words; status says who acts next
 #   m2herd.sh room    [--dir P]               # the machineroom viewer in THIS terminal: Go TUI (m2herd-tui) when installed,
 #                                             #   else the flicker-free bash watch — one command, always the best/latest viewer
 #   m2herd.sh dashboard [--dir P] [--watch [--interval N]]
@@ -60,8 +65,11 @@
 #                                             #   .m2herd-drift/go checks — ok|warn|FAIL + one-line remedy; exit 1 iff any FAIL
 #   m2herd.sh reap    [--dir P] [--dry-run]   # close herdr panes of FINISHED (done|failed) workers so idle claude/codex
 #                                             #   sessions stop holding API connections — never $SELF, never a working pane
-#   m2herd.sh self-update [--check]           # --check: fetch the engine repo, cache behind-count in ~/.cache/m2herd/update-status
-#                                             #   (dashboard renders it); no flag: ff-only pull of the engine repo (refuses dirty tree)
+#   m2herd.sh self-update [--check|--auto]    # move the engine repo to the newest release tag (M2HERD_UPDATE_CHANNEL=release,
+#                                             #   prereleases included; stable; main = ff-only pull). Forward only, refuses a dirty
+#                                             #   or diverged tree. --check: only cache the state in ~/.cache/m2herd/update-status.
+#                                             #   --auto: quiet, once per M2HERD_UPDATE_INTERVAL_HOURS (24), never fails, logs to
+#                                             #   ~/.cache/m2herd/update.log; M2HERD_AUTO_UPDATE=0 opts out (SessionStart hook runs it)
 #   m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync (+--check drift) → archive → gist →
 #                                             #   next → graph lint/show/next → metrics.json; jq asserts
 #
@@ -91,8 +99,16 @@ if [ "$CMD" = "loop" ]; then
   case "${1:-}" in -*|"") : ;; *) LOOP_ACTION="$1"; shift ;; esac
 fi
 CONFIG_ACTION=""; CONFIG_PATH=""; CONFIG_VALUE=""
-DIR="$PWD"; GOAL=""; AREA=""; TEXT=""; CHECK=0; PUSH=0; WATCH=0; INTERVAL=2; RUN=""; ACK_REPO=0; DRYRUN=0
+DIR="$PWD"; GOAL=""; AREA=""; TEXT=""; CHECK=0; AUTO=0; PUSH=0; WATCH=0; INTERVAL=2; RUN=""; ACK_REPO=0; DRYRUN=0
 SLICE=""; EVAL_CMD=""; ATTEMPT_CMD=""; ROUNDS=3
+# `triage` and `gate` (the factory pipeline, docs/factory-v3.md) live in scripts/m2herd-gate; only
+# --dir is taken here, every other argument passes through untouched.
+GATE_ARGS=()
+if [ "$CMD" = "triage" ] || [ "$CMD" = "gate" ]; then
+  while [ $# -gt 0 ]; do
+    case "$1" in --dir) DIR="$2"; shift 2 ;; *) GATE_ARGS+=("$1"); shift ;; esac
+  done
+fi
 while [ $# -gt 0 ]; do
   case "$1" in
     --dir)   DIR="$2"; shift 2 ;;
@@ -100,6 +116,7 @@ while [ $# -gt 0 ]; do
     --goal)  GOAL="$2"; shift 2 ;;
     --area)  AREA="$2"; shift 2 ;;
     --check) CHECK=1; shift ;;
+    --auto)  AUTO=1; shift ;;
     --push)  PUSH=1; shift ;;
     --watch) WATCH=1; shift ;;
     --interval) INTERVAL="$2"; shift 2 ;;
@@ -898,41 +915,165 @@ UPDATE_CACHE="$HOME/.cache/m2herd/update-status"
 # engine repo root (through the symlink chain — $0 may be ~/.local/bin/m2herd)
 engine_repo() { cd "$(dirname "$(self_path)")/.." 2>/dev/null && pwd; }
 
+# Channel (M2HERD_UPDATE_CHANNEL): `release` (default) follows the newest release tag vX.Y.Z[-pre],
+# prereleases included; `stable` skips prereleases; `main` is the pre-3.0 behaviour (ff-only pull of
+# main). Every channel only moves forward: an engine at or ahead of the target stays, one with
+# commits the target lacks (local work, a feature branch) is left alone and reported as diverged.
+# A detached engine (the installer's clone after its first update) moves to the tag; a checkout of
+# `main` is fast-forwarded to it and stays on main; any other branch is a working branch — never moved.
+UPDATE_CHANNEL="${M2HERD_UPDATE_CHANNEL:-release}"
+UPDATE_LOG="$HOME/.cache/m2herd/update.log"
+UPDATE_STAMP="$HOME/.cache/m2herd/update-auto.stamp"
+# written by an update whose release changed install.sh or hooks/; removed by install.sh, shown by the
+# dashboard and the SessionStart digest until then (a status write never touches it)
+UPDATE_RELINK="$HOME/.cache/m2herd/relink-needed"
+
+# newest release tag ON ORIGIN by semver (a local or deleted tag never counts) — a prerelease
+# sorts below its release ("-" → "~" for sort -V)
+latest_release_tag() { # latest_release_tag <channel>  (stdin: `git ls-remote --tags --refs` lines)
+  sed 's|.*refs/tags/||' \
+    | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
+    | { if [ "$1" = stable ]; then grep -v -- '-'; else cat; fi; } \
+    | sed 's/-/~/' | sort -V | tail -1 | sed 's/~/-/' || true
+}
+
+# fetch and compare: sets UPD_STATE (behind|up-to-date|diverged|branch|none|unknown), UPD_N, UPD_TARGET
+update_resolve() { # update_resolve <repo>
+  local repo="$1"
+  UPD_STATE=unknown; UPD_N=0; UPD_TARGET=""; UPD_BRANCH=""
+  case "$UPDATE_CHANNEL" in
+    release|stable|main) ;;
+    *) echo "self-update: M2HERD_UPDATE_CHANNEL must be release|stable|main (got: $UPDATE_CHANNEL)" >&2; return 2 ;;
+  esac
+  if [ "$UPDATE_CHANNEL" = main ]; then
+    GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet origin main 2>/dev/null || return 0
+    UPD_TARGET=origin/main
+  else
+    GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet --tags --force origin 2>/dev/null || return 0
+    # the installer clones with --depth 1: without history every tag would look unrelated (diverged)
+    if [ "$(git -C "$repo" rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
+      GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet --unshallow --tags origin 2>/dev/null || return 0
+    fi
+    local remote_tags
+    remote_tags="$(GIT_TERMINAL_PROMPT=0 git -C "$repo" ls-remote --tags --refs origin 'v*' 2>/dev/null)" || return 0
+    UPD_TARGET="$(printf '%s\n' "$remote_tags" | latest_release_tag "$UPDATE_CHANNEL")"
+    if [ -z "$UPD_TARGET" ]; then UPD_STATE=none; return 0; fi
+    # a tag pushed between the fetch and ls-remote: fetch it by name, or the engine reads as diverged
+    git -C "$repo" rev-parse --quiet --verify "refs/tags/$UPD_TARGET" >/dev/null 2>&1 \
+      || GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet --force origin "refs/tags/$UPD_TARGET:refs/tags/$UPD_TARGET" 2>/dev/null \
+      || { UPD_STATE=unknown; return 0; }
+  fi
+  local br; br="$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+  if git -C "$repo" merge-base --is-ancestor "$UPD_TARGET" HEAD 2>/dev/null; then
+    UPD_STATE=up-to-date
+  elif [ -n "$br" ] && [ "$br" != main ]; then
+    UPD_STATE=branch; UPD_BRANCH="$br"   # a working branch: someone develops here, the update never moves it
+  elif git -C "$repo" merge-base --is-ancestor HEAD "$UPD_TARGET" 2>/dev/null; then
+    UPD_STATE=behind; UPD_N="$(git -C "$repo" rev-list --count "HEAD..$UPD_TARGET" 2>/dev/null || echo 0)"
+  else
+    UPD_STATE=diverged
+  fi
+}
+
+# the cache the dashboard and m2herd-tui read: "<state> <n> <ts> <target>" (readers use the first three)
+update_status_write() { printf '%s %s %s %s\n' "$UPD_STATE" "$UPD_N" "$(ts)" "${UPD_TARGET:--}" > "$UPDATE_CACHE"; }
+
+update_apply() { # update_apply <repo>
+  if [ "$UPDATE_CHANNEL" = main ]; then
+    GIT_TERMINAL_PROMPT=0 git -C "$1" pull --quiet --ff-only origin main
+  elif git -C "$1" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
+    git -C "$1" merge --quiet --ff-only "$UPD_TARGET"   # on main (update_resolve): stays a branch
+  else
+    git -C "$1" -c advice.detachedHead=false checkout --quiet --detach "$UPD_TARGET"
+  fi
+}
+
+# a release that changes install.sh or hooks/ may add links or hook entries the running install lacks
+update_relink_hint() { # update_relink_hint <repo> <old-sha>  — prints the hint and leaves the marker
+  git -C "$1" diff --quiet "$2" HEAD -- scripts/install.sh hooks/ 2>/dev/null && return 0
+  local what="release $UPD_TARGET"; [ "$UPDATE_CHANNEL" != main ] || what="the update to origin/main"
+  local hint="$what changed install.sh or hooks/ — run: $1/scripts/install.sh --local"
+  printf '%s\n' "$hint" > "$UPDATE_RELINK" 2>/dev/null || true
+  echo "$hint"
+}
+
 self_update_cmd() {
-  need_jq
-  local repo behind
+  local repo old
   repo="$(engine_repo)" || { echo "self-update: cannot resolve engine repo" >&2; exit 1; }
   git -C "$repo" rev-parse --git-dir >/dev/null 2>&1 || { echo "self-update: $repo is not a git repo" >&2; exit 1; }
   mkdir -p "$(dirname "$UPDATE_CACHE")"
+  if [ "$AUTO" -eq 1 ]; then self_update_auto "$repo"; return 0; fi
+  update_resolve "$repo" || exit 2
+  update_status_write
   if [ "$CHECK" -eq 1 ]; then
-    if ! GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet origin main 2>/dev/null; then
-      printf 'unknown 0 %s\n' "$(ts)" > "$UPDATE_CACHE"
-      echo "self-update: fetch failed (offline?) — status unknown"; return 0
-    fi
-    behind="$(git -C "$repo" rev-list --count HEAD..origin/main 2>/dev/null || echo 0)"
-    if [ "$behind" -gt 0 ]; then
-      printf 'behind %s %s\n' "$behind" "$(ts)" > "$UPDATE_CACHE"
-      echo "update available: $behind commit(s) behind — run: m2herd self-update"
-    else
-      printf 'up-to-date 0 %s\n' "$(ts)" > "$UPDATE_CACHE"
-      echo "m2herd up-to-date"
-    fi
+    case "$UPD_STATE" in
+      behind)     echo "update available: $UPD_N commit(s) behind $UPD_TARGET — run: m2herd self-update" ;;
+      up-to-date) echo "m2herd up-to-date ($UPDATE_CHANNEL: $UPD_TARGET)" ;;
+      diverged)   echo "m2herd engine has commits $UPD_TARGET lacks (local work or a branch) — not updated automatically" ;;
+      branch)     echo "m2herd engine is on working branch $UPD_BRANCH — never moved; check out main or $UPD_TARGET to follow releases" ;;
+      none)       echo "no release tag on origin yet (channel $UPDATE_CHANNEL)" ;;
+      *)          echo "self-update: fetch failed (offline?) — status unknown" ;;
+    esac
     return 0
   fi
-  # real update: ff-only, never on a dirty tree
   if [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]; then
     echo "self-update: REFUSING — engine repo has uncommitted changes: $repo" >&2; exit 2
   fi
-  GIT_TERMINAL_PROMPT=0 git -C "$repo" pull --ff-only origin main
-  printf 'up-to-date 0 %s\n' "$(ts)" > "$UPDATE_CACHE"
-  log "self-update: engine at $(git -C "$repo" log --oneline -1)"
+  case "$UPD_STATE" in
+    up-to-date) log "self-update: up-to-date ($UPDATE_CHANNEL: $UPD_TARGET)"; return 0 ;;
+    none)       log "self-update: no release tag on origin yet (channel $UPDATE_CHANNEL)"; return 0 ;;
+    unknown)    echo "self-update: fetch failed (offline?)" >&2; exit 1 ;;
+    diverged)   echo "self-update: REFUSING — $repo has commits $UPD_TARGET lacks; check out $UPD_TARGET yourself if you mean to drop them" >&2; exit 2 ;;
+    branch)     echo "self-update: REFUSING — $repo is on working branch $UPD_BRANCH; check out main (or $UPD_TARGET) to follow releases" >&2; exit 2 ;;
+  esac
+  old="$(git -C "$repo" rev-parse HEAD)"
+  update_apply "$repo"
+  UPD_STATE=up-to-date; UPD_N=0; update_status_write
+  log "self-update: engine at $UPD_TARGET ($(git -C "$repo" log --oneline -1))"
+  update_relink_hint "$repo" "$old"
+}
+
+# --auto: what the SessionStart hook and the systemd timer run. Quiet, at most once per
+# M2HERD_UPDATE_INTERVAL_HOURS (default 24), one runner at a time, never fails;
+# M2HERD_AUTO_UPDATE=0 turns it off. One line per run in ~/.cache/m2herd/update.log.
+self_update_auto() { # self_update_auto <repo>
+  local repo="$1" h="${M2HERD_UPDATE_INTERVAL_HOURS:-24}" old msg hint
+  [ "${M2HERD_AUTO_UPDATE:-1}" != 0 ] || return 0
+  case "$h" in ''|*[!0-9]*) h=24 ;; esac
+  if [ "$h" -gt 0 ] && [ -f "$UPDATE_STAMP" ] && [ -n "$(find "$UPDATE_STAMP" -mmin "-$((h * 60))" 2>/dev/null)" ]; then
+    return 0
+  fi
+  if command -v flock >/dev/null 2>&1; then
+    exec 8>"$UPDATE_STAMP.lock"; flock -n 8 || return 0
+  fi
+  touch "$UPDATE_STAMP"   # before the fetch, so an offline machine does not retry every session
+  if ! update_resolve "$repo"; then msg="bad channel $UPDATE_CHANNEL"
+  else
+    update_status_write
+    if [ "$UPD_STATE" != behind ]; then msg="$UPD_STATE ($UPDATE_CHANNEL: ${UPD_TARGET:--})"
+    elif [ -n "$(git -C "$repo" status --porcelain 2>/dev/null)" ]; then msg="skipped: uncommitted changes in $repo ($UPD_TARGET waiting)"
+    else
+      old="$(git -C "$repo" rev-parse --short HEAD)"
+      if update_apply "$repo" >/dev/null 2>&1; then
+        UPD_STATE=up-to-date; UPD_N=0; update_status_write
+        hint="$(update_relink_hint "$repo" "$old")"
+        msg="updated $old -> $UPD_TARGET${hint:+; $hint}"
+      else
+        msg="update to $UPD_TARGET failed"
+      fi
+    fi
+  fi
+  printf '%s %s\n' "$(ts)" "$msg" >> "$UPDATE_LOG" 2>/dev/null || true
 }
 
 # header row rendered by dashboard: only when the cached check is fresh (<24h) and behind
 update_row() {
-  local Y="$1" R="$2" word n when age now ep
+  local Y="$1" R="$2" word n when target age now ep
   [ -f "$UPDATE_CACHE" ] || return 0
-  read -r word n when < "$UPDATE_CACHE" 2>/dev/null || return 0
+  read -r word n when target < "$UPDATE_CACHE" 2>/dev/null || return 0
+  if [ -s "$UPDATE_RELINK" ]; then   # until install.sh runs again (it removes the marker)
+    printf 'update:    %s%s%s\n' "$Y" "$(head -1 "$UPDATE_RELINK")" "$R"; return 0
+  fi
   [ "$word" = "behind" ] || return 0
   now="$(date -u +%s)"
   ep="$(epoch_of "$when")"
@@ -943,7 +1084,7 @@ update_row() {
     age=0
   fi
   [ "$age" -lt 86400 ] || return 0
-  printf 'update:    %s%s commit(s) behind — run: m2herd self-update%s\n' "$Y" "$n" "$R"
+  printf 'update:    %s%s commit(s) behind %s — run: m2herd self-update%s\n' "$Y" "$n" "${target:-}" "$R"
 }
 
 # ---------- dashboard --watch: flicker-free repaint loop -----------------------
@@ -1821,6 +1962,13 @@ eval_cmd_group() {
   esac
 }
 
+gate_cmd() {
+  resolve_dir; need_init
+  local py; py="$(dirname "$(self_path)")/m2herd-gate"
+  if [ "$CMD" = "triage" ]; then set -- triage; else set --; fi
+  exec python3 "$py" --dir "$DIR" "$@" ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
+}
+
 loop_cmd_group() {
   case "$LOOP_ACTION" in
     run) loop_run ;;
@@ -2184,7 +2332,8 @@ selftest() {
 
   # next STEER case: live steering outranks coach-intent (done_when is still empty here)
   printf 'PAUSE everything please\n' >> "$td/.m2herd/inbox/STEER.md"
-  "$self" next --dir "$td" | grep -q '^NEXT: drain steering' || fail "next(steer): want drain-steering"
+  # "triage" when m2herd-steer is on PATH (an installed machine), "drain" without it (CI)
+  "$self" next --dir "$td" | grep -qE '^NEXT: (drain|triage) steering' || fail "next(steer): want drain/triage-steering"
   keep_head "$td/.m2herd/inbox/STEER.md" > "$td/.m2herd/inbox/STEER.md.new" \
     && mv "$td/.m2herd/inbox/STEER.md.new" "$td/.m2herd/inbox/STEER.md"
 
@@ -2613,6 +2762,7 @@ case "$CMD" in
     esac
     ;;
   eval)     eval_cmd_group ;;
+  triage|gate) gate_cmd ;;
   loop)     loop_cmd_group ;;
   dashboard)
     # Tier-3 chain: --watch prefers the Go TUI (m2herd-tui, bubbletea) when installed —
@@ -2630,10 +2780,10 @@ case "$CMD" in
     else dashboard_watch; fi ;;
   self-update) self_update_cmd ;;
   selftest)  selftest ;;
-  help)      sed -n '2,58p' "$0" ;;
+  help)      sed -n '2,/^$/p' "$0" ;;
   # An unknown subcommand must FAIL, not print usage and exit 0. `dispatch --all`
   # shells out to `graph next`; against a pre-v2.3 engine the old fallback returned
   # exit 0 plus 57 lines of this header, which the caller then parsed as a ready-slice
   # list. Every caller of every subcommand had the same hazard.
-  *)         printf 'unknown subcommand: %s\n\n' "$CMD" >&2; sed -n '2,58p' "$0" >&2; exit 2 ;;
+  *)         printf 'unknown subcommand: %s\n\n' "$CMD" >&2; sed -n '2,/^$/p' "$0" >&2; exit 2 ;;
 esac

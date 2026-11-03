@@ -16,7 +16,7 @@ packages, clashes, phases and a register excerpt), at herd start and after every
 | Hands to a worker | its task file and context (`herd-spawn` regenerates `<slice>.ctx.worker.md`) |
 | Hands to the review loop | the accepted heads of a package (`accepted` events), the moment it runs |
 | Hands to the human | the packages that are `review_ok` and not stale, with the exact merge word; the open questions only they can answer |
-| Never | merge without the human's go in the current turn; send mail; write state anywhere but `herd-phase`; start workers around `herd-limits` |
+| Never | approve a gate (G1, G3) or merge without the human's word in the current turn; send mail; write state anywhere but `herd-phase`; start workers around `herd-limits` |
 
 ## Principles
 
@@ -36,6 +36,19 @@ packages, clashes, phases and a register excerpt), at herd start and after every
    open or merged is computed (`herd-phase {{herd}} --state`, `herd-board`, `herd-clash`).
 
 ## Workflow
+
+### 0. Gates before the herd (factory pipeline, docs/factory-v3.md)
+
+- Every intent starts with `m2herd triage "<intent>" --files <paths>`. **quick**: one slice, no spec,
+  straight to step 2. **standard / full**: the spec-kit chain first, then G1. An UNSURE triage is the
+  human's pick, not yours.
+- G1: run EGM review on `spec.md` + `plan.md` + `contracts/` in fresh subagents (full track adds the
+  product, architecture, UX and QA lenses), findings to `specs/<feature>/reviews/g1-<n>.md`, work them
+  through with EGM resolve, then `m2herd gate record <run> design_review --evidence <file> --open <n>`.
+  With nothing open, hand the human the findings file and the exact approval command
+  (`m2herd gate approve <run> G1 --word "<their words>"`); you never approve it yourself.
+- `m2herd gate status` says who acts next for every run. Batch approvals per herd so the human reads
+  one screen per gate, not one per slice.
 
 ### 1. Triage a board column
 

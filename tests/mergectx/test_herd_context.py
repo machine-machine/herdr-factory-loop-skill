@@ -19,7 +19,7 @@ class Ctx(unittest.TestCase):
         self.project = os.path.join(w.tmp, "project")
         os.makedirs(os.path.join(self.project, ".m2herd", "rules"))
         w.sh(self.project, "git", "init", "-q")
-        w.herd = os.path.join(self.project, ".m2herd", "herden", "herde-2310")
+        w.herd = os.path.join(self.project, ".m2herd", "herden", "herd-2310")
         os.makedirs(w.herd)
         with open(os.path.join(self.project, "decisions-questions.json"), "w") as f:
             json.dump({"open_questions": [{"id": "q-reviere-rollen", "question": "Wer darf Reviere sehen?",

@@ -1,0 +1,17 @@
+# m2herd-update.service — daily `m2herd self-update --auto` (SKILL.md §16.5). A systemd USER unit
+# template; nothing installs or enables it for you:
+#
+#   mkdir -p ~/.config/systemd/user
+#   cp templates/systemd/m2herd-update.{service,timer} ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now m2herd-update.timer
+#
+# The SessionStart hook runs the same command on every Claude Code session; the timer covers
+# machines where no session starts for days. Same rate limit, lock and log
+# (~/.cache/m2herd/update.log); M2HERD_AUTO_UPDATE=0 in the unit's environment turns it off.
+[Unit]
+Description=m2herd auto-update: move the engine repo to the newest release (forward only)
+Documentation=file://%h/.cache/herdr-factory-loop-skill/skill/SKILL.md
+
+[Service]
+Type=oneshot
+ExecStart=/bin/sh -lc 'exec m2herd self-update --auto'

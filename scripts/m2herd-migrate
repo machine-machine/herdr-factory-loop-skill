@@ -707,19 +707,19 @@ def selftest():
         w("backups/b1/f.txt")
         w("runs/r1/run.json", "{}")
         w("dispatch/screens/a/1.png", "png")
-        w("dispatch/herde-0101/herd.map", "x\n", old)
-        w("dispatch/herde-0101/a.task.md", "t\n", old)
-        w("dispatch/herde-0202/herd.map", "x\n")                 # fresh v1 -> live
-        w("dispatch/herde-0303/a.task.md", "t\n")                # v2, merged -> moves
-        w("dispatch/herde-0303/herd.events.jsonl",
+        w("dispatch/herd-0101/herd.map", "x\n", old)
+        w("dispatch/herd-0101/a.task.md", "t\n", old)
+        w("dispatch/herd-0202/herd.map", "x\n")                 # fresh v1 -> live
+        w("dispatch/herd-0303/a.task.md", "t\n")                # v2, merged -> moves
+        w("dispatch/herd-0303/herd.events.jsonl",
           '{"ts":"2026-10-01T00:00:00Z","slice":"a","phase":"merged","by":"merge"}\n')
-        w("dispatch/herde-0404/a.task.md", "t\n", old)           # v2, still working -> live
-        w("dispatch/herde-0404/herd.events.jsonl",
+        w("dispatch/herd-0404/a.task.md", "t\n", old)           # v2, still working -> live
+        w("dispatch/herd-0404/herd.events.jsonl",
           '{"ts":"2026-10-01T00:00:00Z","slice":"a","phase":"working","by":"watch"}\n', old)
-        for d in ("herde-0101", "herde-0404"):
+        for d in ("herd-0101", "herd-0404"):
             os.utime(os.path.join(m, "dispatch", d), (old, old))
-        w("dispatch/herde-0101/spawn.sh", f"D={m}/dispatch/herde-0101\n", old)   # names its own old path
-        for d in ("herde-0101",):
+        w("dispatch/herd-0101/spawn.sh", f"D={m}/dispatch/herd-0101\n", old)   # names its own old path
+        for d in ("herd-0101",):
             os.utime(os.path.join(m, "dispatch", d), (old, old))
         w(".sync-stamp", "1\n")
         w("sync.sh", 'cat "$(dirname "$0")/.sync-stamp"\n')                  # kept script, relative reference
@@ -735,10 +735,10 @@ def selftest():
         readers = os.path.join(tmp, "bin")
         os.makedirs(readers)
         with open(os.path.join(readers, "tool"), "w") as f:
-            f.write("D=$HOME/proj/.m2herd/dispatch/herde-0101\ncat .m2herd/dispatch/herde-0101x/no\n"
+            f.write("D=$HOME/proj/.m2herd/dispatch/herd-0101\ncat .m2herd/dispatch/herd-0101x/no\n"
                     'local runs="$REPO/.m2herd/runs" cur\n')
         with open(os.path.join(readers, "other"), "w") as f:
-            f.write("cat .m2herd/dispatch/herde-0202/herd.map\n")   # live herd stays -> not a reader
+            f.write("cat .m2herd/dispatch/herd-0202/herd.map\n")   # live herd stays -> not a reader
         base = [m, "--readers", readers, "--date", "2026-10-23", "--cache-root", os.path.join(tmp, "cache"),
                 "--state-root", os.path.join(tmp, "state")]
 
@@ -749,10 +749,10 @@ def selftest():
 
         rc, txt = run([])
         check("dry run exit 0", rc == 0, txt)
-        check("herd v1 old moves", "MOVE   dispatch/herde-0101/ -> herden/herde-0101/" in txt, txt)
-        check("herd v1 fresh is live", "SKIP   dispatch/herde-0202 — live herd" in txt, txt)
-        check("herd v2 merged moves", "dispatch/herde-0303/ -> herden/herde-0303/" in txt, txt)
-        check("herd v2 working is live", "dispatch/herde-0404 — live herd (slices not merged/parked: a)" in txt, txt)
+        check("herd v1 old moves", "MOVE   dispatch/herd-0101/ -> herden/herd-0101/" in txt, txt)
+        check("herd v1 fresh is live", "SKIP   dispatch/herd-0202 — live herd" in txt, txt)
+        check("herd v2 merged moves", "dispatch/herd-0303/ -> herden/herd-0303/" in txt, txt)
+        check("herd v2 working is live", "dispatch/herd-0404 — live herd (slices not merged/parked: a)" in txt, txt)
         check("screens to cache", "dispatch/screens/ -> " in txt and "cache/proj/screens/" in txt, txt)
         check("backups to cache", "MOVE   backups/ ->" in txt, txt)
         check("old dispatch file archived", "dispatch/old-recon.out.md -> archives/dispatch/" in txt, txt)
@@ -769,24 +769,24 @@ def selftest():
         check("notes split per month", "archives/notes/2026-08.md" in txt and "archives/notes/2026-09.md" in txt
               and "2026-10.md" not in txt, txt)
         check("pycache deleted twice", txt.count("DELETE ") == 2, txt)
-        check("reader found with boundary", "tool: .m2herd/dispatch/herde-0101" in txt and "herde-0101x" not in txt, txt)
+        check("reader found with boundary", "tool: .m2herd/dispatch/herd-0101" in txt and "herd-0101x" not in txt, txt)
         check("live herd reader ignored", "other:" not in txt, txt)
         check("runs/ stays in the fabric (engine run store)", "MOVE   runs/ ->" not in txt, txt)
-        check("moved script naming its own old path", "herde-0101/spawn.sh: .m2herd/dispatch/herde-0101" in txt, txt)
+        check("moved script naming its own old path", "herd-0101/spawn.sh: .m2herd/dispatch/herd-0101" in txt, txt)
         check("kept fabric script, relative path", "sync.sh: .m2herd/.sync-stamp" in txt, txt)
         check("secret-looking files never read", "tool-env.sh" not in txt.split("READERS")[1]
               and "private.sh" not in txt.split("READERS")[1], txt)
-        check("dry run changed nothing", os.path.isdir(os.path.join(m, "dispatch/herde-0101"))
+        check("dry run changed nothing", os.path.isdir(os.path.join(m, "dispatch/herd-0101"))
               and not os.path.exists(os.path.join(m, "archives/2026-10-23")), txt)
 
         rc, txt = run(["--apply"])
         check("apply refused with readers", rc == 3 and "REFUSED" in txt, txt)
-        check("refusal changed nothing", os.path.isdir(os.path.join(m, "dispatch/herde-0101")))
+        check("refusal changed nothing", os.path.isdir(os.path.join(m, "dispatch/herd-0101")))
 
         rc, txt = run(["--apply", "--force-readers"])
         check("forced apply exit 0", rc == 0, txt)
-        check("herd moved", os.path.isfile(os.path.join(m, "herden/herde-0101/herd.map")))
-        check("live herd kept", os.path.isfile(os.path.join(m, "dispatch/herde-0202/herd.map")))
+        check("herd moved", os.path.isfile(os.path.join(m, "herden/herd-0101/herd.map")))
+        check("live herd kept", os.path.isfile(os.path.join(m, "dispatch/herd-0202/herd.map")))
         check("screens in cache", os.path.isfile(os.path.join(tmp, "cache/proj/screens/a/1.png")))
         check("state moved with side files", all(os.path.exists(os.path.join(tmp, "state/proj", n)) for n in
                                                  ("queue.sqlite3", "queue.sqlite3-wal", "queue.sqlite3.triage.lock",
@@ -814,9 +814,9 @@ def selftest():
             idx = f.read()
         check("index one line per entry", idx.count("\n- ") == sum(1 for ln in txt.splitlines()
                                                                       if ln.startswith(("MOVE", "SPLIT", "DELETE"))), idx)
-        check("index lists the herd", "herd: dispatch/herde-0101/ -> herden/herde-0101/" in idx, idx)
+        check("index lists the herd", "herd: dispatch/herd-0101/ -> herden/herd-0101/" in idx, idx)
         check("reader check rerun", "reader check after apply: 3 unresolved" in txt
-              and "herden/herde-0101/spawn.sh" in txt.split("after apply")[1], txt)
+              and "herden/herd-0101/spawn.sh" in txt.split("after apply")[1], txt)
 
         rc, txt = run([])
         check("second dry run is idempotent", "MOVE" not in txt and "SPLIT" not in txt and "DELETE" not in txt, txt)

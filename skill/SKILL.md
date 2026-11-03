@@ -1,7 +1,7 @@
 ---
 name: herdr
-version: 2.10.0
-description: 'Orchestrate a fleet of parallel AI coding agents with herdr, the terminal workspace manager (workspaces/tabs/panes) on this machine: spawn agents (claude/codex/cursor/opencode/etc.), dispatch work, watch lifecycle (idle/working/blocked), unblock approvals, fan out and converge herds; manage agent integrations. Triggers: herdr, "the fleet", orchestrate agents, spawn an agent, "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or driving agents in herdr panes. Also triggers: chat-channel intents (Mattermost/Discord/Slack) needing parallel workers, report back on the same channel; SDD/factory loop (spec-kit, /speckit.*, onboard the factory, spec→plan→tasks→implement); meta-orchestration (meta-orchestrator, fleet-loop/fleet-control, multi-mission /goal portfolios); m2herd — the Claude main-orchestrator context fabric (.m2herd dir; the folder holds the context, the orchestrator holds pointers; refile/notes/areas, fleet-memory gists, RESUME.md).'
+version: 3.0.0-alpha
+description: 'Orchestrate parallel AI coding agents with herdr, the terminal workspace manager (workspaces/tabs/panes) on this machine: spawn agents (claude/codex/cursor/etc.), dispatch work, watch lifecycle (idle/working/blocked), unblock approvals, fan out and converge herds; manage agent integrations. Triggers: herdr, "the fleet", orchestrate agents, spawn an agent, "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or driving agents in herdr panes. Also triggers: chat-channel intents (Mattermost/Discord/Slack) needing parallel workers, report back on the same channel; the factory pipeline (triage, quick/standard/full track, gates G0–G5, EGM goldfish/blind review, spec-kit, /speckit.*, onboard the factory); meta-orchestration (meta-orchestrator, fleet-loop/fleet-control, multi-mission /goal portfolios); m2herd — the Claude main-orchestrator context fabric (.m2herd dir; the folder holds the context, the orchestrator holds pointers; refile/notes/areas, fleet-memory gists, RESUME.md).'
 ---
 
 # herdr Skill
@@ -94,10 +94,10 @@ herdr agent start claude --cwd ~/.herdr/worktrees/<repo>/feature-x --no-focus --
 > That is what `herd-spawn` (§16.7) does. Resume a crashed worker the same way with
 > `claude --continue …`, which keeps the transcript.
 > `herd-loop.sh` and `fleet-loop.sh` detect 0.9 (`--kind` in `agent start --help`) and use
-> the pane-then-start form: herd-loop opens workers in the `herde` tab of its own workspace
+> the pane-then-start form: herd-loop opens workers in the `herd` tab of its own workspace
 > (its own workspace per worker when run outside herdr) and closes the workspaces 0.9's
 > `worktree create` opens on the side; fleet-loop gives each mission orchestrator a
-> workspace labelled with the mission, so each mission's herd gets its own `herde` tab.
+> workspace labelled with the mission, so each mission's herd gets its own `herd` tab.
 
 ### 4. Dispatch work to an agent
 > **herdr ≥ 0.9:** `agent send` is gone — `herdr agent prompt <target> "<text>"` submits by
@@ -189,6 +189,9 @@ herdr notification show "fleet idle" --body "3/3 tasks done" --position top-righ
 ```
 
 ### 9. Channel-driven intent → spin up a herdr "herd"
+
+> **Legacy since 3.0** — kept working, not where new work starts: run intents through the factory pipeline (§11) and the v2 herd flow (§16.7).
+
 **Use when:** an intent arrives over a chat channel (Mattermost, Discord, Slack, etc.) and the work is decomposable into **independent sub-tasks** that benefit from running in parallel. The user is *not* at the keyboard — they're waiting for a deliverable on the channel.
 
 If the work is a single small fix, just do it inline — do not fan out. Fan out only when the goal has ≥2 truly independent slices (different files / services / concerns) or when the user explicitly asks for parallel workers.
@@ -382,105 +385,114 @@ When the same `next time` note shows up in a second run report, it stops being a
 
 Open a PR against this repo (see CONTRIBUTING.md — it's a MINOR bump). The skill is the fleet's institutional memory: a lesson that lives only in a run report gets re-learned; a lesson merged here is learned once, by every future agent.
 
-### 11. SDD factory loop — spec-kit × herdr
+### 11. The factory pipeline — triage, spec, gates, herd
 
-The factory loop is herdr orchestration with [github/spec-kit](https://github.com/github/spec-kit) as the front half: **nothing is implemented without a spec, and every herd derives its slices from `tasks.md` instead of ad-hoc decomposition.** Use it whenever the user asks for SDD, the factory loop, or any `/speckit.*` command — and prefer it over §9's freeform decomposition for any feature big enough to herd.
+**Start here for any build work.** Since 3.0 the factory is one stage-gated pipeline instead of four
+side-by-side paths: [github/spec-kit](https://github.com/github/spec-kit) is the artifact chain, the
+v2 herd flow (§16.7) is the engine, and six gates each record a verdict before work moves on. A
+slice is done only when a check its builder could not edit is green and a reviewer who never saw
+the builder's story finds nothing that survives the skeptics. Build contract:
+`docs/factory-v3.md` (this section wins on conflict). §9, §12, §13 and §15 are **legacy** paths —
+kept working, not where new work starts.
 
 ```
-constitution → specify → clarify → plan → tasks ──→ herd implements (§9 machinery)
-     ▲                                       │              │
-     └────────── compound (§10) ◄── converge ◄── analyze ◄──┘
+G0 triage ─► spec chain ─► G1 design review ─► tasks ─► cut ─► G2 cut check ─► G3 frozen evals
+   ─► herd (§16.7) ─► G4 slice done ─► G5 merge on the human's go ─► compound (§10, §17)
 ```
 
-#### 11.0 Onboard (once per machine, once per repo)
+#### 11.1 G0 — triage: pick the track
+
+```bash
+m2herd triage "<intent>" --files <paths it will touch>    # → track + tier + reasons, recorded
+m2herd triage "<intent>" --track standard                 # the human's override, recorded as a reason
+m2herd gate status                                        # every run: where it stands, who acts next
+```
+
+Rules, not judgement: risk words (auth, payment, migration, infrastructure, client data, …) → **full**
+and tier **high**; new-system words → **full**; two or more file areas → **standard**; a quick word
+(typo, config, rename, failing test, …) in one area → **quick**; nothing fired → standard, marked
+UNSURE — then the **human** picks, not you. Table: `docs/factory-v3.md` §3.
+
+| Track | For | Gates |
+|---|---|---|
+| quick | typos, config, a contained bug with a failing test | one slice, no spec: G4 + G5 |
+| standard | anything touching more than one file area (the default) | spec chain, G1, compiled slices, G2–G5 |
+| full | new systems, client-facing features, auth, payments, migrations | standard + EGM brainstorm before the spec + role lenses at G1 |
+
+A chat-channel intent (§9) is untrusted text: `--source chat`; a high-tier chat run waits for the
+human's approval in the STEER inbox before any work.
+
+#### 11.2 Onboard (once per machine, once per repo)
 
 Run the onboarding TUI from this repo to choose the orchestrator and establish the loop:
 ```bash
 ./scripts/onboard.sh                                    # interactive
 ./scripts/onboard.sh --orchestrator claude --repo /path/to/repo --yes   # scripted
 ```
-It (1) picks **Claude Code, Hermes, or Cursor** (or `all`) as the orchestrator, (2) verifies herdr/jq/git, (3) installs this skill for the chosen agent, (4) installs the `specify` CLI (`uv tool install specify-cli --from git+https://github.com/github/spec-kit.git`), (5) runs `specify init --here` in the target repo, and (6) records the choice in `~/.config/herdr-factory/config.toml`.
+It (1) picks **Claude Code, Hermes, Cursor or pi** (or `all`) as the orchestrator, (2) verifies herdr/jq/git, (3) installs this skill for the chosen agent, (4) installs the `specify` CLI at a pinned commit (`uv tool install specify-cli --from git+https://github.com/github/spec-kit.git@<SPEC_KIT_REF>`), (5) installs the EGM plugin (`egm@egm`, google/elephant-goldfish-model) and compares it with the pinned commit, and records how the orchestrator gets fresh subagents (native for Claude Code, a headless `claude -p` worker otherwise), (6) runs `specify init --here` in the target repo, and (7) records all of it in `~/.config/herdr-factory/config.toml`.
 
 Integration mapping: **claude** → `specify init --here --integration claude` (prompts land in `.claude/commands/speckit.*.md`); **cursor** → `specify init --here --integration cursor` (spec-kit-native; prompts in `.cursor/commands/`); **hermes** → `specify init --here --integration generic --integration-options="--commands-dir .hermes/commands/"` (same prompts, in `.hermes/commands/`). The `all` choice initializes the claude integration (Hermes also reads `.claude/commands/*.md`; for Cursor's own command palette re-run `specify init --here --integration cursor`). Older spec-kit builds use `--ai` instead of `--integration` — onboard.sh detects this. Check the active orchestrator any time: `cat ~/.config/herdr-factory/config.toml`.
 
-#### 11.1 The loop, stage by stage
+#### 11.3 The spec chain and G1 (standard + full)
 
-The **orchestrator** (you) runs the spec-kit stages in its own session; only implementation fans out to workers.
+The orchestrator runs the spec stages in its own session; only implementation fans out.
 
-| # | Stage | Command / action | Artifact | Gate to pass |
-|---|-------|------------------|----------|--------------|
-| 1 | Constitution | `/speckit.constitution` (once per repo) | `.specify/memory/constitution.md` | Principles exist |
-| 2 | Specify | `/speckit.specify <feature idea>` | `specs/<feature>/spec.md` | User stories + acceptance criteria, no `[NEEDS CLARIFICATION]` left |
-| 3 | Clarify | `/speckit.clarify` | updated `spec.md` | Ambiguities resolved (ask the user, don't guess) |
-| 4 | Plan | `/speckit.plan <tech context>` | `plan.md`, `research.md`, `data-model.md`, `contracts/` | Plan consistent with constitution |
-| 5 | Tasks | `/speckit.tasks` | `tasks.md` (`[P]` = parallelizable) | Every requirement maps to ≥1 task |
-| 6 | Implement | herd executes `tasks.md` — §11.2 | commits on `wip/` branches | All assigned tasks done, tests pass per worker |
-| 7 | Analyze | `/speckit.analyze` | consistency report | No CRITICAL findings (spec↔plan↔tasks↔code drift) |
-| 8 | Converge | merge → test → review (§9.5) | integration branch | Acceptance criteria in `spec.md` verified, P1 review findings fixed |
-| 9 | Compound | §10 run report | `~/.herdr/runs/…` | `next time` line written |
-
-Small features (≤3 tasks, no `[P]`): skip the herd, run `/speckit.implement` inline in the orchestrator session. Stages 6–8 above replace `/speckit.implement` only when fanning out.
-
-#### 11.2 Dispatch `tasks.md` to the herd
-
-`tasks.md` is the herd plan — it replaces `/tmp/herd-plan.md` from §9.1 step 7. Tasks marked `[P]` touch disjoint files and may run concurrently; unmarked tasks have ordering dependencies and run serially (in the orchestrator or a single worker) **before** the parallel wave they gate.
+| Stage | Command | Artifact | Passes when |
+|---|---|---|---|
+| Constitution | `/speckit.constitution` (once per repo) | `.specify/memory/constitution.md` | principles exist |
+| Brainstorm (full only) | EGM brainstorm | `concepts_brief.md` → input to specify | — |
+| Specify | `/speckit.specify <idea>` | `specs/<feature>/spec.md` | stories + ACs, every requirement has a stable ID, no `[NEEDS CLARIFICATION]` |
+| Clarify | `/speckit.clarify` | updated `spec.md` | ambiguities resolved by the user, not guessed |
+| Plan | `/speckit.plan <tech context>` | `plan.md`, `research.md`, `data-model.md`, `contracts/` | consistent with the constitution |
+| **G1 design** | EGM review on spec + plan + contracts in fresh subagents → EGM resolve | `specs/<feature>/reviews/g1-<n>.md` | no open finding **and** the human approved |
+| Tasks | `/speckit.tasks` | `tasks.md` (`[P]` = parallel) | every requirement maps to ≥ 1 task |
 
 ```bash
-FEATURE_DIR=$(ls -td specs/*/ | head -1)        # active feature (or take it from the spec stage output)
-TASKS="$FEATURE_DIR/tasks.md"
-
-# Slices: one worker per [P] task (or per phase-group of [P] tasks for small tasks)
-grep -E '^- \[ \] T[0-9]+ \[P\]' "$TASKS"
-
-# Spawn per slice — same worktree machinery as §9.2
-SELF=$(herdr agent list | jq -r '.result.agents[] | select(.focused==true) | .pane_id')
-while IFS= read -r task; do
-  TID=$(echo "$task" | grep -oE 'T[0-9]+' | head -1)
-  herdr worktree create --cwd "$REPO" --branch "wip/$FEATURE/$TID" --base "$BASE" --label "$TID" --json \
-    | jq -r '.result.worktree.path' > /tmp/wt-$TID
-  WT=$(cat /tmp/wt-$TID)
-  # swap codex for claude/cursor per the §9.1-step-6 table when a task suits a different worker
-  PANE=$(herdr agent start codex --cwd "$WT" --no-focus -- \
-           "$(command -v codex)" --dangerously-bypass-approvals-and-sandbox \
-    | jq -r '.result.agent.pane_id')
-  cat > /tmp/prompt-$TID.md <<EOF
-You are one worker in an SDD herd. Read these FIRST, in order:
-  1. .specify/memory/constitution.md   (project principles — binding)
-  2. $FEATURE_DIR/spec.md              (WHAT and acceptance criteria)
-  3. $FEATURE_DIR/plan.md              (HOW — stack, structure, contracts)
-Your assignment from $FEATURE_DIR/tasks.md: $task
-Do this task and ONLY this task. Do NOT edit tasks.md (the orchestrator owns it).
-When done: run the tests relevant to your change, commit on the current branch
-with message "$TID: <summary>", and report what you did and how you verified it.
-EOF
-  herdr agent send "$PANE" "$(cat /tmp/prompt-$TID.md)"
-  herdr pane send-keys "$PANE" Enter
-  echo "$TID=$PANE=$WT" >> /tmp/herd.map
-done < <(grep -E '^- \[ \] T[0-9]+ \[P\]' "$TASKS")
+m2herd gate record <run> design_review --evidence specs/<feature>/reviews/g1-1.md --open 3
+# … resolve, re-review …
+m2herd gate record <run> design_review --evidence specs/<feature>/reviews/g1-2.md --open 0
+m2herd gate approve <run> G1 --word "<the human's words, verbatim>"   # only on their word
 ```
-Monitor, unblock, and converge with the §9.3–9.5 machinery unchanged. SDD-specific rules:
-- **Workers never edit `tasks.md`** — parallel edits to it merge-conflict. The orchestrator ticks `- [x]` boxes on the integration branch as each worker's output is verified.
-- **The spec is the contract.** A worker that "improves" beyond its task's scope gets its extra changes reverted at converge.
-- Run `/speckit.analyze` on the integration branch (stage 7) **before** the §9.5 review wave — it catches spec↔code drift the lens reviewers won't look for.
-- At converge, verify against `spec.md`'s acceptance criteria (and any `/speckit.checklist` output), not just "tests pass".
 
-#### 11.3 SDD gates (the loop's contract)
+G1 catches design flaws before fan-out, when they cost one rewrite instead of N parallel ones. Give
+the human one screen: the findings file and the approval command. Goldfish reviewers use another
+model family than the spec author (`MODELS.md`). A Hermes/Cursor/pi orchestrator runs G1 inside a
+headless `claude -p` worker that has the plugin (EGM needs fresh subagents).
 
-- **No spec → no herd.** If asked to "just implement" something non-trivial in a spec-kit repo, run stages 2–5 first (they're fast) or get the user's explicit waiver.
-- `tasks.md` is the only source of slices. If a slice feels wrong, fix `tasks.md` (re-run `/speckit.tasks` or edit it) — don't silently deviate from it.
-- A `[NEEDS CLARIFICATION]` marker anywhere in `spec.md` blocks stage 4+. Resolve via `/speckit.clarify` or the user/channel.
-- CRITICAL findings from `/speckit.analyze` block the merge — dispatch fixes to workers, re-analyze.
-- Every completed loop ends in §10 compound: the run report's `splits` section should grade how well `tasks.md`'s `[P]` markers predicted real independence — feed misses back as a `/speckit.tasks` prompt hint next run.
+#### 11.4 Cut and G2–G5 — the herd takes over
 
-#### 11.4 When NOT to SDD
+- **Cut.** `tasks.md` is the only source of slices: one herd-flow-v2 slice per `[P]` task (or per
+  file-area group of small ones), unmarked gating tasks become `stacked_on`, requirement IDs and ACs
+  are copied into each `<slice>.task.md`. Until `m2herd cut --from specs/<feature>` lands (3.0.0)
+  the orchestrator writes these files by hand from `templates/herd/task.md.example`. No more
+  hand-rolled bash dispatch: queue with `herd-phase … queued`, start with `herd-watch` (§16.7).
+- **G2 cut check.** `HERD-CUT.md` on the herd: FAIL blocks, CONCERNS need the human's ack.
+- **G3 evals** (3.0.0). A test writer — never the slice's worker — drafts one eval per AC with
+  `m2herd eval draft`; it must fail on the base sha; the human freezes it with `m2herd eval approve`
+  (§18). Until then, ACs are checked by the review loop.
+- **G4 slice done.** `review_ok` from the review loop (other-model reviewer + two skeptics +
+  integration probe). Opt-in now, default in 3.0.0: the **blind pass** — loop arg `blind: true`
+  starts a goldfish reviewer that sees only the ACs, the requirement text, the diff and the repo,
+  never the worker's report (`templates/herd/rules/GOLDFISH.md`).
+- **G5 merge.** Integration probe passed, `/speckit.analyze` has no CRITICAL, and `herd-merge` gets
+  the human's verbatim go.
 
-- Trivial fix / typo / config tweak → just do it (or `gsd`-style quick path). Specs for one-liners are ceremony.
-- Repo has no `.specify/` and the user wants speed → offer onboarding once, don't force it.
-- Exploration/spike work ("try X, see if it works") → spike first, spec what survives.
+Rules that stay: workers never edit `tasks.md` (the orchestrator ticks it on the integration
+branch); the spec is the contract — scope creep is reverted; a failed gate loops back to the stage
+that owns the fix (G1 findings → spec, G4 findings → the slice's worker, failed probe → the herd).
+Every run ends in §10 compound; grade how well `[P]` predicted real independence.
+
+#### 11.5 When NOT to run the pipeline
+
+- Exploration or a spike ("try X, see if it works") → spike first, triage what survives.
+- A repo without `.specify/` and a user who wants speed → offer onboarding once, then triage the
+  intent anyway: a quick run needs no spec-kit.
 
 ### 12. ICM-steered orchestration loop
 
-Everything above (§9 herd, §11 SDD) is orchestration you drive by hand or in one bash run.
+> **Legacy since 3.0** — kept working, not where new work starts: run intents through the factory pipeline (§11) and the v2 herd flow (§16.7).
+
+Everything in §9 is orchestration you drive by hand or in one bash run.
 §12 makes that orchestration **a standing, steerable, disk-reconstructible loop** by adopting
 the Interpretable Context Methodology (ICM): the folder is the orchestrator's state, herdr is
 its body, and a reconciliation loop keeps them in sync.
@@ -530,6 +542,8 @@ Discipline (ICM's anti-drift): per-tick context stays tiny — identity + router
 across stages. Mechanical work is the script's; judgment is the orchestrator's.
 
 ### 13. Meta-orchestration — the orchestrator of orchestrators
+
+> **Legacy since 3.0** — kept working, not where new work starts: run intents through the factory pipeline (§11) and the v2 herd flow (§16.7).
 
 §12 makes ONE orchestrator a standing, disk-reconstructible loop driving WORKERS for one
 feature. §13 adds a tier ABOVE it: a **meta-orchestrator** that launches and oversees
@@ -643,6 +657,8 @@ in `config.yaml`, or the hook silently never fires there.
 
 ### 15. Context budgeting & the decomposer
 
+> **Legacy since 3.0** — kept working, not where new work starts: run intents through the factory pipeline (§11) and the v2 herd flow (§16.7).
+
 §12 makes the folder the orchestrator's state; §13 stacks a tier above it. Both assume the
 orchestrator's **live context window** can hold identity + router + active contract + `_fleet` +
 declared inputs. On a long run that assumption breaks: spec/plan/tasks, worker outputs, ledger
@@ -699,7 +715,7 @@ surface instead of hiding. `status` reads the live bridge file
 (`/tmp/claude-ctx-<session>.json`) to report `USED_PCT` / `REMAINING_PCT` against `BUDGET`;
 `pointer` regenerates one slice's manifest after a §12.3 `RESCOPE` or an edit. `herd-loop.sh
 gen_prompt` then points each worker at its manifest ("Read your context manifest: <path>") instead
-of hard-coding a file list into the prompt — the §11.2/§9.2 dispatch pattern, but the context is a
+of hard-coding a file list into the prompt — the §9.2 dispatch pattern, but the context is a
 pointer, not a payload.
 
 #### 15.3 The Hermes hooks — awareness + restructure on demand
@@ -736,7 +752,7 @@ dedupe keyed on the hook **FILENAME** (not the full command string, which embeds
 path that changes across installs; same convention as §16.5) — sets the GLM-5.2 / 384k default
 in `~/.hermes/config.yaml`, and verifies with `hermes hooks doctor`. It **backs up**
 `settings.json` and `config.yaml` before touching them, only edits `context_length` (never
-rewrites the file), and supports `--dry-run` and `--uninstall`. Onboarding (§11.0) runs it
+rewrites the file), and supports `--dry-run` and `--uninstall`. Onboarding (§11.2) runs it
 automatically when the chosen orchestrator is `hermes` or `all`. `scripts/install.sh --hermes`
 also tries to run it, but resolves it relative to the install script — under the `curl | bash`
 one-liner that resolution fails and the step is **silently skipped**: when installing that way,
@@ -884,7 +900,7 @@ m2herd.sh evolve <analyze|proposals|show|apply|reject> …   # the factory learn
 m2herd.sh eval <draft|approve|status> --slice S [--cmd C]   # locked objective checks (§18)
 m2herd.sh loop <run|status|promote> …                       # scored best-of-N attempts (§18)
 m2herd.sh dashboard [--dir P] [--watch [--interval N]]     # read-only tier-1 TUI: a pure renderer over existing state — no new state, no fabric writes; --watch = flicker-free repaint loop (prefers the Go m2herd-tui when installed; M2HERD_NO_TUI=1 forces the bash renderer)
-m2herd.sh self-update [--check]           # ff-only pull of the engine repo; --check caches the behind-count for the dashboard header
+m2herd.sh self-update [--check|--auto]    # engine → newest release tag, forward only (§16.5); --check caches the state for the dashboard header
 m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync → status → resume (+ next cases, config, dashboard smoke); asserts schema fields with jq
 m2herd-up.sh selftest                     # herdr-free Pi CLI compatibility + detached-worker PID check
 ```
@@ -1058,6 +1074,18 @@ which embeds a node path that changes across upgrades); a timestamped `.bak-<ts>
 `node` is missing (the two bash hooks still register). `./scripts/onboard.sh` wires all of
 this in when the chosen orchestrator is claude (or `all`).
 
+**Auto-update.** Every install follows the newest release: `m2herd-session.sh` starts
+`m2herd self-update --auto` detached on each session start (the hook does not wait). It runs at
+most once per `M2HERD_UPDATE_INTERVAL_HOURS` (24), one runner at a time, and only moves forward —
+checkout of the newest `vX.Y.Z[-pre]` tag (`M2HERD_UPDATE_CHANNEL=release`, the default;
+`stable` skips prereleases; `main` = ff-only pull of main). A checkout of `main` is fast-forwarded
+and stays a branch; any other branch, uncommitted changes or commits the tag lacks: left alone and
+logged. Only tags on origin count. One line per run in
+`~/.cache/m2herd/update.log`; `M2HERD_AUTO_UPDATE=0` opts out; machines without sessions can
+enable `templates/systemd/m2herd-update.timer`. When a release changes `install.sh` or `hooks/`,
+`~/.cache/m2herd/relink-needed` names it: the dashboard and the SessionStart digest show it until
+`scripts/install.sh --local` runs again (it edits agent settings, so tell the user first).
+
 #### 16.6 Settings — `.m2herd/settings.json`
 
 The fabric's config layer (`schema_version: 1`, seeded from `templates/m2herd/settings.json`).
@@ -1107,7 +1135,7 @@ through `inbox/STEER.md`; state stays orchestrator-only.
 #### 16.7 The herd view and the v2 herd flow
 
 The human watches the **orchestrator's tab**: the orchestrator (left 2/3) and ONE `herd-board`
-(right 1/3). Worker TUIs live in their own tab `herde`, where the human drops in only to talk to a
+(right 1/3). Worker TUIs live in their own tab `herd` (pre-3.0 `herde` tabs are still recognised), where the human drops in only to talk to a
 worker. Since 2.10.0 a herd runs on one schema, `docs/herd-flow-v2.md` (the build contract; it
 wins over this summary):
 
@@ -1135,7 +1163,7 @@ fills them in and writes `<slice>.ctx.<role>.md` with the rules, task, report, f
 list, memory files and a register excerpt — the one file an agent starts from.
 
     herd-phase <herd> <slice> <phase> [--field k=v …] [--note …]   # the only writer; --state [--json] reads
-    herd-spawn <herd> <slice> [--resume]     # worker TUI → tab herde; model/effort from the header; refuses without a slot
+    herd-spawn <herd> <slice> [--resume]     # worker TUI → tab herd; model/effort from the header; refuses without a slot
     herd-watch <herd>                        # long-running: starts fix_queued before queued, respects stacked_on, wakes $HERD_ORCH_PANE
     herd-limits [<herd>]                     # one budget for workers AND review agents (slots, free MB, load)
     herd-clash <herd> [--json]               # files two live slices both touch → ⇄ on the board
@@ -1169,9 +1197,8 @@ stops at the first failure. Any merge on a repo's main makes every other `review
 that repo *stale* (yellow) until it is re-probed. In auto mode the merge needs the human's merge
 instruction in the current turn — a reviewer's ✓ is not one.
 
-**What the board shows.** Lanes, each only when non-empty: **Queue** (! fix rounds first, then ◌ queued with why it waits),
-**Working** (? blocked first, ● working, ⧗ tests running, ↺ fix round, ✓ reported, ⚠ still, ✕ gone, ◆ the
-orchestrator's own subagents), **Ready to merge** (◇ accepted + why the review waits, … review
+**What the board shows.** Lanes, each only when non-empty: **Working** (? blocked first, ● working, ⧗ tests running, ↺ fix round, ✓ reported, ⚠ still, ✕ gone, ◆ the
+orchestrator's own subagents), **Queue** under it so running workers stay on top (! fix rounds first, then ◌ queued with why it waits), **Ready to merge** (◇ accepted + why the review waits, … review
 round n/3, ✓ rev'd ✓ + the exact merge word @sha7, ⟳ stale, ! findings), **Merged today**. Header: `slots n/m (k
 review)`, free RAM and disk. Each row ends with model·effort (`O·hi`, `F·hi`, `S·md`).
 The icon carries the meaning, colour only reinforces it (`NO_COLOR`); lines are never cut with
@@ -1183,7 +1210,7 @@ registers every main-thread subagent in `~/.cache/herd-board/<anchor>.agents/` a
 if it is not live; silent in a herd worker's pane. It never blocks the tool call.
 
 **Lifecycle.** Keep a worker pane while its PR may still need rework; right after the merge
-`herdr pane close` it (the emptied `herde` tab closes itself) and remove the worktree. Moving a
+`herdr pane close` it (the emptied `herd` tab closes itself) and remove the worktree. Moving a
 running pane needs no restart (`herdr pane move <p> --tab <t> --target-pane <q> --split down`);
 pane ids survive, and a move steals focus, so focus `$SELF` again.
 
@@ -1352,16 +1379,16 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 | Channel intent → herd | re-read intent → clarify if needed → write `/tmp/herd-plan.md` → `worktree create` per slice → `agent start codex --no-focus` per slice → subscribe/poll `agent_status_changed` → unblock → converge → review → post summary on channel |
 | Review before report | spawn reviewer agents on the integration branch (one lens each) → fix P1s → carry P2/P3 into the summary (§9.5) |
 | Compound a run | write `~/.herdr/runs/<date>-<slug>.md` with a `next time` line → store gist in fleet memory → recurring lessons become PRs to this skill (§10) |
-| Onboard the factory | `./scripts/onboard.sh` — choose claude/hermes/cursor orchestrator, install spec-kit, `specify init` the repo (§11.0) |
+| Onboard the factory | `./scripts/onboard.sh` — choose claude/hermes/cursor/pi orchestrator, install spec-kit + EGM (pinned), `specify init` the repo (§11.2) |
 | ICM-steered loop | `scripts/herd-loop.sh init\|tick\|run\|status` over a `templates/herd-control/` workspace — folder=desired, socket=observed, loop reconciles (§12) |
-| SDD factory loop | `/speckit.specify` → `/speckit.clarify` → `/speckit.plan` → `/speckit.tasks` → herd the `[P]` tasks (§11.2) → `/speckit.analyze` → converge vs `spec.md` → compound (§11) |
+| Factory pipeline | `m2herd triage "<intent>" --files …` (G0) → quick: one slice; standard/full: `/speckit.specify` → `clarify` → `plan` → EGM review + `m2herd gate record`/`approve … G1` → `/speckit.tasks` → slices + HERD-CUT (G2) → herd (§16.7) → review loop, `blind: true` opt-in (G4) → `herd-merge` on the go (G5); `m2herd gate status` says who acts next (§11) |
 | Meta-orchestrate | `scripts/fleet-loop.sh init\|tick\|run\|status` over a `templates/fleet-control/` workspace — one orchestrator per mission in `missions.tsv`, each `/goal`-armed to self-drive its herd; meta launches/oversees/converges (§13) |
 | Which orchestrator? | `cat ~/.config/herdr-factory/config.toml` |
 | Dispatch nudge (hooks) | `./scripts/install.sh` wires `hooks/herdr-dispatch-nudge.sh` into Claude's `UserPromptSubmit` + Hermes's `pre_llm_call` — a per-turn reminder to consider herding, never an auto-spawn (§14) |
 | m2herd context fabric | `m2herd boot\|note\|refile\|resume\|sync --check\|archive\|gist --push\|next\|dashboard` over the repo's `.m2herd/`; `m2herd-up up\|dispatch\|collect\|down` for the 1-orchestrator + 1-machineroom workspace (machineroom pane runs `m2herd dashboard --watch`) — folder holds the context, orchestrator holds pointers, `next` is the machine's own next move, the dashboard is read-only (§16) |
 | m2herd settings | `m2herd config list\|get\|set` over `.m2herd/settings.json` (defaults + validation); `,` in `m2herd-tui` opens the settings editor — config file only, never state (§16.6) |
 | Tear down / retry a worker | `m2herd-up down --slice S [--force]` (pane + worktree + merged branch, idempotent), then re-dispatch; `--all` sweeps every worker (§16.3) |
-| Herd view | `herd-spawn <herd-dir> <slice> <worktree>` puts the worker TUI in tab `herde`; `herd-board` in the right third of the orchestrator tab shows workers + subagents + ready-to-merge PRs; the PreToolUse hook adds every Agent/Task subagent to it (§16.7) |
+| Herd view | `herd-spawn <herd-dir> <slice> <worktree>` puts the worker TUI in tab `herd`; `herd-board` in the right third of the orchestrator tab shows workers + subagents + ready-to-merge PRs; the PreToolUse hook adds every Agent/Task subagent to it (§16.7) |
 | Factory learns | `m2herd evolve analyze` → `proposals` → `show <id>` → `apply <id> [--ack-repo]`\|`reject <id>`; accepted lessons land in `.m2herd/evolver/LESSONS.md` and auto-annotate every dispatch pointer (§17) |
 
 Full CLI + socket reference: [reference.md](reference.md).

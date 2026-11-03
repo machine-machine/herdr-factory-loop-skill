@@ -96,13 +96,13 @@ All in `scripts/`, linked by `install.sh` into `~/.local/bin` without the extens
   task header; refuses to start when `herd-limits` says no slot (prints why); new session gets
   `--session-id <uuid4>` recorded in the `working` event; `--resume` continues THAT id with
   `claude --resume <id>` and, when the last phase is `fix_queued`, the prompt points at the
-  `befunde_file`. Pane placement unchanged (tab `herde`, split the tallest pane, right when < 24 rows).
+  `befunde_file`. Pane placement unchanged (tab `herd` — `herde` before 3.0 —, split the tallest pane, right when < 24 rows).
 - `herd-limits` — single budget for workers AND review agents: env/`<herd>/limits.env`
   `HERD_MAX_SLOTS` (default 6), `HERD_MIN_FREE_MB` (default 8000), `HERD_MAX_LOAD` (default = cores×2.5).
   Exit 0 = slot free; prints `slots used/max, free MB, load`.
 - `herd-watch <herd>` — long-running (does not exit per event): starts `fix_queued` before `queued`,
   respects `stacked_on` (base at least `accepted`), keeps a slice queued when its start fails
-  (logs the error, retries next tick), recognises herdr `done`, finds the `herde` tab by label (no
+  (logs the error, retries next tick), recognises herdr `done`, finds the `herd` tab by label (no
   hard-coded tab id), wakes the orchestrator on reported/blocked via `herdr agent prompt` only to the
   pane named in `HERD_ORCH_PANE`.
 - `herd-clash <herd>` — prints overlapping files between live slices per repo; `--json` for the board.

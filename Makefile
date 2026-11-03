@@ -79,7 +79,7 @@ test:
 	python3 scripts/herd-board --selftest
 	$(MAKE) test-herd
 
-# herd flow v2 suites (docs/herd-flow-v2.md) — offline: temp HOME, stubbed herdr/gh/lage, no bytecode
+# herd flow v2 + factory gate suites (docs/herd-flow-v2.md, docs/factory-v3.md) — offline: temp HOME, stubbed herdr/gh/lage, no bytecode
 test-herd:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/herd-clash --selftest
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/register-excerpt.py --selftest
@@ -96,6 +96,10 @@ test-herd:
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/purge/test_m2herd_purge.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/m2herd-steer --selftest
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/steer/test_steer.py
+	PYTHONDONTWRITEBYTECODE=1 python3 tests/gates/test_gates.py
+	bash tests/update/test_self_update.sh
+	bash tests/fleet/test_empty_fleet.sh
+	bash tests/onboard/test_onboard_pins.sh
 
 # ci — the documented pre-commit check: the same steps CI runs
 # (.github/workflows/ci.yml). Go steps run only when go is on PATH.
