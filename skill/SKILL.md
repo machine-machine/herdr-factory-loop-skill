@@ -1185,9 +1185,8 @@ stops at the first failure. Any merge on a repo's main makes every other `review
 that repo *stale* (yellow) until it is re-probed. In auto mode the merge needs the human's merge
 instruction in the current turn — a reviewer's ✓ is not one.
 
-**What the board shows.** Lanes, each only when non-empty: **Queue** (! fix rounds first, then ◌ queued with why it waits),
-**Working** (? blocked first, ● working, ⧗ tests running, ↺ fix round, ✓ reported, ⚠ still, ✕ gone, ◆ the
-orchestrator's own subagents), **Ready to merge** (◇ accepted + why the review waits, … review
+**What the board shows.** Lanes, each only when non-empty: **Working** (? blocked first, ● working, ⧗ tests running, ↺ fix round, ✓ reported, ⚠ still, ✕ gone, ◆ the
+orchestrator's own subagents), **Queue** under it so running workers stay on top (! fix rounds first, then ◌ queued with why it waits), **Ready to merge** (◇ accepted + why the review waits, … review
 round n/3, ✓ rev'd ✓ + the exact merge word @sha7, ⟳ stale, ! findings), **Merged today**. Header: `slots n/m (k
 review)`, free RAM and disk. Each row ends with model·effort (`O·hi`, `F·hi`, `S·md`).
 The icon carries the meaning, colour only reinforces it (`NO_COLOR`); lines are never cut with

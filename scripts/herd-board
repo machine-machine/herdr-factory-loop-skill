@@ -10,10 +10,11 @@ Usage: herd-board [--anchor <pane>] [<herd-dir> ...]
 Herd dirs: those given plus those listed in ~/.cache/herd-board/<anchor>.herds. The state of a slice is its last
 event in <herd>/herd.events.jsonl (read through herd_events.py next to this script); everything live is computed.
 Lanes, top to bottom, each drawn only when non-empty:
-  1. Queue          ! fix_queued (always first), ◌ queued "starts as no. n" + why it waits (slot, base, memory)
-  2. Working        ? herdr reports `blocked` (first, yellow), ● working (⧗ tests/build, ↺ fix round),
+  1. Working        ? herdr reports `blocked` (first, yellow), ● working (⧗ tests/build, ↺ fix round),
                     ✓ reported (report written, idle), ⚠ still, ✕ gone,
                     plus the orchestrator's own subagents (◆) and Workflow runs (▸ one line; ⚠ only for a still agent)
+  2. Queue          ! fix_queued (always first), ◌ queued "starts as no. n" + why it waits (slot, base, memory);
+                    under Working, so the running workers stay at the top
   3. Ready to merge one row per package: ◇ accepted (+ why the review waits), … review running (round n/3),
                     ✓ rev'd ✓ + the exact merge word (reviewed on current heads), ✓ rev'd waiting for a partner or
                     base, ⟳ stale (PR head or main moved since review_ok), ! findings
@@ -1356,13 +1357,14 @@ def render(anchor, given):
     def lane(k, col):
         return [lane_title(k, col)] + fit(blocks[k], limit[k] - 1) if blocks[k] else []
 
-    body = lane("queue", YEL)
+    queue = lane("queue", YEL)  # under Working (user 29.10.2026: queue below the working workers)
+    body = []
     foot = ([""] + lane("ready", GREEN) if blocks["ready"] else []) + ([""] + merged_lines if merged_lines else [])
 
     # Working lane, adaptive: the free height is shared evenly — one worker gets a full picture plus its step feed,
     # ten workers get one line each; a blank separator only when every worker has room to spare
     rows = lanes["work"]
-    free = avail - len(body) - len(foot) - (1 if rows else 0)
+    free = avail - len(queue) - (1 if rows and queue else 0) - len(foot) - (1 if rows else 0)
     if rows:
         body.append(lane_title("work", CYAN))
         sep = 1 if free // len(rows) >= 4 else 0
@@ -1380,6 +1382,8 @@ def render(anchor, given):
             body += detail_lines(row[:7] + (d,), budget - (len(hl) - 1), w)
         if len(shown) < len(rows):
             body.append(f"{DIM}+{len(rows) - len(shown)} {t('more')}{RST}")
+    if queue:
+        body += ([""] if rows else []) + queue
     busy = any(lanes.values()) or bool(merged_lines)
     if not busy:
         body.append(f"{DIM}{t('idle')}{RST}")
@@ -1626,16 +1630,17 @@ def selftest():
                 row = lambda s: next((l for l in lines if re.match(rf"^\S+ {re.escape(s)}(\s|$)", l)), "")
                 order = [next((i for i, l in enumerate(lines) if l == t("lane_" + k)), -1)
                          for k in ("queue", "work", "ready")]
-                check(f"[{lang}] all three lanes in order", busy and -1 not in order and order == sorted(order))
+                check(f"[{lang}] all three lanes in order (Working, Queue, Ready)", busy and -1 not in order
+                      and order[1] < order[0] < order[2])
                 ready_at = next((i for i, l in enumerate(lines) if l.startswith("✓ ok-api+ok-ui")), -1)
                 check(f"[{lang}] clean package: rev'd ✓ + merge word under Ready to merge",
                       order[2] < ready_at and f"{t('reviewed')} ✓" in lines[ready_at]
                       and t("word", w="merge ok-api") in text and "✓✓" not in text)
                 check(f"[{lang}] blocked slice first under Working, yellow ?", "? w-blk" in row("w-blk") and
-                      order[1] < lines.index(row("w-blk")) < order[2])
+                      order[1] < lines.index(row("w-blk")) < order[0])
                 check(f"[{lang}] header slots, no you-counter", t("slots", u=4, m=6, k=1) in lines[0]
                       and "du:" not in lines[0] and "you:" not in lines[0])
-                q = [l.split()[1] for l in lines[order[0] + 1:order[1]] if l[:1] in "!◌"]
+                q = [l.split()[1] for l in lines[order[0] + 1:order[2]] if l[:1] and l[:1] in "!◌"]
                 check(f"[{lang}] queue: fix first, then by pos", q == ["fx", "q-two", "q-one", "q-stack"])
                 check(f"[{lang}] fix row + base reason", t("fix_queued", pos=1) in row("fx")
                       and t("w_base_q", b="w-run") in row("q-stack"))

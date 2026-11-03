@@ -48,6 +48,8 @@ pass on by default follow in 3.0.0.
   title is "Herd". `herd-spawn`, `herd-limits` and `herd-loop.sh` still recognise a tab labelled
   `herde` (a `herd` tab wins when both exist) unless `HERD_SPAWN_TAB` / `HERD_TAB` names another
   label, so running herds keep their slots across the upgrade.
+- herd-board: the Queue lane sits under Working, so the running workers stay at the top (operator
+  request 29.10.2026; was a local patch on the installed copy until now).
 - SKILL.md §11 rewritten as "The factory pipeline" (G0–G5); the hand-rolled `tasks.md` bash dispatch
   is gone in favour of herd-flow-v2 slices, `herd-phase … queued` and `herd-watch`. README stack map:
   start at §11 + §16; §9, §12, §13, §15 legacy. Skill description gains triage/gate/EGM triggers.
