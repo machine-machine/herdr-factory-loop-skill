@@ -134,7 +134,7 @@ with today's flags and the tier only changes the gates.
 
 | Upstream | Adoption | Pin |
 |---|---|---|
-| github/spec-kit | the one artifact chain, unchanged | `uv tool install` git ref in onboard.sh |
+| github/spec-kit | the one artifact chain, unchanged | `SPEC_KIT_REF` in `scripts/onboard.sh` (the commit the fleet runs), passed to `uv tool install` / `uvx` |
 | google/elephant-goldfish-model (Apache-2.0) | Claude Code plugin `egm@egm`: review, resolve, review loop, drift report; brainstorm and bootstrap on the full track. Not used: draft, its `docs/designs/` layout | `EGM_PIN` in `scripts/onboard.sh`; the plugin CLI cannot install a ref, so onboarding compares the installed `gitCommitSha` with the pin and warns on a mismatch |
 | bmad-code-org/bmad-method (MIT) | ideas only, never installed: right-sized tracks, role lenses for G1, verified context for inherited codebases | `NOTICE` |
 

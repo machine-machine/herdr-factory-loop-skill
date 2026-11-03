@@ -26,7 +26,9 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/herdr-factory"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
-SPEC_KIT_GIT="git+https://github.com/github/spec-kit.git"
+# spec-kit is pinned like EGM (docs/factory-v3.md §7): the commit the fleet runs; bump after a bench run
+SPEC_KIT_REF="1b0556c711b633a6d50b2e2f5f8db0e6717489d3"
+SPEC_KIT_GIT="git+https://github.com/github/spec-kit.git@$SPEC_KIT_REF"
 # EGM is a pinned dependency (docs/factory-v3.md §7). Bump only after a bench run; the plugin CLI
 # cannot install a ref, so step 5 installs the marketplace head and compares it with this pin.
 EGM_REPO="google/elephant-goldfish-model"
@@ -393,6 +395,7 @@ cat > "$CONFIG_FILE" <<EOF
 primary = "$ORCHESTRATOR"
 
 [speckit]
+ref = "$SPEC_KIT_REF"
 cli = "${SPECIFY_BIN:-uvx --from $SPEC_KIT_GIT specify}"
 last_repo = "${TARGET_REPO:-}"
 initialized = $SPECKIT_INITIALIZED

@@ -37,7 +37,8 @@ pass on by default follow in 3.0.0.
 - **EGM in onboarding** — `scripts/onboard.sh` step 5 installs the `egm` plugin
   (google/elephant-goldfish-model), compares the installed commit with `EGM_PIN`, records how the
   orchestrator gets fresh subagents (native or a headless `claude -p` worker) and writes an `[egm]`
-  block to `~/.config/herdr-factory/config.toml`.
+  block to `~/.config/herdr-factory/config.toml`. spec-kit is pinned the same way (`SPEC_KIT_REF`,
+  recorded as `[speckit] ref`).
 - **Auto-update to the newest release** — `m2herd self-update` now moves the engine repo to the
   newest release tag (`M2HERD_UPDATE_CHANNEL=release`, prereleases included; `stable`; `main` keeps
   the old ff-only pull of main). Forward only: an engine at or ahead of the tag stays, one with
