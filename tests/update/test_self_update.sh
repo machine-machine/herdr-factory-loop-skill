@@ -43,6 +43,17 @@ M2HERD_UPDATE_CHANNEL=stable m2 self-update >/dev/null
 check "stable channel stops at v1.10.0" 'head_is v1.10.0'
 check "bad channel is refused" '! M2HERD_UPDATE_CHANNEL=nightly m2 self-update --check >/dev/null 2>&1'
 
+# the installer's shallow clone (--depth 1) of a main that is ahead of the newest tag: no false "diverged"
+rm -rf "$T/eng"; git clone -q --depth 1 "file://$T/origin.git" "$T/eng" 2>/dev/null
+out="$(m2 self-update --check)"
+check "shallow clone ahead of the newest tag reads up-to-date" 'printf "%s" "$out" | grep -q "up-to-date" && cache | grep -q "^up-to-date "'
+
+# a tag that exists only locally (or was deleted on origin) never counts
+engine v1.0.0
+git -C "$T/eng" tag v9.0.0 v1.0.0
+m2 self-update --check >/dev/null
+check "local-only tag is ignored" 'cache | grep -q " v2.0.0-alpha$"'
+
 # never downgrade: an engine ahead of the newest tag stays
 engine main
 m2 self-update >/dev/null
@@ -60,6 +71,19 @@ engine v1.0.0
 echo dirty > "$T/eng/v.txt"
 m2 self-update >/dev/null 2>&1; rc=$?
 check "dirty engine is refused (exit 2)" '[ "$rc" -eq 2 ] && head_is v1.0.0'
+
+# a checkout of main is fast-forwarded to the tag and stays on main; a working branch is never moved
+engine v1.0.0
+git -C "$T/eng" checkout -q -B main v1.0.0
+m2 self-update >/dev/null
+check "main checkout: fast-forwarded to the tag" 'head_is v2.0.0-alpha'
+check "main checkout: still on branch main" '[ "$(git -C "$T/eng" symbolic-ref --short HEAD)" = main ]'
+engine v1.0.0
+git -C "$T/eng" checkout -q -b my-feature v1.0.0
+M2HERD_UPDATE_INTERVAL_HOURS=0 m2 self-update --auto
+check "working branch: auto never moves it" 'head_is v1.0.0 && [ "$(git -C "$T/eng" symbolic-ref --short HEAD)" = my-feature ]'
+check "working branch: logged as diverged" 'tail -1 "$HOME/.cache/m2herd/update.log" | grep -q "^[0-9T:-]*Z diverged"'
+rm -f "$HOME/.cache/m2herd/update-auto.stamp"
 
 # main channel keeps the pre-3.0 behaviour: ff-only pull of main
 engine v1.0.0
@@ -85,6 +109,14 @@ git -C "$T/eng" checkout -q -- v.txt
 git -C "$T/eng" remote set-url origin "$T/nowhere.git"
 M2HERD_UPDATE_INTERVAL_HOURS=0 m2 self-update --auto; rc=$?
 check "auto offline: exit 0, logged unknown" '[ "$rc" -eq 0 ] && tail -1 "$HOME/.cache/m2herd/update.log" | grep -q "unknown"'
+
+# a release that changes hooks/ or install.sh leaves a visible relink state after --auto
+(cd "$T/seed" && mkdir -p hooks && echo x > hooks/new-hook.sh && git add -A && git commit -qm hook && git tag v2.0.0 && git push -q origin main --tags)
+engine v2.0.0-alpha
+M2HERD_UPDATE_INTERVAL_HOURS=0 m2 self-update --auto
+check "auto to a release that changed hooks: relink state" 'head_is v2.0.0 && cache | grep -q "^relink 0 .* v2.0.0$"'
+row="$(cd "$T" && rm -rf d0 && git init -q d0 && cd d0 && bash "$REPO/scripts/m2herd.sh" init --goal t >/dev/null && NO_COLOR=1 bash "$REPO/scripts/m2herd.sh" dashboard 2>/dev/null | grep '^update:')"
+check "dashboard shows the relink row" 'printf "%s" "$row" | grep -q "install.sh --local"'
 
 # the dashboard row reads the four-field cache
 printf 'behind 2 %s v9.9.9\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$HOME/.cache/m2herd/update-status"

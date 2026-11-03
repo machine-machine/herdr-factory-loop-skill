@@ -221,6 +221,11 @@ class Cli(unittest.TestCase):
         cli(self.base, "triage", "refresh the thing", "--id", "u1", "--track", "quick")
         _, out, _ = cli(self.base, "status", "u1")
         self.assertIn("orchestrator: one slice", out)
+        cli(self.base, "triage", "refresh the thing", "--id", "u2")                       # UNSURE standard …
+        rc, out, _ = cli(self.base, "triage", "refresh the thing", "--id", "u2", "--track", "standard", "--json")
+        self.assertEqual((rc, json.loads(out)["sure"]), (0, True))                         # … confirmed as is
+        _, out, _ = cli(self.base, "status", "u2")
+        self.assertNotIn("pick the track", out)
 
     def test_bad_run_id_and_missing_run(self):
         rc, _, err = cli(self.base, "triage", "x", "--id", "../evil")

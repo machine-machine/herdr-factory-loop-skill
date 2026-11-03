@@ -1078,8 +1078,9 @@ this in when the chosen orchestrator is claude (or `all`).
 `m2herd self-update --auto` detached on each session start (the hook does not wait). It runs at
 most once per `M2HERD_UPDATE_INTERVAL_HOURS` (24), one runner at a time, and only moves forward —
 checkout of the newest `vX.Y.Z[-pre]` tag (`M2HERD_UPDATE_CHANNEL=release`, the default;
-`stable` skips prereleases; `main` = ff-only pull of main). An engine with uncommitted changes or
-with commits the tag lacks is left alone and logged. One line per run in
+`stable` skips prereleases; `main` = ff-only pull of main). A checkout of `main` is fast-forwarded
+and stays a branch; any other branch, uncommitted changes or commits the tag lacks: left alone and
+logged. Only tags on origin count. One line per run in
 `~/.cache/m2herd/update.log`; `M2HERD_AUTO_UPDATE=0` opts out; machines without sessions can
 enable `templates/systemd/m2herd-update.timer`. When a release changes `install.sh` or `hooks/`,
 the log line says to re-run `scripts/install.sh --local`.

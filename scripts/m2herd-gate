@@ -187,8 +187,9 @@ def main(argv=None):
             d = triage(o.intent, files)
             if o.tier and he.TIERS.index(o.tier) > he.TIERS.index(d["tier"]):
                 d["tier"], d["reasons"] = o.tier, d["reasons"] + [f"tier raised to {o.tier} by --tier"]
-            if o.track and o.track != d["track"]:
-                d["reasons"] = d["reasons"] + [f"track {d['track']} → {o.track} by --track"]
+            if o.track:   # the human's pick, also when it confirms the rule's (UNSURE) answer
+                d["reasons"] = d["reasons"] + ([f"track {d['track']} → {o.track} by --track"] if o.track != d["track"]
+                                               else [f"track {o.track} confirmed by --track"])
                 d["track"], d["sure"], d["override"] = o.track, True, True
             if d["tier"] == "high" and d["track"] != "full" and not o.force:
                 raise he.TransitionError("a high-tier run needs the full track (docs/factory-v3.md §6); "

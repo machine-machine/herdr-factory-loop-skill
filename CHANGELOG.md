@@ -41,7 +41,11 @@ pass on by default follow in 3.0.0.
 - **Auto-update to the newest release** — `m2herd self-update` now moves the engine repo to the
   newest release tag (`M2HERD_UPDATE_CHANNEL=release`, prereleases included; `stable`; `main` keeps
   the old ff-only pull of main). Forward only: an engine at or ahead of the tag stays, one with
-  uncommitted changes or commits the tag lacks is refused. `--auto` is the routine: quiet, once per
+  uncommitted changes or commits the tag lacks is refused. A detached engine moves to the tag, a
+  checkout of `main` is fast-forwarded to it (stays a branch), any other branch is never moved.
+  Only tags on origin count; the installer's shallow clone is unshallowed once so it is not
+  mistaken for diverged. A release that changes `install.sh` or `hooks/` leaves a `relink` state
+  the dashboard shows until `install.sh --local` runs. `--auto` is the routine: quiet, once per
   `M2HERD_UPDATE_INTERVAL_HOURS` (24), one runner at a time, never fails, logs to
   `~/.cache/m2herd/update.log`; `m2herd-session.sh` starts it detached on every session
   (`M2HERD_AUTO_UPDATE=0` opts out); `templates/systemd/m2herd-update.{service,timer}` for machines
@@ -72,7 +76,8 @@ pass on by default follow in 3.0.0.
   `AWAITING_SOLO (fill missions.tsv)` (re-done against 3.0 from an unpushed June fix;
   `tests/fleet/test_empty_fleet.sh`).
 - Triage: after an UNSURE triage the human's `--track` pick was refused as "lowering"; it may now
-  lower the track, and `gate status` names the human as the next actor of an UNSURE run (found by
+  lower the track — or confirm the rule's answer — and `gate status` names the human as the next
+  actor of an UNSURE run until they do (found by
   running the pipeline on its own release; confirmed by the blind review and both skeptics).
 - Default run ids carry a hash of the whole intent, so two intents sharing their first 40
   characters no longer collapse into one run (main review, confirmed by both skeptics).

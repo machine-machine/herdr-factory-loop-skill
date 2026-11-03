@@ -919,13 +919,16 @@ engine_repo() { cd "$(dirname "$(self_path)")/.." 2>/dev/null && pwd; }
 # prereleases included; `stable` skips prereleases; `main` is the pre-3.0 behaviour (ff-only pull of
 # main). Every channel only moves forward: an engine at or ahead of the target stays, one with
 # commits the target lacks (local work, a feature branch) is left alone and reported as diverged.
+# A detached engine (the installer's clone after its first update) moves to the tag; a checkout of
+# `main` is fast-forwarded to it and stays on main; any other branch is a working branch — never moved.
 UPDATE_CHANNEL="${M2HERD_UPDATE_CHANNEL:-release}"
 UPDATE_LOG="$HOME/.cache/m2herd/update.log"
 UPDATE_STAMP="$HOME/.cache/m2herd/update-auto.stamp"
 
-# newest release tag by semver — a prerelease sorts below its release ("-" → "~" for sort -V)
+# newest release tag ON ORIGIN by semver (a local or deleted tag never counts) — a prerelease
+# sorts below its release ("-" → "~" for sort -V)
 latest_release_tag() { # latest_release_tag <repo> <channel>
-  git -C "$1" tag -l 'v[0-9]*' \
+  GIT_TERMINAL_PROMPT=0 git -C "$1" ls-remote --tags --refs origin 'v*' 2>/dev/null | sed 's|.*refs/tags/||' \
     | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
     | { if [ "$2" = stable ]; then grep -v -- '-'; else cat; fi; } \
     | sed 's/-/~/' | sort -V | tail -1 | sed 's/~/-/' || true
@@ -944,11 +947,18 @@ update_resolve() { # update_resolve <repo>
     UPD_TARGET=origin/main
   else
     GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet --tags --force origin 2>/dev/null || return 0
+    # the installer clones with --depth 1: without history every tag would look unrelated (diverged)
+    if [ "$(git -C "$repo" rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
+      GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet --unshallow --tags origin 2>/dev/null || return 0
+    fi
     UPD_TARGET="$(latest_release_tag "$repo" "$UPDATE_CHANNEL")"
     if [ -z "$UPD_TARGET" ]; then UPD_STATE=none; return 0; fi
   fi
+  local br; br="$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
   if git -C "$repo" merge-base --is-ancestor "$UPD_TARGET" HEAD 2>/dev/null; then
     UPD_STATE=up-to-date
+  elif [ -n "$br" ] && [ "$br" != main ]; then
+    UPD_STATE=diverged   # on a working branch: someone develops here, the update never moves it
   elif git -C "$repo" merge-base --is-ancestor HEAD "$UPD_TARGET" 2>/dev/null; then
     UPD_STATE=behind; UPD_N="$(git -C "$repo" rev-list --count "HEAD..$UPD_TARGET" 2>/dev/null || echo 0)"
   else
@@ -962,6 +972,8 @@ update_status_write() { printf '%s %s %s %s\n' "$UPD_STATE" "$UPD_N" "$(ts)" "${
 update_apply() { # update_apply <repo>
   if [ "$UPDATE_CHANNEL" = main ]; then
     GIT_TERMINAL_PROMPT=0 git -C "$1" pull --quiet --ff-only origin main
+  elif git -C "$1" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
+    git -C "$1" merge --quiet --ff-only "$UPD_TARGET"   # on main (update_resolve): stays a branch
   else
     git -C "$1" -c advice.detachedHead=false checkout --quiet --detach "$UPD_TARGET"
   fi
@@ -1011,7 +1023,7 @@ self_update_cmd() {
 # M2HERD_UPDATE_INTERVAL_HOURS (default 24), one runner at a time, never fails;
 # M2HERD_AUTO_UPDATE=0 turns it off. One line per run in ~/.cache/m2herd/update.log.
 self_update_auto() { # self_update_auto <repo>
-  local repo="$1" h="${M2HERD_UPDATE_INTERVAL_HOURS:-24}" old msg
+  local repo="$1" h="${M2HERD_UPDATE_INTERVAL_HOURS:-24}" old msg hint
   [ "${M2HERD_AUTO_UPDATE:-1}" != 0 ] || return 0
   case "$h" in ''|*[!0-9]*) h=24 ;; esac
   if [ "$h" -gt 0 ] && [ -f "$UPDATE_STAMP" ] && [ -n "$(find "$UPDATE_STAMP" -mmin "-$((h * 60))" 2>/dev/null)" ]; then
@@ -1029,8 +1041,11 @@ self_update_auto() { # self_update_auto <repo>
     else
       old="$(git -C "$repo" rev-parse --short HEAD)"
       if update_apply "$repo" >/dev/null 2>&1; then
-        UPD_STATE=up-to-date; UPD_N=0; update_status_write
-        msg="updated $old -> $UPD_TARGET$(update_relink_hint "$repo" "$old" | sed 's/^/; /')"
+        UPD_STATE=up-to-date; UPD_N=0
+        hint="$(update_relink_hint "$repo" "$old")"
+        [ -z "$hint" ] || UPD_STATE=relink   # the dashboard shows it until install.sh runs again
+        update_status_write
+        msg="updated $old -> $UPD_TARGET${hint:+; $hint}"
       else
         msg="update to $UPD_TARGET failed"
       fi
@@ -1044,6 +1059,10 @@ update_row() {
   local Y="$1" R="$2" word n when target age now ep
   [ -f "$UPDATE_CACHE" ] || return 0
   read -r word n when target < "$UPDATE_CACHE" 2>/dev/null || return 0
+  if [ "$word" = relink ]; then   # set by --auto; cleared by the next check after install.sh ran
+    printf 'update:    %sat %s — hooks/installer changed: run %s/scripts/install.sh --local%s\n' \
+      "$Y" "${target:-}" "$(engine_repo)" "$R"; return 0
+  fi
   [ "$word" = "behind" ] || return 0
   now="$(date -u +%s)"
   ep="$(epoch_of "$when")"
