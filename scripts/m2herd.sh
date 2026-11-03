@@ -991,7 +991,8 @@ update_apply() { # update_apply <repo>
 # a release that changes install.sh or hooks/ may add links or hook entries the running install lacks
 update_relink_hint() { # update_relink_hint <repo> <old-sha>  — prints the hint and leaves the marker
   git -C "$1" diff --quiet "$2" HEAD -- scripts/install.sh hooks/ 2>/dev/null && return 0
-  local hint="release $UPD_TARGET changed install.sh or hooks/ — run: $1/scripts/install.sh --local"
+  local what="release $UPD_TARGET"; [ "$UPDATE_CHANNEL" != main ] || what="the update to origin/main"
+  local hint="$what changed install.sh or hooks/ — run: $1/scripts/install.sh --local"
   printf '%s\n' "$hint" > "$UPDATE_RELINK" 2>/dev/null || true
   echo "$hint"
 }

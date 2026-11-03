@@ -136,6 +136,18 @@ chmod +x "$T/shim/git"
 out="$(PATH="$T/shim:$PATH" m2 self-update --check)"
 check "tag pushed mid-check: behind, not diverged" 'printf "%s" "$out" | grep -q "behind v2.1.0" && git -C "$T/eng" rev-parse -q --verify refs/tags/v2.1.0 >/dev/null'
 
+# re-running the README one-liner on a detached (release-following) engine moves it to the newest
+# release, never onto main's untagged head
+commit untagged-after-v2.1.0; git -C "$T/seed" push -q origin main
+check "fixture: main is ahead of the newest tag" '[ "$(sha main)" != "$(sha v2.1.0)" ]'
+engine v1.0.0
+(cd "$T" && HERMES_SKILL_CACHE_DIR="$T/eng" M2HERD_AUTO_UPDATE=0 bash -s -- --cursor < "$REPO/scripts/install.sh" >/dev/null 2>&1)
+check "one-liner re-run: detached engine goes to the newest release, not main" 'head_is v2.1.0'
+engine v1.0.0
+git -C "$T/eng" checkout -q -B main v1.0.0
+(cd "$T" && HERMES_SKILL_CACHE_DIR="$T/eng" M2HERD_AUTO_UPDATE=0 bash -s -- --cursor < "$REPO/scripts/install.sh" >/dev/null 2>&1)
+check "one-liner re-run: a main checkout still pulls main" 'head_is main && [ "$(git -C "$T/eng" symbolic-ref --short HEAD)" = main ]'
+
 # the dashboard row reads the four-field cache
 printf 'behind 2 %s v9.9.9\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$HOME/.cache/m2herd/update-status"
 row="$(cd "$T" && git init -q d && cd d && bash "$REPO/scripts/m2herd.sh" init --goal t >/dev/null && NO_COLOR=1 bash "$REPO/scripts/m2herd.sh" dashboard 2>/dev/null | grep '^update:')"

@@ -256,6 +256,7 @@ specify_installed_sha() {
   for f in "$d"/specify-cli/lib/python*/site-packages/specify_cli-*.dist-info/direct_url.json; do
     [ -f "$f" ] && jq -r '.vcs_info.commit_id // empty' "$f" 2>/dev/null && return 0
   done
+  return 0   # pipx, PyPI or another prefix: unknown, never fatal under set -e
 }
 if command -v specify >/dev/null 2>&1; then
   SPECIFY_BIN=$(command -v specify)

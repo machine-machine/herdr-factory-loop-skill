@@ -48,7 +48,9 @@ pass on by default follow in 3.0.0.
   Only tags on origin count; the installer's shallow clone is unshallowed once so it is not
   mistaken for diverged; a working branch is reported as such and never moved. A release that
   changes `install.sh` or `hooks/` leaves `~/.cache/m2herd/relink-needed`: the dashboard and the
-  SessionStart digest show it until `install.sh` runs again, which removes it. `--auto` is the routine: quiet, once per
+  SessionStart digest show it until `install.sh` runs again, which removes it. Re-running the
+  install one-liner on a release-following (detached) engine moves it with `self-update` instead
+  of `git pull`, so it never lands on main's untagged head. `--auto` is the routine: quiet, once per
   `M2HERD_UPDATE_INTERVAL_HOURS` (24), one runner at a time, never fails, logs to
   `~/.cache/m2herd/update.log`; `m2herd-session.sh` starts it detached on every session
   (`M2HERD_AUTO_UPDATE=0` opts out); `templates/systemd/m2herd-update.{service,timer}` for machines

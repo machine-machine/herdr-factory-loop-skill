@@ -109,7 +109,13 @@ else
     git clone --depth 1 "$REPO_URL" "$CACHE_DIR"
   else
     echo "Updating existing clone at $CACHE_DIR ..."
-    git -C "$CACHE_DIR" pull --ff-only
+    if git -C "$CACHE_DIR" symbolic-ref --quiet HEAD >/dev/null 2>&1; then
+      git -C "$CACHE_DIR" pull --ff-only
+    else
+      # detached = the engine follows releases (m2herd self-update): forward to the newest release
+      # tag, never onto main's untagged head (a pull would put it there and auto-update would stay)
+      bash "$CACHE_DIR/scripts/m2herd.sh" self-update || echo "self-update did not move the engine (see above) — installing what is checked out"
+    fi
   fi
   SKILL_SRC="$CACHE_DIR/skill"
   HOOKS_SRC_DIR="$CACHE_DIR/hooks"

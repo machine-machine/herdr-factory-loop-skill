@@ -99,6 +99,7 @@ test-herd:
 	PYTHONDONTWRITEBYTECODE=1 python3 tests/gates/test_gates.py
 	bash tests/update/test_self_update.sh
 	bash tests/fleet/test_empty_fleet.sh
+	bash tests/onboard/test_onboard_pins.sh
 
 # ci — the documented pre-commit check: the same steps CI runs
 # (.github/workflows/ci.yml). Go steps run only when go is on PATH.

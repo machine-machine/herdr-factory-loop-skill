@@ -201,7 +201,8 @@ ln -s "$(pwd)/skill" ~/.claude/skills/herdr
 ### Update
 
 See the **Upgrade** block in [Quick start](#quick-start): re-run the install
-one-liner, or `m2herd self-update` (the SessionStart hook already does this daily). For a manual clone,
+one-liner (on an engine that follows releases it runs `m2herd self-update`, never a pull of main),
+or `m2herd self-update` (the SessionStart hook already does this daily). For a manual clone,
 `cd herdr-factory-loop-skill && git pull` follows `main` instead of releases — the symlinks stay
 valid and the skill is reloaded on the next session.
 
