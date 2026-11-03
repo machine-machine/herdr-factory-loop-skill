@@ -12,6 +12,7 @@ under a lock). `m2herd triage` and `m2herd gate …` call this script with --dir
 network: triage is a table of words and file areas, so the same intent always gets the same track.
 """
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -58,7 +59,7 @@ def hits(kind, text):
 def areas(files):
     out = set()
     for f in files:
-        parts = [p for p in f.strip().lstrip("./").split("/") if p]
+        parts = [p for p in f.strip().split("/") if p and p != "."]   # keep dotfiles: .github is not github
         if not parts:
             continue
         out.add("/".join(parts[:2]) if parts[0] in CONTAINERS and len(parts) > 2 else parts[0])
@@ -92,8 +93,11 @@ def triage(intent, files=None):
 
 
 def slug(text):
+    """Default run id: readable prefix + a hash of the whole intent, so two intents that share their
+    first words never land in one run, and the same intent (a re-triage) always does."""
     s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
-    return (s[:40].rstrip("-") or "run")
+    h = hashlib.sha1(" ".join((text or "").lower().split()).encode()).hexdigest()[:6]
+    return f"{s[:40].rstrip('-') or 'run'}-{h}"
 
 
 def run_dir(base, rid):
@@ -116,6 +120,9 @@ def waiting_on(rid, st):
         return "nothing recorded"
     ev, track = last["event"], st["track"]
     if ev == "triaged":
+        if last.get("sure") is False:
+            return (f"human: pick the track — m2herd triage \"<intent>\" --id {rid} --track quick|standard|full "
+                    "(no rule was sure)")
         if last.get("needs_approval"):
             return "human: approve this high-tier chat intent in the STEER inbox before any work (SEC-4)"
         return "orchestrator: " + NEXT[track].format(id=rid)
@@ -182,12 +189,13 @@ def main(argv=None):
                 d["tier"], d["reasons"] = o.tier, d["reasons"] + [f"tier raised to {o.tier} by --tier"]
             if o.track and o.track != d["track"]:
                 d["reasons"] = d["reasons"] + [f"track {d['track']} → {o.track} by --track"]
-                d["track"], d["sure"] = o.track, True
+                d["track"], d["sure"], d["override"] = o.track, True, True
             if d["tier"] == "high" and d["track"] != "full" and not o.force:
                 raise he.TransitionError("a high-tier run needs the full track (docs/factory-v3.md §6); "
                                          "use --force --note '<why the risk words are a false alarm>'")
             rid = o.id or slug(o.intent)
-            fields = dict(track=d["track"], tier=d["tier"], sure=d["sure"], reasons=d["reasons"], intent=o.intent,
+            fields = dict(track=d["track"], tier=d["tier"], sure=d["sure"], override=d.get("override"),
+                          reasons=d["reasons"], intent=o.intent,
                           files=files or None, areas=d["areas"] or None, feature=o.feature, source=o.source,
                           needs_approval=True if (o.source == "chat" and d["tier"] == "high") else None)
             if o.dry_run:

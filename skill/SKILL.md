@@ -429,7 +429,7 @@ Run the onboarding TUI from this repo to choose the orchestrator and establish t
 ./scripts/onboard.sh                                    # interactive
 ./scripts/onboard.sh --orchestrator claude --repo /path/to/repo --yes   # scripted
 ```
-It (1) picks **Claude Code, Hermes, Cursor or pi** (or `all`) as the orchestrator, (2) verifies herdr/jq/git, (3) installs this skill for the chosen agent, (4) installs the `specify` CLI (`uv tool install specify-cli --from git+https://github.com/github/spec-kit.git`), (5) installs the EGM plugin (`egm@egm`, google/elephant-goldfish-model) and compares it with the pinned commit, and checks how the orchestrator gets fresh subagents (native for Claude Code, a headless `claude -p` worker otherwise), (6) runs `specify init --here` in the target repo, and (7) records all of it in `~/.config/herdr-factory/config.toml`.
+It (1) picks **Claude Code, Hermes, Cursor or pi** (or `all`) as the orchestrator, (2) verifies herdr/jq/git, (3) installs this skill for the chosen agent, (4) installs the `specify` CLI (`uv tool install specify-cli --from git+https://github.com/github/spec-kit.git`), (5) installs the EGM plugin (`egm@egm`, google/elephant-goldfish-model) and compares it with the pinned commit, and records how the orchestrator gets fresh subagents (native for Claude Code, a headless `claude -p` worker otherwise), (6) runs `specify init --here` in the target repo, and (7) records all of it in `~/.config/herdr-factory/config.toml`.
 
 Integration mapping: **claude** → `specify init --here --integration claude` (prompts land in `.claude/commands/speckit.*.md`); **cursor** → `specify init --here --integration cursor` (spec-kit-native; prompts in `.cursor/commands/`); **hermes** → `specify init --here --integration generic --integration-options="--commands-dir .hermes/commands/"` (same prompts, in `.hermes/commands/`). The `all` choice initializes the claude integration (Hermes also reads `.claude/commands/*.md`; for Cursor's own command palette re-run `specify init --here --integration cursor`). Older spec-kit builds use `--ai` instead of `--integration` — onboard.sh detects this. Check the active orchestrator any time: `cat ~/.config/herdr-factory/config.toml`.
 
@@ -900,7 +900,7 @@ m2herd.sh evolve <analyze|proposals|show|apply|reject> …   # the factory learn
 m2herd.sh eval <draft|approve|status> --slice S [--cmd C]   # locked objective checks (§18)
 m2herd.sh loop <run|status|promote> …                       # scored best-of-N attempts (§18)
 m2herd.sh dashboard [--dir P] [--watch [--interval N]]     # read-only tier-1 TUI: a pure renderer over existing state — no new state, no fabric writes; --watch = flicker-free repaint loop (prefers the Go m2herd-tui when installed; M2HERD_NO_TUI=1 forces the bash renderer)
-m2herd.sh self-update [--check]           # ff-only pull of the engine repo; --check caches the behind-count for the dashboard header
+m2herd.sh self-update [--check|--auto]    # engine → newest release tag, forward only (§16.5); --check caches the state for the dashboard header
 m2herd.sh selftest                        # tmpdir end-to-end: init → note → refile → sync → status → resume (+ next cases, config, dashboard smoke); asserts schema fields with jq
 m2herd-up.sh selftest                     # herdr-free Pi CLI compatibility + detached-worker PID check
 ```
@@ -1073,6 +1073,16 @@ which embeds a node path that changes across upgrades); a timestamped `.bak-<ts>
 `settings.json` is written before every edit; the `.js` hook is skipped with a warning when
 `node` is missing (the two bash hooks still register). `./scripts/onboard.sh` wires all of
 this in when the chosen orchestrator is claude (or `all`).
+
+**Auto-update.** Every install follows the newest release: `m2herd-session.sh` starts
+`m2herd self-update --auto` detached on each session start (the hook does not wait). It runs at
+most once per `M2HERD_UPDATE_INTERVAL_HOURS` (24), one runner at a time, and only moves forward —
+checkout of the newest `vX.Y.Z[-pre]` tag (`M2HERD_UPDATE_CHANNEL=release`, the default;
+`stable` skips prereleases; `main` = ff-only pull of main). An engine with uncommitted changes or
+with commits the tag lacks is left alone and logged. One line per run in
+`~/.cache/m2herd/update.log`; `M2HERD_AUTO_UPDATE=0` opts out; machines without sessions can
+enable `templates/systemd/m2herd-update.timer`. When a release changes `install.sh` or `hooks/`,
+the log line says to re-run `scripts/install.sh --local`.
 
 #### 16.6 Settings — `.m2herd/settings.json`
 

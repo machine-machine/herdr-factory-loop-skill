@@ -19,7 +19,8 @@ pass on by default follow in 3.0.0.
   (`scripts/m2herd-gate`): a fixed rule table (risk words, new-system words, file areas, quick words)
   picks quick / standard / full plus a low / medium / high risk tier, marks the answer UNSURE when
   no rule fired, and records it. `--track` overrides and is recorded; a high-tier run below the full
-  track needs `--force --note`; a high-tier chat intent waits for the STEER inbox (SEC-4).
+  track needs `--force --note`; a high-tier chat intent is marked `needs_approval` and `gate status`
+  sends it to the STEER inbox first (SEC-4; advisory in the alpha — no gate refuses it yet).
 - **Gate events** — `.m2herd/factory/<run>/gates.jsonl`, append-only, written only through
   `herd_events.append_gate` under a lock: `triaged`, `design_review`, `design_ok` with validated
   transitions (a quick run has no G1; re-triage only raises; `design_ok` is the human's, needs their
@@ -37,6 +38,15 @@ pass on by default follow in 3.0.0.
   (google/elephant-goldfish-model), compares the installed commit with `EGM_PIN`, records how the
   orchestrator gets fresh subagents (native or a headless `claude -p` worker) and writes an `[egm]`
   block to `~/.config/herdr-factory/config.toml`.
+- **Auto-update to the newest release** — `m2herd self-update` now moves the engine repo to the
+  newest release tag (`M2HERD_UPDATE_CHANNEL=release`, prereleases included; `stable`; `main` keeps
+  the old ff-only pull of main). Forward only: an engine at or ahead of the tag stays, one with
+  uncommitted changes or commits the tag lacks is refused. `--auto` is the routine: quiet, once per
+  `M2HERD_UPDATE_INTERVAL_HOURS` (24), one runner at a time, never fails, logs to
+  `~/.cache/m2herd/update.log`; `m2herd-session.sh` starts it detached on every session
+  (`M2HERD_AUTO_UPDATE=0` opts out); `templates/systemd/m2herd-update.{service,timer}` for machines
+  without sessions. The update-status cache gains the target tag as a fourth field (readers use
+  the first three); the dashboard row names it. Tests in `tests/update/`.
 - `tests/gates/test_gates.py` in `make test-herd`; credits in README, EGM in `NOTICE`.
 - The objective loop layer (was Unreleased): `m2herd eval draft|approve|status` freezes
   checks into `.m2herd/evals/approved/<slice>/` with a checksum, and
@@ -58,6 +68,17 @@ pass on by default follow in 3.0.0.
 - `m2herd help` prints the whole usage header (it stopped at a fixed line 58).
 
 ### Fixed
+- `fleet-loop.sh tick` reported `MISSION_COMPLETE` for an empty `missions.tsv`; it now waits with
+  `AWAITING_SOLO (fill missions.tsv)` (re-done against 3.0 from an unpushed June fix;
+  `tests/fleet/test_empty_fleet.sh`).
+- Triage: after an UNSURE triage the human's `--track` pick was refused as "lowering"; it may now
+  lower the track, and `gate status` names the human as the next actor of an UNSURE run (found by
+  running the pipeline on its own release; confirmed by the blind review and both skeptics).
+- Default run ids carry a hash of the whole intent, so two intents sharing their first 40
+  characters no longer collapse into one run (main review, confirmed by both skeptics).
+- Found by the release review, low: a blind finding on the same spot as a main-reviewer finding
+  now keeps the higher severity; `gate record --open` must be ≥ 0; a refused event on an unknown
+  run leaves no empty run dir; file areas keep dotfiles (`.github` is not `github`).
 - `m2herd selftest` failed on any machine with `m2herd-steer` on PATH: the `next` steering line says
   "triage steering" there, not "drain steering".
 

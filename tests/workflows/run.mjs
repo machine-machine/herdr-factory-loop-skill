@@ -387,6 +387,15 @@ async function main() {
     ok(r2.results[0].outcome === 'review_ok' && /blind pass on/.test(lastOf(herd2, 'blind').note), 'blind: silent goldfish does not block; review_ok note says blind pass on')
     ok(rt2.logs.some(m => /blind reviewer returned nothing/.test(m)), 'blind: silent goldfish is logged')
     ok(rt2.calls.filter(c => (c.label || '').startsWith('blind:')).map(c => c.model).join() === 'claude-fable-5-1,claude-opus-5-5', 'blind: goldfish default = reviewer rule (other model), opus fallback')
+    // same spot rated low by the main reviewer and high by the goldfish: the high one goes to the skeptics
+    const herd3 = path.join(TMP, 'herd6d')
+    hp(herd3, 'blind working')
+    hp(herd3, `blind accepted --field prs='["api#55@${a.sha.slice(0, 7)}"]'`)
+    const BLINDHIGH = { summary: 'x', tests: '1 passed', description_ok: true, findings: [{ severity: 'high', title: 'Typo in label ', file: 'B.txt', line: 1, description: 'label breaks the export', repro: 'export -> wrong column' }] }
+    const rt3 = runtime(handlerFor({ review: () => MAINLOW, blind: () => BLINDHIGH, verify: () => ({ refuted: false, reason: 'yes', severity_corrected: 'high' }), integrate: () => integ(apiMain, 'org/api', ['api#55']) }))
+    const r3 = await rt3.run(LOOP, base(herd3, g, { blind: true }))
+    ok(rt3.calls.filter(c => (c.label || '').startsWith('verify:')).length === 2 && r3.results[0].outcome === 'review_befund', 'blind: a blind high on a main low spot keeps the higher severity and blocks')
+    ok((fs.readFileSync(lastOf(herd3, 'blind').befunde_file, 'utf8').match(/typo in label/gi) || []).length === 1, 'blind: the shared spot is still listed once')
   }
 
   // --- 7. review-open-prs standalone: no herd, no prior -> pins the head, writes no state ---

@@ -33,11 +33,16 @@ existing clone, re-links everything):
 curl -sSL https://raw.githubusercontent.com/machine-machine/herdr-factory-loop-skill/main/scripts/install.sh | bash
 ```
 
-Or, once installed, upgrade the engine directly:
+Once installed it **updates itself**: the m2herd SessionStart hook runs `m2herd self-update --auto`
+in the background on every Claude Code session — at most once a day, forward only, to the newest
+release tag (prereleases included), never on a dirty or locally changed engine. Log:
+`~/.cache/m2herd/update.log`. Opt out with `M2HERD_AUTO_UPDATE=0`; pick the channel with
+`M2HERD_UPDATE_CHANNEL=release|stable|main`; headless machines can add the daily
+`templates/systemd/m2herd-update.timer`. By hand:
 
 ```bash
-m2herd self-update            # pull latest (refuses a dirty tree)
-m2herd self-update --check    # only report how far behind you are
+m2herd self-update            # move to the newest release now (refuses a dirty or diverged tree)
+m2herd self-update --check    # only report how far behind the newest release you are
 ```
 
 **Install from a git checkout** (development / air-gapped):
@@ -196,8 +201,8 @@ ln -s "$(pwd)/skill" ~/.claude/skills/herdr
 ### Update
 
 See the **Upgrade** block in [Quick start](#quick-start): re-run the install
-one-liner, or `m2herd self-update`. For a manual clone,
-`cd herdr-factory-loop-skill && git pull` does the same — the symlinks stay
+one-liner, or `m2herd self-update` (the SessionStart hook already does this daily). For a manual clone,
+`cd herdr-factory-loop-skill && git pull` follows `main` instead of releases — the symlinks stay
 valid and the skill is reloaded on the next session.
 
 ## Repository layout

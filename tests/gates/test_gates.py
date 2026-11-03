@@ -82,6 +82,19 @@ class Transitions(unittest.TestCase):
         ev = he.append_gate(self.run, "triaged", track="standard", tier="medium", force=True, note="false alarm")
         self.assertEqual(ev["forced_from"], "triaged")
 
+    def test_humans_pick_may_lower_an_unsure_triage(self):
+        he.append_gate(self.run, "triaged", track="standard", tier="medium", sure=False)
+        with self.assertRaisesRegex(he.TransitionError, "never lower"):      # a rule result may not lower
+            he.append_gate(self.run, "triaged", track="quick", tier="medium", sure=True)
+        he.append_gate(self.run, "triaged", track="quick", tier="medium", sure=True, override=True)
+        with self.assertRaisesRegex(he.TransitionError, "never lower"):      # tier still only rises
+            he.append_gate(self.run, "triaged", track="standard", tier="low", sure=True, override=True)
+
+    def test_sure_triage_is_not_lowered_by_override(self):
+        he.append_gate(self.run, "triaged", track="full", tier="medium", sure=True)
+        with self.assertRaisesRegex(he.TransitionError, "never lower"):
+            he.append_gate(self.run, "triaged", track="standard", tier="medium", sure=True, override=True)
+
     def test_gate_lines_are_invisible_to_phase_reader(self):
         he.append_gate(self.run, "triaged", track="quick", tier="low")
         he.append(self.run, "s1", "queued")
@@ -89,6 +102,15 @@ class Transitions(unittest.TestCase):
             f.write('{"torn": \n')
         self.assertEqual(list(he.state(self.run)), ["s1"])
         self.assertEqual(len(he.read_gates(self.run)), 1)
+
+    def test_open_count_and_no_litter(self):
+        with self.assertRaises(he.TransitionError):
+            he.append_gate(self.run, "design_review", evidence="g1.md", open=0)
+        self.assertFalse(os.path.exists(self.run), "a refused event on an unknown run creates nothing")
+        he.append_gate(self.run, "triaged", track="standard", tier="medium")
+        for bad in (-2, None, "x"):
+            with self.assertRaisesRegex(ValueError, ">= 0"):
+                he.append_gate(self.run, "design_review", evidence="g1.md", open=bad)
 
     def test_validation(self):
         with self.assertRaises(ValueError):
@@ -126,6 +148,8 @@ class Triage(unittest.TestCase):
         self.assertEqual(gate.hits("quick", "pre-format"), [])
 
     def test_areas(self):
+        self.assertEqual(gate.areas([".env", "env/settings.py"]), [".env", "env"])
+        self.assertEqual(gate.areas([".github/workflows/ci.yml"]), [".github"])
         self.assertEqual(gate.areas(["src/api/a.py", "src/api/b/c.py", "./README.md", "src/x.py"]),
                          ["README.md", "src", "src/api"])   # a file right under src/ is area src
 
@@ -142,7 +166,7 @@ class Cli(unittest.TestCase):
         rc, out, _ = cli(self.base, "triage", "show totals on the dashboard", "--files", "api/a.py,ui/b.ts")
         self.assertEqual(rc, 0)
         self.assertIn("track: standard (tier medium)", out)
-        rid = "show-totals-on-the-dashboard"
+        rid = gate.slug("show totals on the dashboard")
         evs = he.read_gates(os.path.join(self.base, ".m2herd", "factory", rid))
         self.assertEqual((evs[0]["event"], evs[0]["areas"]), ("triaged", ["api", "ui"]))
         cli(self.base, "record", rid, "design_review", "--evidence", "specs/001/reviews/g1-1.md", "--open", "0")
@@ -176,6 +200,27 @@ class Cli(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.base, ".m2herd")), "dry run wrote nothing")
         _, out, _ = cli(self.base, "triage", "add payment page", "--source", "chat", "--id", "pay")
         self.assertIn("STEER inbox", out)
+
+    def test_cli_override_after_unsure_triage(self):
+        cli(self.base, "triage", "review the open pull request", "--id", "r1")       # no rule fires: UNSURE
+        rc, out, err = cli(self.base, "triage", "review the open pull request", "--id", "r1", "--track", "quick")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("track: quick", out)
+
+    def test_default_ids_keep_intents_apart(self):
+        a = gate.slug("add the export button to the dashboard page for admins only")
+        b = gate.slug("add the export button to the dashboard page for users and guests")
+        self.assertNotEqual(a, b)
+        self.assertEqual(a, gate.slug("Add the export button to the dashboard  page for admins only"))
+        self.assertTrue(he.RUN_RE.match(a), a)
+
+    def test_unsure_status_asks_the_human(self):
+        cli(self.base, "triage", "refresh the thing", "--id", "u1")
+        _, out, _ = cli(self.base, "status", "u1")
+        self.assertIn("human: pick the track", out)
+        cli(self.base, "triage", "refresh the thing", "--id", "u1", "--track", "quick")
+        _, out, _ = cli(self.base, "status", "u1")
+        self.assertIn("orchestrator: one slice", out)
 
     def test_bad_run_id_and_missing_run(self):
         rc, _, err = cli(self.base, "triage", "x", "--id", "../evil")

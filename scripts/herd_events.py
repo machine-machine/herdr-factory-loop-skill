@@ -243,7 +243,7 @@ def gate_state(run_dir):
 def append_gate(run_dir, event, by="orchestrator", note=None, force=False, **fields):
     """Validate and append one gate event under the run's lock. Rules beyond the transition table:
     a quick run has no G1; re-triage may raise track and tier, never lower them (force + note
-    overrides); design_ok is written by the human only and carries their words verbatim."""
+    overrides) — except that the human's --track pick (override=True) may lower an UNSURE track; design_ok is written by the human only and carries their words verbatim."""
     if event not in GATE_OF:
         raise ValueError(f"unknown gate event {event!r} (one of {', '.join(GATE_OF)})")
     if by not in GATE_BY:
@@ -255,11 +255,19 @@ def append_gate(run_dir, event, by="orchestrator", note=None, force=False, **fie
             raise ValueError(f"triaged needs track in {TRACKS}")
         if fields.get("tier") not in TIERS:
             raise ValueError(f"triaged needs tier in {TIERS}")
+    if event == "design_review":
+        try:
+            if int(fields.get("open")) < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            raise ValueError("design_review needs open = the number of findings still open (>= 0)")
     if event == "design_ok":
         if by != "human":
             raise ValueError("design_ok is the human's approval (by=human)")
         if not str(fields.get("word") or "").strip():
             raise ValueError("design_ok needs the human's words verbatim (word=...)")
+    if event != "triaged" and not force and not os.path.isfile(gates_path(run_dir)):
+        raise TransitionError(f"nothing -> {event} is not allowed (allowed: triaged) — no run at {run_dir}")
     os.makedirs(run_dir, exist_ok=True)
     with open(gates_path(run_dir) + ".lock", "w") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -279,7 +287,9 @@ def append_gate(run_dir, event, by="orchestrator", note=None, force=False, **fie
                     raise TransitionError(f"design_review {rev.get('evidence', '')} still has {rev['open']} open "
                                           "finding(s) — resolve them and record a new design_review")
             if event == "triaged" and st["track"]:
-                if (TRACKS.index(fields["track"]) < TRACKS.index(st["track"])
+                # an UNSURE triage is the human's pick: their --track override may lower its track
+                humans_pick = st["gates"]["G0"].get("sure") is False and fields.get("override") is True
+                if ((TRACKS.index(fields["track"]) < TRACKS.index(st["track"]) and not humans_pick)
                         or TIERS.index(fields["tier"]) < TIERS.index(st["tier"] or "low")):
                     raise TransitionError(f"re-triage may raise, never lower: was {st['track']}/{st['tier']}")
         ev = {"ts": now(), "gate": GATE_OF[event], "event": event, "by": by}

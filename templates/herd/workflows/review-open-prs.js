@@ -325,8 +325,10 @@ async function reviewOne(g, pr, pin) {
   const blinds = []
   for (const f of (bl && bl.findings) || []) {
     const twin = mains.find(m => same(m, f))
-    if (twin) twin.also_blind = true
-    else blinds.push({ ...f, source: 'blind' })
+    if (!twin) { blinds.push({ ...f, source: 'blind' }); continue }
+    twin.also_blind = true
+    // one spot, two ratings: the higher one goes on, so a blind medium is never lost under a main low
+    if (SEV[f.severity] > SEV[twin.severity]) Object.assign(twin, { severity: f.severity, blind_severity: f.severity })
   }
   const all = mains.concat(blinds)
   const big = all.filter(f => f.severity !== 'low')

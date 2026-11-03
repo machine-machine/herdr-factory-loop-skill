@@ -51,7 +51,8 @@ Transitions (from the run's last gate event):
 | `design_ok` | `design_review` (spec changed), `triaged` |
 
 Extra rules: a quick run has no `design_review` (re-triage to standard first). Re-triage may raise
-track and tier, never lower them. `design_ok` needs `by: human`, the human's words in `word`, and a
+track and tier, never lower them — except that the human's `--track` pick (`override: true`) may
+lower the track of an UNSURE triage, because an unsure triage is theirs to decide. `design_ok` needs `by: human`, the human's words in `word`, and a
 last `design_review` with `open: 0`. `--force` needs a note and records `forced_from`, as in
 `herd-phase`.
 
@@ -63,7 +64,9 @@ per slice, with the sha), `drift_found` (after merge). Once a herd exists, slice
 ## 3. G0 triage — the rule table
 
 `m2herd triage "<intent>" [--files a,b] [--track T] [--tier T] [--id ID] [--feature DIR]
-[--source chat] [--dry-run] [--json]`. Pure rules, no model, no network: the same intent and file
+[--source chat] [--dry-run] [--json]`. The default run id is the intent's slug plus a hash of the
+whole intent, so a re-triage of the same intent hits the same run and different intents never share
+one. An UNSURE run's `gate status` names the human as the next actor. Pure rules, no model, no network: the same intent and file
 list always give the same answer. First matching row wins (`scripts/m2herd-gate`, `HIGH_RISK`,
 `FULL`, `QUICK`, `LOW_TIER`):
 
@@ -79,7 +82,8 @@ Tier: **high** on any row-1 word; **low** when the words say docs/tests/tooling/
 under `docs/`, `tests/`, `spec/`, CI dirs or is a `.md`; else **medium**. `--tier` only raises.
 `--track` overrides the track and is recorded as a reason; a high-tier run below the full track is
 refused without `--force --note`. `--source chat` marks channel text as untrusted (SEC-4): a
-high-tier chat run records `needs_approval` and `gate status` sends it to the STEER inbox first.
+high-tier chat run records `needs_approval` and `gate status` sends it to the STEER inbox first
+(advisory in the alpha: no gate refuses the run yet; 3.0.0 adds the approval event).
 
 ## 4. G1 — the design review
 
