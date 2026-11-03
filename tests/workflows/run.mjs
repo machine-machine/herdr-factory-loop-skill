@@ -118,6 +118,7 @@ function handlerFor(sc) {
       return r
     }
     if (l.startsWith('review:')) return sc.review(l, opts)
+    if (l.startsWith('blind:')) return sc.blind ? sc.blind(l, opts) : CLEAN
     if (l.startsWith('verify:')) return sc.verify ? sc.verify(l, opts) : { refuted: true, reason: 'not reproducible', severity_corrected: 'none' }
     if (l.startsWith('integrate:')) return sc.integrate(l, opts, prompt)
     if (l.startsWith('fix:')) return sc.fix(l, opts)
@@ -192,6 +193,7 @@ async function main() {
     ok(ints.every(c => c.prompt.includes('refs/remotes/origin/main')), 'clean: probe merges onto current main')
     ok(rt.calls.filter(c => (c.label || '').startsWith('verify:')).length === 0, 'clean: low findings get no skeptics')
     ok(rt.calls.every(c => c.model), 'clean: every agent has an explicit model')
+    ok(rt.calls.filter(c => (c.label || '').startsWith('blind:')).length === 0, 'clean: blind unset -> no goldfish reviewer')
     ok(rt.logs.some(m => /head moved after acceptance/.test(m)), 'clean: moved head is logged')
   }
 
@@ -338,6 +340,53 @@ async function main() {
     ok(rt.calls.filter(c => (c.label || '').startsWith('review:')).map(c => c.model).join() === 'claude-fable-5-1,claude-opus-5-5', 'integ: unavailable fable reviewer falls back to opus')
     const bf = fs.readFileSync(lastOf(herd, 'integ').befunde_file, 'utf8')
     ok(/test_x\.py::test_y/.test(bf) && /source: integration/.test(bf), 'integ: befunde file names the failing test')
+  }
+
+  // --- 6b. blind pass: goldfish beside the main reviewer, sees the task but never report/ctx/findings ---
+  {
+    const herd = path.join(TMP, 'herd6b')
+    const a = prBranch(api, 'feat/blind', 55, 'j.txt', 'b', 'blind')
+    hp(herd, 'blind working')
+    hp(herd, `blind accepted --field prs='["api#55@${a.sha.slice(0, 7)}"]'`)
+    const BLINDBUG = { summary: 'AC2 unmet', tests: '2 passed', description_ok: true, findings: [
+      { severity: 'medium', title: 'empty list not handled', file: 'j.txt', line: 1, description: 'AC2: empty input crashes', repro: 'run with [] -> crash' },
+      { severity: 'low', title: 'typo in label', file: 'b.txt', line: 1, description: 'dup of main', repro: 'open b.txt' }] }
+    const MAINLOW = { ...LOWONLY }
+    const rt = runtime(handlerFor({
+      review: () => MAINLOW,
+      blind: () => BLINDBUG,
+      verify: () => ({ refuted: false, reason: 'reproduced: [] crashes', severity_corrected: 'medium' }),
+      integrate: () => integ(apiMain, 'org/api', ['api#55']),
+    }))
+    const g = [{ name: 'blind', slices: ['blind'], prs: [{ repo: 'org/api', short: 'api', n: 55, head: 'feat/blind', base: 'main', wt: a.wt, worker_model: 'claude-opus-5-5' }] }]
+    const res = await rt.run(LOOP, base(herd, g, { blind: true, models: { goldfish: 'gold-model' } }))
+    ok(res.results[0].outcome === 'review_befund', `blind: blind-only medium finding blocks (got ${res.results[0].outcome} ${res.results[0].error || ''})`)
+    const bc = rt.calls.filter(c => (c.label || '').startsWith('blind:'))
+    const rc = rt.calls.filter(c => (c.label || '').startsWith('review:'))
+    ok(bc.length === 1 && rc.length === 1 && bc[0].label === 'blind:blind:api#55', 'blind: one goldfish beside one main reviewer')
+    ok(bc[0].model === 'gold-model' && bc[0].effort === rc[0].effort && bc[0].phase === 'Review', 'blind: models.goldfish + same effort as the main reviewer')
+    const bp = bc[0].prompt
+    ok(bp.includes(path.join(herd, 'blind.task.md')) && bp.includes(`${a.wt}--review`) && bp.includes(a.sha), 'blind: prompt names task.md, review worktree, pinned sha')
+    // the prompt may name the forbidden files only inside the "Do NOT open" sentence
+    const allowed = bp.split('\n').filter(x => !/Do NOT open/.test(x)).join('\n')
+    ok(!/\.out\.md|ctx\.reviewer|befunde/.test(allowed) && !allowed.includes(path.join(herd, 'blind.out.md')), 'blind: no report/ctx/findings path outside the prohibition')
+    ok(/Do NOT open/.test(bp) && !/gh pr view \d/.test(bp), 'blind: prompt forbids report/ctx/findings/PR text')
+    const sk = rt.calls.filter(c => (c.label || '').startsWith('verify:'))
+    ok(sk.length === 2, 'blind: the blind medium finding gets the same two skeptics')
+    const e = lastOf(herd, 'blind')
+    const bf = fs.readFileSync(e.befunde_file, 'utf8')
+    ok(/empty list not handled/.test(bf) && /source: blind/.test(bf), 'blind: befunde file carries the finding with source: blind')
+    ok(/blind pass on/.test(bf), 'blind: befunde header says the blind pass was on')
+    ok((bf.match(/typo in label/g) || []).length === 1, 'blind: duplicate low (same file + title) kept once')
+    // goldfish returns nothing -> logged, main review decides
+    const herd2 = path.join(TMP, 'herd6c')
+    hp(herd2, 'blind working')
+    hp(herd2, `blind accepted --field prs='["api#55@${a.sha.slice(0, 7)}"]'`)
+    const rt2 = runtime(handlerFor({ review: () => CLEAN, blind: () => null, integrate: () => integ(apiMain, 'org/api', ['api#55']) }))
+    const r2 = await rt2.run(LOOP, base(herd2, g, { blind: true }))
+    ok(r2.results[0].outcome === 'review_ok' && /blind pass on/.test(lastOf(herd2, 'blind').note), 'blind: silent goldfish does not block; review_ok note says blind pass on')
+    ok(rt2.logs.some(m => /blind reviewer returned nothing/.test(m)), 'blind: silent goldfish is logged')
+    ok(rt2.calls.filter(c => (c.label || '').startsWith('blind:')).map(c => c.model).join() === 'claude-fable-5-1,claude-opus-5-5', 'blind: goldfish default = reviewer rule (other model), opus fallback')
   }
 
   // --- 7. review-open-prs standalone: no herd, no prior -> pins the head, writes no state ---

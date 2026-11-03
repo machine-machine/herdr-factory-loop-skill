@@ -39,7 +39,7 @@ PROJECT_WORDS = re.compile("|".join([r"workspace-\d", r"herde-\d"] + _LOCAL), re
 
 
 def main():
-    files = ["WORKER.md", "REVIEWER.md", "FIXER.md", "MODELS.md", "ORCHESTRATOR.md", "HERD-CUT.md", "STEER.md"]
+    files = ["WORKER.md", "REVIEWER.md", "FIXER.md", "MODELS.md", "ORCHESTRATOR.md", "HERD-CUT.md", "STEER.md", "GOLDFISH.md"]
     for n in files:
         check(f"{n} exists", os.path.isfile(os.path.join(RULES, n)))
     extra = [os.path.join(REPO, "templates", "herd", n) for n in ("COMMON.md", "task.md.example")]
@@ -131,8 +131,8 @@ def main():
     check("SKILL description < 1024 chars", m and len(m.group(1)) < 1024, str(len(m.group(1)) if m else None))
     ver = re.search(r"^version:\s*(\S+)", skill, re.M).group(1)
     with open(os.path.join(REPO, "CHANGELOG.md"), encoding="utf-8") as f:
-        latest = re.search(r"^## \[(\d+\.\d+\.\d+)\]", f.read(), re.M).group(1)
-    check("SKILL version == CHANGELOG latest == 2.10.0", ver == latest == "2.10.0", f"{ver} {latest}")
+        latest = re.search(r"^## \[(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)\]", f.read(), re.M).group(1)
+    check("SKILL version == CHANGELOG latest", ver == latest, f"{ver} {latest}")
 
     # the published docs carry examples, never the source fabric's ticket ids or memory file names
     leaks = re.compile("|".join([r"\b\d{11}\b"] + _LOCAL), re.I)

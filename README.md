@@ -88,7 +88,7 @@ m2herd-up down --slice S|--all   # tear down pane + worktree (+merged branch); r
 The herd view (§16.7) — what a human watching the orchestrator tab sees:
 
 ```
-herd-spawn <herd-dir> <slice> <worktree>   # worker TUI into tab "herde", registered with the board
+herd-spawn <herd-dir> <slice> <worktree>   # worker TUI into tab "herd", registered with the board
 herd-board                                 # right third of the orchestrator tab: workers, subagents, ready-to-merge PRs
 ```
 
@@ -114,12 +114,12 @@ This skill teaches an agent how to:
 | 8 | Notify the human | Local desktop notifications |
 | 9 | Channel-driven intent → herd | Intent arrives on a chat channel, spin up a parallel herd |
 | 10 | Compound the run | Review before reporting, write a run report, promote recurring lessons into this skill |
-| 11 | SDD factory loop (spec-kit × herdr) | Spec-driven development: spec → plan → tasks → herd implements `[P]` tasks → analyze → converge against the spec |
+| 11 | **The factory pipeline** (start here) | One stage-gated path from intent to merge: `m2herd triage` picks quick/standard/full (G0), spec-kit chain + EGM goldfish design review approved by the human (G1), slices from `tasks.md` + cut check (G2), frozen evals (G3, 3.0.0), review loop with optional blind pass (G4), merge on the human's go (G5) — `docs/factory-v3.md` |
 | 12 | ICM-steered loop (`herd-loop.sh`) | Make one orchestrator a standing, disk-reconstructible reconciler over a `herd-control/` workspace (folder=desired, socket=observed) |
 | 13 | Meta-orchestration (`fleet-loop.sh`) | Be the orchestrator of orchestrators: launch + oversee one orchestrator per mission (each driving its own herd), `/goal`-armed to self-drive — `fleet-control/` |
 | 14 | Dispatch nudge (hooks) | Claude Code `UserPromptSubmit` + Hermes `pre_llm_call` hooks that re-check "should this herd?" every turn, by default — proposes a plan, never auto-spawns |
 | 15 | Context budgeting & decomposer (Hermes) | keep the orchestrator within a token budget (default GLM-5.2/384k); decompose into budget-sized slice manifests; hooks offload context on demand |
-| 16 | m2herd — the Fable main-orchestrator context fabric | Claude Code (Fable) as the MAIN orchestrator: a per-repo, gitignored `.m2herd/` holds the context while the orchestrator holds pointers — note/refile/resume/sync/archive/gist via `m2herd`, a 1-orchestrator + 1-machineroom-pane workspace via `m2herd-up`, three Claude Code hooks as the heartbeat; the herd view (`herd-board` beside the orchestrator, worker TUIs in a `herde` tab, subagents on the board via a PreToolUse hook) |
+| 16 | m2herd — the Fable main-orchestrator context fabric | Claude Code (Fable) as the MAIN orchestrator: a per-repo, gitignored `.m2herd/` holds the context while the orchestrator holds pointers — note/refile/resume/sync/archive/gist via `m2herd`, a 1-orchestrator + 1-machineroom-pane workspace via `m2herd-up`, three Claude Code hooks as the heartbeat; the herd view (`herd-board` beside the orchestrator, worker TUIs in a `herd` tab, subagents on the board via a PreToolUse hook) |
 | 17 | evolve — the factory learns | Run trace bundles (`.m2herd/runs/`) + `m2herd evolve` (analyze/proposals/show/apply/reject): failed runs become reviewable proposals, accepted lessons land in `LESSONS.md` and auto-annotate every later dispatch |
 | 18 | eval/loop — objective optimization | Approved evals (`.m2herd/evals/approved/`) are checksummed before use; `m2herd loop run` executes isolated worktree attempts, scores each round, stores artifacts, and `loop promote` applies only the best patch into a clean checkout |
 
@@ -128,17 +128,17 @@ See [`skill/SKILL.md`](./skill/SKILL.md) for the full reference and
 
 ## Which stack? (stack map)
 
-Four generations of orchestration live in this repo side by side. Pick by orchestrator:
-
-- **Start here — §16 m2herd** (+ §17 evolve): Claude Code (Fable) is the main orchestrator;
-  `.m2herd/` context fabric, `m2herd`/`m2herd-up`, the three Claude Code hooks. This is the
-  actively developed path.
-- **§12 / §15 herd-control**: the Hermes-era path — ICM reconciler (`herd-loop.sh`) plus the
-  Hermes context-budget layer. Kept working; superseded by §16 for Claude Code.
-- **§9 (with §1–§8, §10)**: manual herd recipes — raw herdr orchestration patterns any agent
-  can follow by hand, no standing loop.
-- **§13 fleet-control**: multi-mission meta-orchestration — one orchestrator per mission,
-  each self-driving its own herd.
+- **Start here — §11 the factory pipeline**, run by **§16 m2herd** (+ §17 evolve): one path from
+  intent to merge with gates G0–G5 ([`docs/factory-v3.md`](./docs/factory-v3.md)); Claude Code
+  (Fable) is the main orchestrator, `.m2herd/` holds the context, the v2 herd flow (§16.7) executes.
+  This is the actively developed path.
+- **Legacy** (kept working, not where new work starts):
+  - **§12 / §15 herd-control**: the Hermes-era path — ICM reconciler (`herd-loop.sh`) plus the
+    Hermes context-budget layer.
+  - **§9 (with §1–§8, §10)**: manual herd recipes — raw herdr orchestration patterns any agent
+    can follow by hand, no standing loop.
+  - **§13 fleet-control**: multi-mission meta-orchestration — one orchestrator per mission,
+    each self-driving its own herd.
 - **§18 eval/loop**: the Karpathy-style objective loop — use when a slice has a
   machine-checkable score and the builder must optimize against a judge it cannot edit.
 
@@ -232,7 +232,8 @@ herdr-factory-loop-skill/
 │       ├── evolver/             ←   evolver seeds: LESSONS.md (marker convention) + README (§17)
 │       └── runs/                ←   trace-bundle store README (§17)
 └── scripts/
-    ├── onboard.sh           ← onboarding TUI: orchestrator choice + spec-kit + SDD loop
+    ├── onboard.sh           ← onboarding TUI: orchestrator choice + spec-kit + EGM (pinned) + SDD loop
+    ├── m2herd-gate          ← factory pipeline: G0 triage rule table + gate verdicts per run (`m2herd triage`, `m2herd gate`, §11)
     ├── install.sh           ← one-line installer (see Install section)
     ├── herd-loop.sh         ← ICM reconciliation loop over a herd-control/ workspace (§12)
     ├── fleet-loop.sh        ← meta-orchestrator loop over a fleet-control/ workspace (§13)
@@ -241,7 +242,7 @@ herdr-factory-loop-skill/
     ├── m2herd.sh            ← .m2herd/ engine: boot/init/status/note/refile/resume/sync/archive/gist/next/config/evolve/eval/loop/dashboard/self-update/selftest (§16–§18)
     ├── m2herd-up.sh         ← m2herd workspace bootstrap + worker dispatch/collect/down (§16)
     ├── herd-board           ← the herd view panel: workers + subagents + ready-to-merge PRs (§16.7)
-    ├── herd-spawn.sh        ← start a worker TUI in the "herde" tab and register it with the board (§16.7)
+    ├── herd-spawn.sh        ← start a worker TUI in the "herd" tab and register it with the board (§16.7)
     └── lint.sh              ← sanity checks on SKILL.md frontmatter & cross-refs
 ```
 
@@ -279,6 +280,16 @@ Originally copied from a local Claude skills directory and adapted:
 - Section 9 (channel-driven herd) added by Hermes Agent session on 2026-06-11
 
 See [`CHANGELOG.md`](./CHANGELOG.md) for the full history.
+
+## Credits
+
+- [github/spec-kit](https://github.com/github/spec-kit) (MIT) — the spec chain of the factory pipeline.
+- [google/elephant-goldfish-model](https://github.com/google/elephant-goldfish-model) (Apache-2.0) —
+  installed as the `egm` Claude Code plugin at a pinned commit for the G1 goldfish design review;
+  the blind review pass applies its zero-context principle. No EGM file is vendored.
+- [bmad-code-org/bmad-method](https://github.com/bmad-code-org/bmad-method) (MIT) — ideas only:
+  right-sized tracks, role lenses, the role-file structure of `templates/herd/rules/`. Not
+  installed; BMad is a trademark of BMad Code, LLC. Details in [`NOTICE`](./NOTICE).
 
 ## License
 

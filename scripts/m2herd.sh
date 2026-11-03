@@ -48,6 +48,11 @@
 #                                             # score each round, keep best patch under .m2herd/loops/<run-id>/
 #   m2herd.sh loop status [--run ID]          # render loop run summary
 #   m2herd.sh loop promote --run ID           # apply the best patch to a clean current worktree
+#   m2herd.sh triage "<intent>" [--files a,b] [--track T] [--id ID] [--dry-run]
+#                                             # G0 of the factory pipeline: quick|standard|full + risk tier from a rule
+#                                             #   table (scripts/m2herd-gate), recorded in .m2herd/factory/<id>/gates.jsonl
+#   m2herd.sh gate status|record|approve ...  # gate verdicts per run: record design_review (G1 findings file + open
+#                                             #   count), approve G1 with the human's words; status says who acts next
 #   m2herd.sh room    [--dir P]               # the machineroom viewer in THIS terminal: Go TUI (m2herd-tui) when installed,
 #                                             #   else the flicker-free bash watch — one command, always the best/latest viewer
 #   m2herd.sh dashboard [--dir P] [--watch [--interval N]]
@@ -93,6 +98,14 @@ fi
 CONFIG_ACTION=""; CONFIG_PATH=""; CONFIG_VALUE=""
 DIR="$PWD"; GOAL=""; AREA=""; TEXT=""; CHECK=0; PUSH=0; WATCH=0; INTERVAL=2; RUN=""; ACK_REPO=0; DRYRUN=0
 SLICE=""; EVAL_CMD=""; ATTEMPT_CMD=""; ROUNDS=3
+# `triage` and `gate` (the factory pipeline, docs/factory-v3.md) live in scripts/m2herd-gate; only
+# --dir is taken here, every other argument passes through untouched.
+GATE_ARGS=()
+if [ "$CMD" = "triage" ] || [ "$CMD" = "gate" ]; then
+  while [ $# -gt 0 ]; do
+    case "$1" in --dir) DIR="$2"; shift 2 ;; *) GATE_ARGS+=("$1"); shift ;; esac
+  done
+fi
 while [ $# -gt 0 ]; do
   case "$1" in
     --dir)   DIR="$2"; shift 2 ;;
@@ -1821,6 +1834,13 @@ eval_cmd_group() {
   esac
 }
 
+gate_cmd() {
+  resolve_dir; need_init
+  local py; py="$(dirname "$(self_path)")/m2herd-gate"
+  if [ "$CMD" = "triage" ]; then set -- triage; else set --; fi
+  exec python3 "$py" --dir "$DIR" "$@" ${GATE_ARGS[@]+"${GATE_ARGS[@]}"}
+}
+
 loop_cmd_group() {
   case "$LOOP_ACTION" in
     run) loop_run ;;
@@ -2184,7 +2204,8 @@ selftest() {
 
   # next STEER case: live steering outranks coach-intent (done_when is still empty here)
   printf 'PAUSE everything please\n' >> "$td/.m2herd/inbox/STEER.md"
-  "$self" next --dir "$td" | grep -q '^NEXT: drain steering' || fail "next(steer): want drain-steering"
+  # "triage" when m2herd-steer is on PATH (an installed machine), "drain" without it (CI)
+  "$self" next --dir "$td" | grep -qE '^NEXT: (drain|triage) steering' || fail "next(steer): want drain/triage-steering"
   keep_head "$td/.m2herd/inbox/STEER.md" > "$td/.m2herd/inbox/STEER.md.new" \
     && mv "$td/.m2herd/inbox/STEER.md.new" "$td/.m2herd/inbox/STEER.md"
 
@@ -2613,6 +2634,7 @@ case "$CMD" in
     esac
     ;;
   eval)     eval_cmd_group ;;
+  triage|gate) gate_cmd ;;
   loop)     loop_cmd_group ;;
   dashboard)
     # Tier-3 chain: --watch prefers the Go TUI (m2herd-tui, bubbletea) when installed —
@@ -2630,10 +2652,10 @@ case "$CMD" in
     else dashboard_watch; fi ;;
   self-update) self_update_cmd ;;
   selftest)  selftest ;;
-  help)      sed -n '2,58p' "$0" ;;
+  help)      sed -n '2,/^$/p' "$0" ;;
   # An unknown subcommand must FAIL, not print usage and exit 0. `dispatch --all`
   # shells out to `graph next`; against a pre-v2.3 engine the old fallback returned
   # exit 0 plus 57 lines of this header, which the caller then parsed as a ready-slice
   # list. Every caller of every subcommand had the same hazard.
-  *)         printf 'unknown subcommand: %s\n\n' "$CMD" >&2; sed -n '2,58p' "$0" >&2; exit 2 ;;
+  *)         printf 'unknown subcommand: %s\n\n' "$CMD" >&2; sed -n '2,/^$/p' "$0" >&2; exit 2 ;;
 esac

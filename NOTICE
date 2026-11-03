@@ -4,6 +4,21 @@ Copyright (c) 2026 machine-machine — MIT License, see LICENSE.
 This project contains material adapted from third-party work, listed below with its license.
 
 ----------------------------------------------------------------------------------------------------
+Elephant-Goldfish Model (EGM) — https://github.com/google/elephant-goldfish-model
+----------------------------------------------------------------------------------------------------
+
+Used as a dependency, not vendored: scripts/onboard.sh installs the `egm` Claude Code plugin and
+compares it with the commit pinned there (3d0b34821ce88ad328b0c9bf0e06d7eb5f1cd669, 2026-10-23).
+templates/herd/rules/GOLDFISH.md and the review loop's blind pass apply EGM's zero-context reviewer
+principle in their own words; no EGM prompt text is copied. Should an EGM prompt ever be vendored,
+it keeps its license header and is listed here. EGM is Copyright Google LLC, licensed under the
+Apache License, Version 2.0 (https://www.apache.org/licenses/LICENSE-2.0).
+
+The tracks of the factory pipeline (quick / standard / full) and the role lenses of gate G1 follow
+the BMad Method's scale-adaptive planning paths and agent roles as ideas only (see below for the
+license and trademark notice); no BMad file is installed or copied for them.
+
+----------------------------------------------------------------------------------------------------
 BMad Method — https://github.com/bmad-code-org/BMAD-METHOD
 ----------------------------------------------------------------------------------------------------
 

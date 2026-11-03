@@ -16,6 +16,8 @@ the scripts: Opus 5.5 = `claude-opus-5-5`, Fable 5.1 = `claude-fable-5-1`, Sonne
 | Worker: fuzzy domain logic, new data model, many open questions | Fable 5.1 | high | Better at holding open questions, recording decisions and asking instead of inventing. |
 | Fix after review | same model, same session (`--resume`); switch model after the 2nd orange round at the same spot | as worker | The session already has the context and the reasons. Two failed rounds at one spot mean a blind spot of that model; a fresh model sees it. |
 | Main reviewer | the other model than the worker | high; xhigh for merge/auth/migration/hot-file probes | A model reviewing its own kind of reasoning tends to confirm it. Merge, auth, migration and hot files are where a missed bug costs most. |
+| Goldfish: G1 design review (EGM), blind pass in the review loop | a different family from the author — the model the spec author or worker did not use | high; xhigh on the high tier | A goldfish has no context but the artifact and the requirement, so it cannot be anchored on the author's story; a second family adds a second set of blind spots instead of the same one twice. |
+| Test writer: one draft eval per acceptance criterion (G3, from 3.0.0) | never the slice's worker; Opus 5.5 | high | The judge must not be the builder. Each eval has to fail on the base sha to count, which needs care more than speed. |
 | Skeptics per medium/high finding | one Opus 5.5 + one Fable 5.1 | medium | Two models disagreeing is the signal; each checks one finding, so medium effort is enough. |
 | Conflict resolution, restacking | Opus 5.5 | high | Mechanical but must be exact (`rebase --onto`, `range-diff` with only `=` lines). |
 | Data digging, measurement | Opus 5.5 | medium | Many queries, little judgement per step; numbers are checked against a command anyway. |
@@ -33,6 +35,7 @@ Each table row above runs under one rules file; `herd-context <role> <herd> [<sl
 | `WORKER.md` | `worker` | Worker (both rows); fix after review (its "Fix round" section) |
 | `REVIEWER.md` | `reviewer` | Main reviewer; skeptics (its "As a skeptic" section — the loop points skeptics at the reviewer context) |
 | `FIXER.md` | `fixer` | Fix after review, only with `fixBy: "fixer"` |
+| `GOLDFISH.md` | — (the review loop's `blind` arg; EGM skills for G1) | Goldfish |
 
 Data digging and mechanical bulk run as one-off agents of the orchestrator without a rules file of
 their own; their prompt names what they may touch.

@@ -1,0 +1,239 @@
+#!/usr/bin/env python3
+"""m2herd-gate — triage and gate verdicts of the factory pipeline (docs/factory-v3.md).
+
+  m2herd-gate triage "<intent>" [--files a,b,...] [--track T] [--tier T] [--id ID] [--feature DIR]
+                     [--source chat|cli] [--force --note TEXT] [--dry-run] [--json]
+  m2herd-gate record <id> design_review --evidence PATH --open N [--round N] [--note TEXT]
+  m2herd-gate approve <id> G1 --word "<the human's words, verbatim>"
+  m2herd-gate status [<id>] [--json]
+
+Every run lives in <dir>/.m2herd/factory/<id>/gates.jsonl (written only through herd_events.append_gate,
+under a lock). `m2herd triage` and `m2herd gate …` call this script with --dir. Rules only, no LLM, no
+network: triage is a table of words and file areas, so the same intent always gets the same track.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
+import herd_events as he  # noqa: E402
+
+# ---- G0 rule table (docs/factory-v3.md §3). First matching row wins; --track overrides. ----------------
+# Words match on word boundaries, case-insensitive; a trailing * matches any ending (migrat* → migration).
+HIGH_RISK = ["auth", "authn", "authz", "authenticat*", "authorization", "authorisation", "login", "password*", "oauth", "sso", "permission*", "credential*", "secret*", "token*",
+             "payment*", "billing", "invoice*", "checkout", "stripe", "migrat*", "schema change", "infra*",
+             "terraform", "deploy*", "client data", "customer data", "pii", "gdpr", "encrypt*"]
+FULL = ["new system", "new service", "greenfield", "client-facing", "customer-facing", "public api"]
+QUICK = ["typo*", "spelling", "wording", "rename", "comment*", "docstring*", "readme", "changelog", "bump",
+         "config", "flag", "lint", "format*", "whitespace", "one-line", "one line", "failing test"]
+LOW_TIER = ["doc", "docs", "documentation", "readme", "changelog", "test", "tests", "tooling", "ci", "script*"]
+LOW_PATHS = re.compile(r"(^|/)(docs?|tests?|spec|\.github|\.forgejo)/|\.md$|(^|/)test_[^/]*$|_test\.[a-z]+$")
+# a path's area is its first component, or the first two under these container dirs
+CONTAINERS = {"src", "lib", "app", "apps", "packages", "services", "internal", "cmd", "pkg"}
+
+NEXT = {
+    "quick": "one slice, no spec: write <slice>.task.md, herd-phase <herd> <slice> queued — gates G4 + G5 only",
+    "standard": "/speckit.specify → /speckit.clarify → /speckit.plan, then G1: EGM review of spec.md + plan.md + "
+                "contracts/ in fresh subagents → m2herd gate record {id} design_review --evidence "
+                "specs/<feature>/reviews/g1-1.md --open <n>",
+    "full": "EGM brainstorm → concepts_brief.md → /speckit.specify …, then G1 with the role lenses "
+            "(product, architecture, UX, QA) → m2herd gate record {id} design_review …",
+}
+
+
+def _rx(words):
+    alts = [re.escape(w[:-1]) + r"\w*" if w.endswith("*") else re.escape(w) for w in words]
+    return re.compile(r"(?<![\w-])(" + "|".join(alts) + r")(?![\w-])", re.I)
+
+
+RX = {k: _rx(v) for k, v in (("high", HIGH_RISK), ("full", FULL), ("quick", QUICK), ("low", LOW_TIER))}
+
+
+def hits(kind, text):
+    return sorted({m.group(1).lower() for m in RX[kind].finditer(text or "")})
+
+
+def areas(files):
+    out = set()
+    for f in files:
+        parts = [p for p in f.strip().lstrip("./").split("/") if p]
+        if not parts:
+            continue
+        out.add("/".join(parts[:2]) if parts[0] in CONTAINERS and len(parts) > 2 else parts[0])
+    return sorted(out)
+
+
+def triage(intent, files=None):
+    """-> {track, tier, sure, reasons, areas}. Pure function of the intent text and the file list."""
+    files = [f for f in (files or []) if f.strip()]
+    ar = areas(files)
+    high, full, quick = hits("high", intent), hits("full", intent), hits("quick", intent)
+    low = hits("low", intent) or (files and all(LOW_PATHS.search(f) for f in files))
+    tier = "high" if high else ("low" if low else "medium")
+    if high:
+        return {"track": "full", "tier": tier, "sure": True, "areas": ar,
+                "reasons": [f"risk words: {', '.join(high)}"]}
+    if full:
+        return {"track": "full", "tier": tier, "sure": True, "areas": ar,
+                "reasons": [f"new-system words: {', '.join(full)}"]}
+    if len(ar) > 1:
+        return {"track": "standard", "tier": tier, "sure": True, "areas": ar,
+                "reasons": [f"{len(ar)} file areas: {', '.join(ar)}"]}
+    if quick:
+        why = [f"quick words: {', '.join(quick)}"]
+        if ar:
+            return {"track": "quick", "tier": tier, "sure": True, "areas": ar, "reasons": why + [f"one area: {ar[0]}"]}
+        return {"track": "quick", "tier": tier, "sure": False, "areas": ar,
+                "reasons": why + ["scope not given — pass --files to confirm it stays in one area"]}
+    return {"track": "standard", "tier": tier, "sure": False, "areas": ar,
+            "reasons": ["no rule fired — standard is the default; confirm or pass --track"]}
+
+
+def slug(text):
+    s = re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+    return (s[:40].rstrip("-") or "run")
+
+
+def run_dir(base, rid):
+    if not he.RUN_RE.match(rid or ""):
+        raise ValueError(f"bad run id {rid!r} (expected {he.RUN_RE.pattern})")
+    return os.path.join(base, ".m2herd", "factory", rid)
+
+
+def runs(base):
+    root = os.path.join(base, ".m2herd", "factory")
+    if not os.path.isdir(root):
+        return []
+    return sorted(d for d in os.listdir(root) if os.path.isfile(os.path.join(root, d, he.GATES_FILE)))
+
+
+def waiting_on(rid, st):
+    """One line: who acts next and with which command (the board and `status` show it)."""
+    last = st["last"]
+    if not last:
+        return "nothing recorded"
+    ev, track = last["event"], st["track"]
+    if ev == "triaged":
+        if last.get("needs_approval"):
+            return "human: approve this high-tier chat intent in the STEER inbox before any work (SEC-4)"
+        return "orchestrator: " + NEXT[track].format(id=rid)
+    if ev == "design_review":
+        if int(last.get("open") or 0) > 0:
+            return f"orchestrator: resolve {last['open']} G1 finding(s) (EGM resolve), then record a new design_review"
+        return f"human: read {last.get('evidence', 'the G1 findings')}, then m2herd gate approve {rid} G1 --word \"<your words>\""
+    if ev == "design_ok":
+        return "orchestrator: cut (G2) — compile tasks.md into the herd, run HERD-CUT.md on it"
+    return "?"
+
+
+def show(rid, st):
+    tr = f"{st['track'] or '?'}/{st['tier'] or '?'}"
+    last = st["last"] or {}
+    return f"{rid:32} {tr:16} {last.get('gate', '-')}:{last.get('event', '-'):14} {last.get('ts', '')}\n" \
+           f"{'':32} → {waiting_on(rid, st)}"
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="m2herd-gate", description=__doc__.split("\n\n")[0])
+    ap.add_argument("--dir", default=os.getcwd(), help="repo root holding .m2herd/ (default: cwd)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    t = sub.add_parser("triage", help="G0: pick quick|standard|full and record it")
+    t.add_argument("intent")
+    t.add_argument("--files", default="", help="comma-separated paths the change will touch")
+    t.add_argument("--track", choices=he.TRACKS)
+    t.add_argument("--tier", choices=he.TIERS, help="raise the risk tier (never lowers the rule's tier)")
+    t.add_argument("--id", help="run id (default: slug of the intent)")
+    t.add_argument("--feature", help="spec-kit feature dir, once it exists (recorded on the event)")
+    t.add_argument("--source", choices=("cli", "chat"), default="cli", help="chat = untrusted channel text (SEC-4)")
+    t.add_argument("--force", action="store_true")
+    t.add_argument("--note")
+    t.add_argument("--dry-run", action="store_true", help="print the decision, write nothing")
+    t.add_argument("--json", action="store_true")
+
+    r = sub.add_parser("record", help="record a gate verdict the orchestrator produced")
+    r.add_argument("id")
+    r.add_argument("event", choices=["design_review"])
+    r.add_argument("--evidence", required=True, help="findings file, e.g. specs/<feature>/reviews/g1-1.md")
+    r.add_argument("--open", type=int, required=True, help="findings still open after EGM resolve")
+    r.add_argument("--round", type=int)
+    r.add_argument("--feature")
+    r.add_argument("--note")
+
+    a = sub.add_parser("approve", help="the human's approval of a gate (G1 here; G3 is m2herd eval approve)")
+    a.add_argument("id")
+    a.add_argument("gate", choices=["G1"])
+    a.add_argument("--word", required=True, help="the human's words, verbatim")
+    a.add_argument("--note")
+
+    s = sub.add_parser("status", help="where each run stands and who acts next")
+    s.add_argument("id", nargs="?")
+    s.add_argument("--json", action="store_true")
+
+    o = ap.parse_args(argv)
+    base = os.path.abspath(o.dir)
+    try:
+        if o.cmd == "triage":
+            files = [f for f in o.files.split(",") if f.strip()]
+            d = triage(o.intent, files)
+            if o.tier and he.TIERS.index(o.tier) > he.TIERS.index(d["tier"]):
+                d["tier"], d["reasons"] = o.tier, d["reasons"] + [f"tier raised to {o.tier} by --tier"]
+            if o.track and o.track != d["track"]:
+                d["reasons"] = d["reasons"] + [f"track {d['track']} → {o.track} by --track"]
+                d["track"], d["sure"] = o.track, True
+            if d["tier"] == "high" and d["track"] != "full" and not o.force:
+                raise he.TransitionError("a high-tier run needs the full track (docs/factory-v3.md §6); "
+                                         "use --force --note '<why the risk words are a false alarm>'")
+            rid = o.id or slug(o.intent)
+            fields = dict(track=d["track"], tier=d["tier"], sure=d["sure"], reasons=d["reasons"], intent=o.intent,
+                          files=files or None, areas=d["areas"] or None, feature=o.feature, source=o.source,
+                          needs_approval=True if (o.source == "chat" and d["tier"] == "high") else None)
+            if o.dry_run:
+                ev = dict(gate="G0", event="triaged", run=rid, **{k: v for k, v in fields.items() if v is not None})
+            else:
+                ev = he.append_gate(run_dir(base, rid), "triaged", note=o.note, force=o.force, **fields)
+                ev = dict(ev, run=rid)
+            if o.json:
+                print(json.dumps(ev, ensure_ascii=False))
+            else:
+                print(f"track: {d['track']} (tier {d['tier']}){'' if d['sure'] else ' — UNSURE, ask the human'}")
+                for why in d["reasons"]:
+                    print(f"  why: {why}")
+                print(f"run: {rid}{' (dry run, nothing written)' if o.dry_run else ''}")
+                print(f"next: {waiting_on(rid, {'last': ev, 'track': d['track']})}")
+            return 0
+        if o.cmd == "record":
+            ev = he.append_gate(run_dir(base, o.id), o.event, note=o.note, evidence=o.evidence, open=o.open,
+                                round=o.round, feature=o.feature)
+            print(json.dumps(ev, ensure_ascii=False))
+            return 0
+        if o.cmd == "approve":
+            ev = he.append_gate(run_dir(base, o.id), "design_ok", by="human", note=o.note, word=o.word)
+            print(json.dumps(ev, ensure_ascii=False))
+            return 0
+        if o.cmd == "status":
+            ids = [o.id] if o.id else runs(base)
+            out = {}
+            for rid in ids:
+                st = he.gate_state(run_dir(base, rid))
+                if st["last"] is None and o.id:
+                    raise ValueError(f"no gate events for run {rid!r} under {base}/.m2herd/factory/")
+                out[rid] = dict(st, waiting_on=waiting_on(rid, st))
+            if o.json:
+                print(json.dumps(out, ensure_ascii=False, indent=1))
+            elif not out:
+                print("no factory runs yet — start one with: m2herd triage \"<intent>\"")
+            else:
+                for rid, st in out.items():
+                    print(show(rid, st))
+            return 0
+    except (ValueError, he.TransitionError) as e:
+        print(f"m2herd-gate: {e}", file=sys.stderr)
+        return 2
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

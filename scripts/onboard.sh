@@ -6,8 +6,10 @@
 #   2. Verifying the substrate (herdr server, jq, git)
 #   3. Installing this skill for the chosen orchestrator(s)
 #   4. Installing spec-kit's `specify` CLI (github/spec-kit)
-#   5. Initializing spec-kit (the SDD loop) in a target repo
-#   6. Writing ~/.config/herdr-factory/config.toml
+#   5. Installing the EGM plugin (google/elephant-goldfish-model) at a pinned commit — the goldfish
+#      reviews of gate G1 (docs/factory-v3.md); checks the orchestrator can start fresh subagents
+#   6. Initializing spec-kit (the SDD loop) in a target repo
+#   7. Writing ~/.config/herdr-factory/config.toml
 #
 # Usage:
 #   ./scripts/onboard.sh                # interactive TUI
@@ -25,6 +27,10 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/herdr-factory"
 CONFIG_FILE="$CONFIG_DIR/config.toml"
 SPEC_KIT_GIT="git+https://github.com/github/spec-kit.git"
+# EGM is a pinned dependency (docs/factory-v3.md §7). Bump only after a bench run; the plugin CLI
+# cannot install a ref, so step 5 installs the marketplace head and compares it with this pin.
+EGM_REPO="google/elephant-goldfish-model"
+EGM_PIN="3d0b34821ce88ad328b0c9bf0e06d7eb5f1cd669"
 
 # ---------- presentation -----------------------------------------------------
 
@@ -122,7 +128,7 @@ while [ $# -gt 0 ]; do
     --repo)         need_val "$@"; TARGET_REPO="$2"; shift 2 ;;
     --yes|-y)       ASSUME_YES=1; shift ;;
     --force)        FORCE_INIT=1; shift ;;
-    -h|--help)      sed -n '2,19p' "$0"; exit 0 ;;
+    -h|--help)      sed -n '2,/^$/p' "$0"; exit 0 ;;
     *) fail "unknown arg: $1"; exit 1 ;;
   esac
 done
@@ -131,7 +137,7 @@ banner
 
 # ---------- step 1: orchestrator ----------------------------------------------
 
-step "1/6  Orchestrator"
+step "1/7  Orchestrator"
 say "  The orchestrator is the agent that drives the SDD loop and herds the workers."
 if [ -z "$ORCHESTRATOR" ] && [ "$ASSUME_YES" -eq 1 ]; then
   ORCHESTRATOR="claude"
@@ -156,7 +162,7 @@ esac
 
 # ---------- step 2: substrate checks -------------------------------------------
 
-step "2/6  Substrate checks"
+step "2/7  Substrate checks"
 MISSING=0
 HERDR_OK=1
 if command -v herdr >/dev/null 2>&1; then
@@ -215,7 +221,7 @@ fi
 
 # ---------- step 3: install the skill ------------------------------------------
 
-step "3/6  Install the herdr skill for $ORCHESTRATOR"
+step "3/7  Install the herdr skill for $ORCHESTRATOR"
 say "  Also wires up the dispatch-nudge hook (skill/SKILL.md §14): a per-turn"
 say "  reminder to consider fanning decomposable work out to herdr workers —"
 say "  it never spawns anything itself, only proposes; you still confirm."
@@ -239,7 +245,7 @@ esac
 
 # ---------- step 4: spec-kit CLI ------------------------------------------------
 
-step "4/6  spec-kit (github/spec-kit)"
+step "4/7  spec-kit (github/spec-kit)"
 SPECIFY_BIN=""
 if command -v specify >/dev/null 2>&1; then
   SPECIFY_BIN=$(command -v specify)
@@ -264,9 +270,41 @@ specify_cmd() {
   if [ -n "$SPECIFY_BIN" ]; then "$SPECIFY_BIN" "$@"; else uvx --from "$SPEC_KIT_GIT" specify "$@"; fi
 }
 
-# ---------- step 5: establish the SDD loop in a repo ----------------------------
+# ---------- step 5: EGM goldfish reviews (gate G1) -----------------------------
 
-step "5/6  Establish the SDD loop in a repo"
+step "5/7  EGM — goldfish reviews for gate G1 ($EGM_REPO)"
+say "  G1 reviews spec.md + plan.md in fresh, zero-context subagents (EGM review/resolve)."
+EGM_SHA=""; EGM_OK=false; EGM_SUBAGENTS="unknown"
+egm_installed_sha() {
+  jq -r '[.plugins["egm@egm"][]?.gitCommitSha] | first // empty' "$HOME/.claude/plugins/installed_plugins.json" 2>/dev/null || true
+}
+if ! command -v claude >/dev/null 2>&1; then
+  warn "claude CLI not found — EGM needs Claude Code (it is also the G1 route for a Hermes/Cursor/pi orchestrator)"
+else
+  EGM_SHA=$(egm_installed_sha)
+  if [ -z "$EGM_SHA" ] && confirm "Install the EGM plugin (claude plugin install egm@egm)?"; then
+    claude plugin marketplace add "$EGM_REPO" >/dev/null 2>&1 || true
+    claude plugin install egm@egm >/dev/null 2>&1 || warn "claude plugin install egm@egm failed — run it by hand"
+    EGM_SHA=$(egm_installed_sha)
+  fi
+  if [ -z "$EGM_SHA" ]; then
+    warn "EGM not installed — G1 falls back to the orchestrator's own review (weaker: not zero-context)"
+  elif [ "$EGM_SHA" = "$EGM_PIN" ]; then
+    EGM_OK=true; ok "EGM installed at the pinned commit ${EGM_PIN:0:12}"
+  else
+    EGM_OK=true; warn "EGM installed at ${EGM_SHA:0:12}, pin is ${EGM_PIN:0:12} — run the bench before trusting a new ref"
+  fi
+  # EGM stops a review when the agent cannot start fresh subagents: Claude Code can; the other
+  # orchestrators run G1 inside a headless `claude -p` worker that has the plugin (factory-v3 §7).
+  case "$ORCHESTRATOR" in
+    claude|all) EGM_SUBAGENTS="native" ; ok "subagents: native (Claude Code)" ;;
+    *)          EGM_SUBAGENTS="claude-p"; ok "subagents: G1 runs in a headless 'claude -p' worker for $ORCHESTRATOR" ;;
+  esac
+fi
+
+# ---------- step 6: establish the SDD loop in a repo ----------------------------
+
+step "6/7  Establish the SDD loop in a repo"
 if [ -z "$TARGET_REPO" ] && [ "$ASSUME_YES" -eq 0 ]; then
   if has_tty; then
     printf '  %s' "Path to the repo to initialize with spec-kit (empty = skip): "
@@ -342,7 +380,7 @@ fi
 
 # ---------- step 6: write config -------------------------------------------------
 
-step "6/6  Write factory config"
+step "7/7  Write factory config"
 mkdir -p "$CONFIG_DIR"
 if [ -f "$CONFIG_FILE" ]; then
   CONFIG_BAK="$CONFIG_FILE.bak-$(date +%Y%m%d%H%M%S)"
@@ -359,6 +397,13 @@ cli = "${SPECIFY_BIN:-uvx --from $SPEC_KIT_GIT specify}"
 last_repo = "${TARGET_REPO:-}"
 initialized = $SPECKIT_INITIALIZED
 
+[egm]
+repo = "$EGM_REPO"
+pin = "$EGM_PIN"
+installed = "${EGM_SHA:-}"
+ok = $EGM_OK
+subagents = "$EGM_SUBAGENTS"
+
 [onboarding]
 date = "$(date +%Y-%m-%d)"
 skill_repo = "$REPO_ROOT"
@@ -371,17 +416,17 @@ if [ "$HERDR_OK" -eq 0 ]; then
   printf '\n'
   warn "herdr is still missing — install it before running the herd (the 'herd implements' step needs it)"
 fi
-printf '\n%s\n' "${GREEN}${BOLD}Onboarding complete.${RESET} The SDD factory loop:"
+printf '\n%s\n' "${GREEN}${BOLD}Onboarding complete.${RESET} The factory pipeline (SKILL.md §11):"
 cat <<EOF
 
-  ${CYAN}1.${RESET} /speckit.constitution   — project principles (once per repo)
-  ${CYAN}2.${RESET} /speckit.specify        — WHAT to build → specs/<feature>/spec.md
-  ${CYAN}3.${RESET} /speckit.clarify        — resolve underspecified requirements
-  ${CYAN}4.${RESET} /speckit.plan           — HOW to build it → plan.md
-  ${CYAN}5.${RESET} /speckit.tasks          — actionable task list → tasks.md ([P] = parallel)
-  ${CYAN}6.${RESET} herd implements         — herdr fans [P] tasks out to workers (SKILL.md §11)
-  ${CYAN}7.${RESET} /speckit.analyze        — cross-artifact consistency gate before merge
-  ${CYAN}8.${RESET} converge + compound     — merge, verify against spec.md, write run report (§10)
+  ${CYAN}G0${RESET} m2herd triage "<intent>"  — quick | standard | full, recorded with its reason
+  ${CYAN}  ${RESET} /speckit.constitution     — project principles (once per repo)
+  ${CYAN}  ${RESET} /speckit.specify, clarify, plan — spec.md, plan.md, contracts/ (standard + full)
+  ${CYAN}G1${RESET} EGM review of spec + plan  — goldfish findings, resolve, then the human approves
+  ${CYAN}  ${RESET} /speckit.tasks            — tasks.md ([P] = parallel) → the herd's slices
+  ${CYAN}G2${RESET} HERD-CUT.md                — cut check on the herd before any worker starts
+  ${CYAN}G4${RESET} review loop                — other-model reviewer + skeptics (+ blind goldfish pass)
+  ${CYAN}G5${RESET} herd-merge on your go      — integration probe passed, /speckit.analyze clean
 
 Start a ${BOLD}$ORCHESTRATOR${RESET} session in your repo and say: "run the factory loop on <feature idea>".
 EOF

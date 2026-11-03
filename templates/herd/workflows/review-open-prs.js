@@ -1,10 +1,10 @@
 export const meta = {
   name: 'review-open-prs',
-  description: 'One review round per herd package: pin a <slice>--review worktree, main reviewer (other model) + two skeptics per medium/high finding, integration probe per repo onto current main',
+  description: 'One review round per herd package: pin a <slice>--review worktree, main reviewer (other model) + optional blind goldfish reviewer + two skeptics per medium/high finding, integration probe per repo onto current main',
   whenToUse: 'Called by review-fix-loop.js once per package and round; standalone it is a read-only review of open PRs (no herd state is written).',
   phases: [
     { title: 'Pin', detail: 'fetch PR heads, pin <slice>--review worktrees, run the repo setup' },
-    { title: 'Review', detail: 'one main reviewer per PR, model = the one the worker did not use' },
+    { title: 'Review', detail: 'one main reviewer per PR, model = the one the worker did not use; with blind, a goldfish reviewer beside it' },
     { title: 'Verify', detail: 'two skeptics per medium/high finding: one Opus, one Fable' },
     { title: 'Integrate', detail: 'per repo: packages merged onto current main in planned order, touched suites run' },
   ],
@@ -21,8 +21,11 @@ export const meta = {
 //   setup           {<repo>: shell command run inside a fresh review/probe worktree}
 //   tests           {<repo>: shell command for the touched suites}
 //   reviewModel     'other' (default) | 'same'
+//   blind           true -> a goldfish reviewer runs beside the main reviewer (default false; spec env HERD_REVIEW_BLIND).
+//                   It sees the task, the diff and the repo, never the worker's report, ctx or earlier findings
+//                   (templates/herd/rules/GOLDFISH.md); its findings go through the same skeptics, source 'blind'
 //   stale           'delta' (default) | 'full' — only matters when a slice's prior phase is review_ok
-//   models          {opus, fable} model ids (defaults claude-opus-5-5, claude-fable-5-1)
+//   models          {opus, fable, goldfish} model ids (defaults claude-opus-5-5, claude-fable-5-1; goldfish = reviewer rule)
 //   hot             {<repo>: [regex strings]} extra hot-file patterns (effort xhigh)
 //   rules           extra project rules appended to every prompt (one paragraph)
 //   register        optional path of a decisions register reviewers consult
@@ -37,6 +40,7 @@ const STALE = A.stale === 'full' ? 'full' : 'delta'
 const OPUS = (A.models && A.models.opus) || 'claude-opus-5-5'
 const FABLE = (A.models && A.models.fable) || 'claude-fable-5-1'
 const LANG = A.lang || 'English'
+const BLIND = A.blind === true || A.blind === 'true' || A.blind === 1 || A.blind === '1'
 const SEV = { none: 0, low: 1, medium: 2, high: 3 }
 const HOT_DEFAULT = ['(^|/)migrations?/', 'alembic/', '(^|/)auth', 'login', 'session', 'token', 'permission', 'rollen', '\\.sql$', '(^|/)Dockerfile$', 'docker-compose']
 
@@ -70,6 +74,7 @@ function reviewerModel(pr) {
   const w = pr.worker_model || OPUS
   return A.reviewModel === 'same' ? w : otherModel(w)
 }
+function goldfishModel(pr) { return (A.models && A.models.goldfish) || reviewerModel(pr) }
 async function run(prompt, opts) {
   // per-agent model, no inheritance; fall back to Opus when the chosen model is unavailable
   const r = await agent(prompt, opts)
@@ -247,6 +252,26 @@ Report ONLY real, concretely reproducible findings (input -> wrong result). No s
 ${RULES}`
 }
 
+// goldfish: judges the change against the task alone — no report, no ctx file, no earlier findings, no PR text
+const blindPrompt = (g, pr, pin, mode, hot) => {
+  const slice = sliceOf(g, pr)
+  const task = A.herd ? `${A.herd.replace(/\/+$/, '')}/${slice}.task.md` : ''
+  const what = mode === 'delta'
+    ? `Review the change since the last clean review: \`git -C ${pin.review_wt} diff ${priorSha((PRIOR[slice] || {}).prs, pr)}..${pin.pin}\`, and read the full change \`git -C ${pin.review_wt} diff ${pin.base_sha}...${pin.pin}\` for orientation.`
+    : `The change: \`git -C ${pin.review_wt} diff ${pin.base_sha}...${pin.pin}\`.`
+  return `You are a blind (goldfish) reviewer for ${pr.repo} PR #${pr.n}, base ${base(pr.base)}. Herd package "${g.name}", slice ${slice}, review round ${ROUND}.
+Your review worktree is ${pin.review_wt}, pinned at ${pin.pin} (detached); the rest of the repo there is yours to read.
+${task ? `What was asked: ${task} — the goal, the requirement text and the numbered acceptance criteria (AC1, AC2, ...). This file and the code are your only sources of intent.` : 'No task file was given: judge the change on its own terms and say so in the summary.'}
+${what}
+You judge the change WITHOUT the builder's story. Do NOT open, cat, grep or otherwise read: the worker's report (any *.out.md), generated context files (*.ctx.*.md), findings files (*.befunde-*.md, NACH-MERGE.md), the PR title, body or comments (no gh pr view), commit messages beyond their subject line, or any chat. If a tool result shows you one of them anyway, ignore it.
+${hot ? `This change is hot (${hot}): read callers and migrations with extra care.\n` : ''}Work like this:
+1. For every acceptance criterion: is it actually met by the code at ${pin.pin}? Name the criterion (AC<n>) in the description of every finding that concerns it; an unmet criterion is at least medium.
+2. Read the surrounding code of every changed spot: callers, guards upstream, migrations. Walk edge cases: empty, one, many, missing, duplicate, unauthorised, the error path.
+3. Run the tests of the touched modules in ${pin.review_wt}${lookup(A.tests, pr) ? ` (repo test command for reference: \`${lookup(A.tests, pr)}\` — narrow it to the touched files)` : ''}. Check whether the new tests would fail without the change.
+Report ONLY real, concretely reproducible findings (input -> wrong result), with the severity table of a strict reviewer (high: data loss, wrong result users rely on, security hole, breaks main; medium: wrong behaviour on a realistic path, unmet criterion, test that passes while behaviour is wrong; low: everything else). No style or taste. Zero findings beats invented ones. description_ok: answer true (you do not read the PR text).
+${RULES}`
+}
+
 const skepticPrompt = (g, pr, pin, f, k) => `Try to REFUTE this review finding (skeptic ${k + 1} of 2). ${pr.repo} PR #${pr.n}, pinned at ${pin.pin} in ${pin.review_wt} (read only).
 Finding [${f.severity}] ${f.title} — ${f.file}${f.line ? ':' + f.line : ''}
 ${f.description}
@@ -289,17 +314,30 @@ async function reviewOne(g, pr, pin) {
   const hot = hotReason(pr, pin)
   const key = keyOf(pr)
   if (mode === 'probe') return { pr: key, slice: sliceOf(g, pr), pin: pin.pin, mode, rev: null, findings: [] }
-  const rev = await run(reviewPrompt(g, pr, pin, mode, hot), { label: `review:${g.name}:${key}`, phase: 'Review', schema: FINDINGS, model: reviewerModel(pr), effort: hot ? 'xhigh' : 'high' })
+  const effort = hot ? 'xhigh' : 'high'
+  const [rev, bl] = await parallel([
+    () => run(reviewPrompt(g, pr, pin, mode, hot), { label: `review:${g.name}:${key}`, phase: 'Review', schema: FINDINGS, model: reviewerModel(pr), effort }),
+  ].concat(BLIND ? [() => run(blindPrompt(g, pr, pin, mode, hot), { label: `blind:${g.name}:${key}`, phase: 'Review', schema: FINDINGS, model: goldfishModel(pr), effort })] : []))
   if (!rev) return { pr: key, slice: sliceOf(g, pr), pin: pin.pin, mode, rev: null, findings: [], error: 'reviewer returned nothing' }
-  const big = rev.findings.filter(f => f.severity !== 'low')
-  const low = rev.findings.filter(f => f.severity === 'low')
+  if (BLIND && !bl) log(`${g.name} ${key}: blind reviewer returned nothing — main review only`)
+  const same = (a, b) => String(a.file || '').toLowerCase() === String(b.file || '').toLowerCase() && String(a.title || '').trim().toLowerCase() === String(b.title || '').trim().toLowerCase()
+  const mains = rev.findings.map(f => ({ ...f, source: f.source || 'review' }))
+  const blinds = []
+  for (const f of (bl && bl.findings) || []) {
+    const twin = mains.find(m => same(m, f))
+    if (twin) twin.also_blind = true
+    else blinds.push({ ...f, source: 'blind' })
+  }
+  const all = mains.concat(blinds)
+  const big = all.filter(f => f.severity !== 'low')
+  const low = all.filter(f => f.severity === 'low')
   const judged = await parallel(big.map(f => () =>
     parallel([OPUS, FABLE].map((m, k) => () => run(skepticPrompt(g, pr, pin, f, k), { label: `verify:${g.name}:${key}:${k + 1}`, phase: 'Verify', schema: VERDICT, model: m, effort: 'medium' })))
       .then(vs => ({ f, vs }))))
   const findings = surviving(rev, judged.filter(Boolean))
     .concat(low.map(f => ({ ...f, votes: 0, survives: true, unverified: true, severity_final: 'low' })))
     .map(f => ({ ...f, pr: key, slice: sliceOf(g, pr) }))
-  return { pr: key, slice: sliceOf(g, pr), pin: pin.pin, mode, hot, rev: { summary: rev.summary, tests: rev.tests, description_ok: rev.description_ok }, findings }
+  return { pr: key, slice: sliceOf(g, pr), pin: pin.pin, mode, hot, rev: { summary: rev.summary, tests: rev.tests, description_ok: rev.description_ok }, blind: bl ? { summary: bl.summary, tests: bl.tests } : null, findings }
 }
 
 function integFindings(g, res, mine) {

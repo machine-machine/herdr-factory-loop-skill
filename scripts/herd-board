@@ -88,7 +88,7 @@ STRINGS = {
            "stale_main": "{repo} main moved", "stale_nomain": "{repo} main not recorded", "befund": "findings", "word": "say “{w}”",
            "v1": "v1 herd — herd-recover migrates it", "wf": "workflow: {r} running, {d} done",
            "no_core": "herd_events.py missing next to herd-board", "draw_err": "herd-board"},
-    "de": {"title": "Herde", "load": "Last", "done": "fertig", "check": "prüfen", "working": "arbeitet",
+    "de": {"title": "Herd", "load": "Last", "done": "fertig", "check": "prüfen", "working": "arbeitet",
            "still": "still", "needs_answer": "braucht Antwort", "ended": "beendet ohne Bericht", "missing": "fehlt:",
            "blocked": "blockiert", "since": "seit", "signed": "rev'd",
            "in_review": "in Prüfung", "no_review": "noch ohne Review", "merged": "Heute gemergt ", "more": "weitere",
@@ -110,7 +110,7 @@ STRINGS = {
            "review_round": "Review läuft, Runde {n}/3", "reprobe": "Nachprüfung nach Merge", "reviewed": "rev'd", "stale": "veraltet",
            "stale_head": "{ref} hat neue Commits", "stale_main": "{repo}-main ist weiter",
            "stale_nomain": "{repo}-main nicht erfasst", "befund": "Befunde",
-           "word": "Wort: „{w}“", "v1": "v1-Herde — herd-recover migriert",
+           "word": "Wort: „{w}“", "v1": "v1-Herd — herd-recover migriert",
            "wf": "Workflow: {r} laufen, {d} fertig", "no_core": "herd_events.py fehlt neben herd-board",
            "draw_err": "herd-board"},
 }
@@ -1489,7 +1489,7 @@ def selftest():
     iso = lambda ago_s: time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now - ago_s))
     sha = lambda c: (c * 40)[:40]
     with tempfile.TemporaryDirectory() as tmp:
-        herd = os.path.join(tmp, "herde-v2")
+        herd = os.path.join(tmp, "herd-v2")
         os.makedirs(herd)
         wt_root = os.path.join(tmp, "wt")
         evs = []
@@ -1554,7 +1554,7 @@ def selftest():
         open(os.path.join(herd, "w-fix.status.json"), "w").write('{"kurz": "behebt Befunde"}')
 
         # v1 herd: herd.map and malformed status files, no events
-        old = os.path.join(tmp, "herde-v1")
+        old = os.path.join(tmp, "herd-v1")
         os.makedirs(old)
         cases = {  # slice -> status.json as written by a worker
             "hbst-liste": '{"satz": "Board liest Listen", "schritt": 2, "von": 4, "fehlt": ["Tests", "Doku"]}',
@@ -1704,7 +1704,7 @@ def selftest():
                       busy and any("ZeroDivisionError" in l for l in strip(out)))
             finally:
                 g["render"] = render_impl
-            wide = f"{DIM}herde-2010: v1 herd — herd-recover migrates it{RST}  🤖 cut check"
+            wide = f"{DIM}herd-2010: v1 herd — herd-recover migrates it{RST}  🤖 cut check"
             cut = [ANSI.sub("", clip(wide, n)) for n in (38, 20, 50)]
             check("clip keeps every line inside the panel width (colour codes free, emoji two columns)",
                   [sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in v) for v in cut] == [38, 20, 50]

@@ -115,21 +115,21 @@ def build(tmp):
     w(m, d + "held.md", "r\n", OLD)
     w(m, d + "live-ref.md", "r\n", OLD)
     # herds
-    h = d + "herde-0101/"                                                   # merged 20 d ago, all old
+    h = d + "herd-0101/"                                                   # merged 20 d ago, all old
     w(m, h + "a.task.md", "t\n", OLD)
     w(m, h + "herd.events.jsonl", ev("a", "working", OLD) + ev("a", "merged", NOW - 20 * 86400, "merge"), OLD)
     w(m, h + "screens/s.png", "png", MID)
-    h = d + "herde-0202/"                                                   # merged 3 d ago
+    h = d + "herd-0202/"                                                   # merged 3 d ago
     w(m, h + "a.task.md", "t\n", MID)
     w(m, h + "herd.events.jsonl", ev("a", "merged", NOW - 3 * 86400, "merge"), MID)
     w(m, h + "screens/t.png", "png", MID)
-    h = d + "herde-0303/"                                                   # live: still working
+    h = d + "herd-0303/"                                                   # live: still working
     w(m, h + "a.task.md", "needs dispatch/live-ref.md\n", OLD)
     w(m, h + "herd.events.jsonl", ev("a", "working", OLD, "watch"), OLD)
     w(m, h + "screens/u.png", "png", OLD)
     w(m, h + "x.lock", "", OLD)
     age_dir(os.path.join(m, h), OLD)
-    w(m, d + "herde-0404/herd.map", "x\n")                                  # v1, fresh -> live
+    w(m, d + "herd-0404/herd.map", "x\n")                                  # v1, fresh -> live
     # run data in the fabric
     w(m, d + "screens/s-old/1.png", "png" * 100, OLD)
     w(m, d + "screens/s-mid/1.png", "png", MID)
@@ -157,17 +157,17 @@ def build(tmp):
     os.makedirs(os.path.join(m, "rules/empty"))
     age_dir(os.path.join(m, "rules/empty"), OLD)
     # an archived herd from an earlier run whose run data is still in the cache
-    w(m, "archives/2026-01-01/dispatch/herde-0505/herd.events.jsonl",
+    w(m, "archives/2026-01-01/dispatch/herd-0505/herd.events.jsonl",
       ev("a", "merged", NOW - 20 * 86400, "merge"), OLD)
     w(m, "archives/2026-01-01/INDEX.md", "- old\n", OLD)
     # cache
     w(cache, "screens/README.md", "r\n", OLD)
     w(cache, "screens/c-old/1.png", "png" * 50, OLD)
     w(cache, "screens/c-mid/1.png", "png", MID)
-    w(cache, "herden/herde-0505/screens/1.png", "png", MID)                 # archived herd merged 20 d ago
-    w(cache, "herden/herde-0303/screens/1.png", "png", OLD)                 # live herd
-    w(cache, "herden/herde-9999/screens/1.png", "png", OLD)                 # herd unknown -> mtime
-    w(cache, "herden/herde-9998/screens/1.png", "png", MID)
+    w(cache, "herden/herd-0505/screens/1.png", "png", MID)                 # archived herd merged 20 d ago
+    w(cache, "herden/herd-0303/screens/1.png", "png", OLD)                 # live herd
+    w(cache, "herden/herd-9999/screens/1.png", "png", OLD)                 # herd unknown -> mtime
+    w(cache, "herden/herd-9998/screens/1.png", "png", MID)
     w(cache, "worker.log", "l\n", OLD)
     w(cache, "other/stuff.txt", "s\n", OLD)                                 # not run data -> untouched
     w(bin_, "tool", "cat $HOME/proj/.m2herd/dispatch/tool-ref.md\n")
@@ -224,7 +224,7 @@ def main():
         archived = [ln.split()[1] for ln in plan.splitlines() if ln.startswith("ARCHIVE")]
         for rel in ("dispatch/unused.out.md", "dispatch/notes-old.md", "dispatch/notes-old2.md", "old-top.md",
                     "dispatch/chain-a.md", "dispatch/chain-b.md", "dispatch/olddir/", "context/",
-                    "dispatch/herde-0101/", "private-note.md", "dispatch/secret-ref.md"):
+                    "dispatch/herd-0101/", "private-note.md", "dispatch/secret-ref.md"):
             check(f"archive {rel}", rel in archived, plan)
         check("archive keeps the path", f"ARCHIVE dispatch/unused.out.md -> {A}dispatch/unused.out.md" in plan, plan)
         check("archive dir counts files", "dispatch/olddir/ -> " in plan and "2 files" in plan, plan)
@@ -236,18 +236,18 @@ def main():
                          ("lanes/", "word + slash"), ("RESUME.md", "keep"), ("NOTES.md", "keep"),
                          ("PHASE-NEXT-2026-01-01.md", "keep"), ("checks.sh", "keep"), ("tool.sh", "script"),
                          ("rules/", "keep"), ("decisions-register.json", "register"), ("tickets/", "jsonl"),
-                         ("queue.sqlite3", "state"), ("settings.json", "engine"), ("dispatch/herde-0303/", "live"),
-                         ("dispatch/herde-0404/", "live v1"), ("dispatch/herde-0202/", "recent herd")):
+                         ("queue.sqlite3", "state"), ("settings.json", "engine"), ("dispatch/herd-0303/", "live"),
+                         ("dispatch/herd-0404/", "live v1"), ("dispatch/herd-0202/", "recent herd")):
             check(f"keep {rel} ({why})", rel not in archived, plan)
         check("held file skipped", "SKIP    dispatch/held.md — in use by pid" in plan, plan)
         # run data in the fabric
         check("old screens deleted in place", "DELETE  dispatch/screens/s-old/" in plan, plan)
         check("mid screens moved", "MOVE    dispatch/screens/s-mid/ -> ~/.cache/m2herd/proj/screens/s-mid/" in plan, plan)
         check("fresh screens stay", "s-new" not in plan, plan)
-        check("merged herd: screens deleted (merged 20 d ago)", "DELETE  dispatch/herde-0101/screens/s.png" in plan, plan)
-        check("recent herd: screens to cache/herden", "MOVE    dispatch/herde-0202/screens/t.png -> "
-              "~/.cache/m2herd/proj/herden/herde-0202/screens/t.png" in plan, plan)
-        check("live herd untouched", "herde-0303/screens" not in plan and "herde-0303/x.lock" not in plan, plan)
+        check("merged herd: screens deleted (merged 20 d ago)", "DELETE  dispatch/herd-0101/screens/s.png" in plan, plan)
+        check("recent herd: screens to cache/herden", "MOVE    dispatch/herd-0202/screens/t.png -> "
+              "~/.cache/m2herd/proj/herden/herd-0202/screens/t.png" in plan, plan)
+        check("live herd untouched", "herd-0303/screens" not in plan and "herd-0303/x.lock" not in plan, plan)
         check("runs: CURRENT run and README stay", "r-cur" not in plan and "runs/README" not in plan
               and "runs/CURRENT" not in plan and "DELETE  loop/runs/r-old/" in plan, plan)
         check("backups", "DELETE  backups/b-old.tar" in plan
@@ -266,17 +266,17 @@ def main():
         # cache retention
         check("cache old deleted", "DELETE  ~/.cache/m2herd/proj/screens/c-old/" in plan, plan)
         check("cache mid kept", "c-mid" not in plan and "screens/README" not in plan, plan)
-        check("cache herd of archived merged herd deleted", "DELETE  ~/.cache/m2herd/proj/herden/herde-0505/" in plan
-              and "merged" in plan.split("herde-0505/")[1].splitlines()[0], plan)
-        check("cache herd of live herd kept", "herden/herde-0303" not in plan, plan)
-        check("cache unknown herd by mtime", "herden/herde-9999/" in plan and "herde-9998" not in plan, plan)
+        check("cache herd of archived merged herd deleted", "DELETE  ~/.cache/m2herd/proj/herden/herd-0505/" in plan
+              and "merged" in plan.split("herd-0505/")[1].splitlines()[0], plan)
+        check("cache herd of live herd kept", "herden/herd-0303" not in plan, plan)
+        check("cache unknown herd by mtime", "herden/herd-9999/" in plan and "herd-9998" not in plan, plan)
         check("cache top-level log", "DELETE  ~/.cache/m2herd/proj/worker.log" in plan, plan)
         check("cache non-run data untouched", "other/stuff" not in plan, plan)
         check("totals printed", "freed from disk (deleted)" in txt and "archived in the fabric" in txt, txt)
 
         rc, vtxt = cli(base + ["--verbose"], home)
         check("verbose names the reader", "KEEP    dispatch/tool-ref.md — referenced by" in vtxt
-              and "KEEP    dispatch/herde-0303 — live herd" in vtxt, vtxt)
+              and "KEEP    dispatch/herd-0303 — live herd" in vtxt, vtxt)
         rc, stxt = cli(base + ["--summary"], home)
         check("summary has no action lines", "ARCHIVE" not in stxt and "totals" in stxt, stxt)
 
@@ -311,12 +311,12 @@ def main():
         check("no fabric file lost (only caches and run data leave)", not lost, "\n".join(lost))
         check("archived file is in archives", os.path.join(A, "dispatch/olddir/x.md") in after, "\n".join(sorted(after)))
         check("moved run data in the cache", "screens/s-mid/1.png" in cache_after
-              and "herden/herde-0202/screens/t.png" in cache_after and "backups/b-mid.tar" in cache_after,
+              and "herden/herd-0202/screens/t.png" in cache_after and "backups/b-mid.tar" in cache_after,
               "\n".join(sorted(cache_after)))
         check("old run data gone", "dispatch/screens/s-old/1.png" not in after and "screens/c-old/1.png" not in cache_after
-              and "herden/herde-0505/screens/1.png" not in cache_after and "worker.log" not in cache_after)
+              and "herden/herd-0505/screens/1.png" not in cache_after and "worker.log" not in cache_after)
         check("current run kept", "loop/runs/r-cur/run.json" in after and "loop/runs/CURRENT" in after)
-        check("live herd intact", {r for r in before if r.startswith("dispatch/herde-0303/")}
+        check("live herd intact", {r for r in before if r.startswith("dispatch/herd-0303/")}
               <= after, "\n".join(sorted(after)))
         check("held file still in place", "dispatch/held.md" in after)
         check("empty dir removed", not os.path.exists(os.path.join(m, "empty-old"))

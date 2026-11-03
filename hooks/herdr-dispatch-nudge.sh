@@ -28,11 +28,11 @@ while IFS= read -r -t 5 _line 2>/dev/null; do payload="${payload}${_line}"$'\n';
 # partial in $_line — append it so a newline-less payload isn't dropped.
 if [ -n "${_line:-}" ]; then payload="${payload}${_line}"; fi
 
-NUDGE='herdr: before starting multi-part or channel-relayed work, check whether it decomposes into >=2 independent slices (different files/services/features) — see the herdr skill Sections 9 (herd), 11 (SDD), 13 (meta-orchestration). If it does, propose a short plan (slices, base branch, worker count/type) and get explicit user/channel confirmation BEFORE spawning any herdr agent, worktree, or branch. Never auto-spawn workers without that confirmation. Trivial or single-file asks: just do the work inline, no herd.'
+NUDGE='herdr factory: before starting multi-part or channel-relayed work, triage it first — m2herd triage "<intent>" --files <paths it will touch> (herdr skill Section 11, the factory pipeline). quick = one slice, no spec; standard/full = spec-kit chain plus the G1 design review before any herd. Then propose the plan (track, slices, base branch, worker count/type) and get explicit user/channel confirmation BEFORE spawning any herdr agent, worktree, or branch. Never auto-spawn workers without that confirmation. Trivial or single-file asks: just do the work inline, no herd.'
 
 # Without jq we can't parse the event or build JSON safely — emit a static,
-# hand-escaped envelope instead (NUDGE's only JSON-special characters are the
-# two double quotes, escaped below) so the nudge still lands. Event sniffed
+# hand-escaped envelope instead (NUDGE's only JSON-special characters are its
+# double quotes, escaped below) so the nudge still lands. Event sniffed
 # crudely from the raw payload; default is the Claude Code shape.
 if ! command -v jq >/dev/null 2>&1; then
   _esc=${NUDGE//\"/\\\"}

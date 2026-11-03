@@ -22,9 +22,11 @@ export const meta = {
 //   tests        {<repo>: command} touched suites for the integration probe
 //   fixBy        'worker' (default: befund -> fix_queued, no fixer) | 'fixer' (in-loop fixer, max maxFix rounds)
 //   reviewModel  'other' (default) | 'same';  stale 'delta' (default) | 'full'
+//   blind        true -> blind goldfish reviewer beside the main reviewer (default false; spec env HERD_REVIEW_BLIND;
+//                templates/herd/rules/GOLDFISH.md); passed through to review-open-prs.js
 //   run_id       id recorded in the events (default 'loop'); pass a timestamp, the script cannot make one
 //   herdPhase    herd-phase command (default 'herd-phase' on PATH)
-//   maxFix       fixer rounds (default 3);  models {opus, fable};  hot {<repo>: [regex]};  rules, register, lang
+//   maxFix       fixer rounds (default 3);  models {opus, fable, goldfish};  hot {<repo>: [regex]};  rules, register, lang
 //   git          {name, email, coauthor} for fixer commits (default: the worktree's own git identity)
 
 const A = args || {}
@@ -40,6 +42,7 @@ const FABLE = (A.models && A.models.fable) || 'claude-fable-5-1'
 const GROUPS = A.groups || []
 const WANT = A.review && A.review.length ? new Set(A.review) : null
 const BLOCKING = ['high', 'medium']
+const BLIND = A.blind === true || A.blind === 'true' || A.blind === 1 || A.blind === '1'
 
 function sq(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'" }
 function keyOf(pr) { return `${pr.short}#${pr.n}` }
@@ -152,10 +155,10 @@ Forbidden: merging, herd-phase, tickets, mail, staging, reading credentials, oth
 // ---- Record ----
 function befundeText(g, slice, sha7, blocking, lows, integ, round, hist) {
   const lines = [`# Review findings — ${slice} @ ${sha7}`, '',
-    `Package ${g.name}, run ${RUN}, round ${round}, fix_by ${FIX_BY}. Written by review-fix-loop.js; resume the worker with \`herd-spawn ${HERD} ${slice} --resume\`.`, '',
+    `Package ${g.name}, run ${RUN}, round ${round}, fix_by ${FIX_BY}${BLIND ? ', blind pass on' : ''}. Written by review-fix-loop.js; resume the worker with \`herd-spawn ${HERD} ${slice} --resume\`.`, '',
     '## To fix (medium/high, survived two skeptics or came from the integration probe)', '']
   blocking.forEach((f, i) => {
-    lines.push(`### ${i + 1}. [${f.severity_final}] ${f.pr} — ${f.title}`, '', `File: ${f.file}${f.line ? ':' + f.line : ''}${f.source ? ` (source: ${f.source})` : ''}`, '', f.description, '', `Repro: ${f.repro}`)
+    lines.push(`### ${i + 1}. [${f.severity_final}] ${f.pr} — ${f.title}`, '', `File: ${f.file}${f.line ? ':' + f.line : ''}${f.source ? ` (source: ${f.source}${f.also_blind ? ', also found blind' : ''})` : ''}`, '', f.description, '', `Repro: ${f.repro}`)
     if ((f.reasons || []).length) lines.push('', `Skeptics: ${f.reasons.join(' | ')}`)
     lines.push('')
   })
@@ -190,7 +193,7 @@ function recordScript(g, gr, round, hist) {
       const lowLines = lows.map(fline)
       if (lowLines.length) parts.push(heredoc(`${HERD}/NACH-MERGE.md`, [`## ${slice} — review ${RUN} (${prList.join(', ')})`, '', ...lows.map(f => `- [low] ${fline(f)}: ${f.description}`), ''].join('\n'), true, i++))
       const modes = prs.map(pr => (gr.modes || {})[keyOf(pr)] || 'full')
-      parts.push(phaseCmd(slice, 'review_ok', [['prs', prList], ['main', main], ['run_id', RUN], ['lows', lowLines]], `clean after round ${round} (${[...new Set(modes)].join('/')} review, integration probe passed)`))
+      parts.push(phaseCmd(slice, 'review_ok', [['prs', prList], ['main', main], ['run_id', RUN], ['lows', lowLines]], `clean after round ${round} (${[...new Set(modes)].join('/')} review${BLIND ? ', blind pass on' : ''}, integration probe passed)`))
       out[slice] = { outcome: 'review_ok', prs: prList, main, lows: lowLines }
     }
   }
@@ -221,7 +224,7 @@ async function loop(g) {
   for (; ; round++) {
     const res = await workflow({ scriptPath: A.reviewScript }, {
       herd: HERD, groups: GROUPS, review: [g.name], prior, round, setup: A.setup, tests: A.tests,
-      reviewModel: A.reviewModel, stale: A.stale, models: A.models, hot: A.hot, rules: A.rules, register: A.register, lang: A.lang,
+      reviewModel: A.reviewModel, stale: A.stale, blind: BLIND, models: A.models, hot: A.hot, rules: A.rules, register: A.register, lang: A.lang,
     })
     gr = res && (res.groups || []).find(x => x.name === g.name)
     if (!gr || gr.error) {

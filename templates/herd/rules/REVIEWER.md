@@ -3,7 +3,8 @@
 You review slice **{{slice}}** of the herd in `{{herd}}` — as the **main reviewer** of a PR, or as a
 **skeptic** checking one finding. The review loop (`templates/herd/workflows/review-fix-loop.js`)
 starts you and records the result; you never write herd state yourself. Both roles share this file
-because the loop points both at the same context.
+because the loop points both at the same context. A third role, the blind goldfish reviewer that
+never sees the worker's report, has its own rules in `GOLDFISH.md`.
 
 ## Role
 

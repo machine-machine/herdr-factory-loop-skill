@@ -434,7 +434,7 @@ launch_mission() {
   local reported pane name; name="$(agent_name "$orch-orch-$mission")"
   if herdr_v09; then
     # 0.9: one workspace per mission, labelled with it. The mission orchestrator's own
-    # herd-loop then opens its workers in that workspace's "herde" tab, so missions
+    # herd-loop then opens its workers in that workspace's "herd" tab, so missions
     # never share a tab. The pane is ours, so its id is authoritative.
     pane="$(herdr workspace create --cwd "$repo" --label "$mission" --no-focus 2>/dev/null | jq -r '.result.root_pane.pane_id // empty' || true)"
     if [ -n "$pane" ] && ! start_agent "$pane" "$name" "$bin" "$flag"; then

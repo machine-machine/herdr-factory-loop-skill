@@ -94,14 +94,14 @@ class Base(unittest.TestCase):
         except OSError:
             return []
 
-    def add_herde(self, workers):
-        """tab herde with panes [(pane, rows, status or None)]."""
+    def add_herd(self, workers, label="herd", tab="w1:t2"):
+        """tab `label` (default herd; `herde` = the pre-3.0 label) with panes [(pane, rows, status or None)]."""
         st = self.herdr()
-        st["tabs"].append({"tab_id": "w1:t2", "workspace_id": "w1", "label": "herde"})
+        st["tabs"].append({"tab_id": tab, "workspace_id": "w1", "label": label})
         for pane, rows, status in workers:
-            st["panes"].append({"pane_id": pane, "tab_id": "w1:t2", "scroll": {"viewport_rows": rows}})
+            st["panes"].append({"pane_id": pane, "tab_id": tab, "scroll": {"viewport_rows": rows}})
             if status:
-                st["agents"].append({"pane_id": pane, "tab_id": "w1:t2", "agent_status": status,
+                st["agents"].append({"pane_id": pane, "tab_id": tab, "agent_status": status,
                                      "agent_session": {"value": ""}})
         self.herdr(st)
 
@@ -123,11 +123,11 @@ class Base(unittest.TestCase):
 
 
 class LimitsTest(Base):
-    def test_counts_working_and_blocked_in_herde_only(self):
-        self.add_herde([("w1:p2", 30, "working"), ("w1:p3", 30, "blocked"), ("w1:p4", 30, "idle"),
+    def test_counts_working_and_blocked_in_herd_only(self):
+        self.add_herd([("w1:p2", 30, "working"), ("w1:p3", 30, "blocked"), ("w1:p4", 30, "idle"),
                         ("w1:p5", 30, "done")])
         st = self.herdr()
-        st["tabs"].append({"tab_id": "w2:t1", "workspace_id": "w2", "label": "herde"})
+        st["tabs"].append({"tab_id": "w2:t1", "workspace_id": "w2", "label": "herd"})
         st["agents"].append({"pane_id": "w2:p1", "tab_id": "w2:t1", "agent_status": "working"})
         self.herdr(st)
         r = self.run_script("herd-limits", self.herd, "--json")
@@ -139,8 +139,19 @@ class LimitsTest(Base):
         self.assertIn("slots 2/2", r.stdout)
         self.assertIn("no slot: all 2 slots used", r.stdout)
 
+    def test_legacy_herde_tab_counts_unless_label_is_set(self):
+        self.add_herd([("w1:p2", 30, "working")])
+        self.add_herd([("w1:p3", 30, "working"), ("w1:p4", 30, "blocked")], label="herde", tab="w1:t3")
+        r = self.run_script("herd-limits", self.herd, "--json")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(json.loads(r.stdout)["workers"], 3)
+        r = self.run_script("herd-limits", self.herd, "--json", env={"HERD_SPAWN_TAB": "herd"})
+        self.assertEqual(json.loads(r.stdout)["workers"], 1)
+        r = self.run_script("herd-limits", self.herd, "--json", env={"HERD_SPAWN_TAB": "other"})
+        self.assertEqual(json.loads(r.stdout)["workers"], 0)
+
     def test_limits_env_file_and_env_precedence(self):
-        self.add_herde([("w1:p2", 30, "working")])
+        self.add_herd([("w1:p2", 30, "working")])
         wr(os.path.join(self.herd, "limits.env"), "export HERD_MAX_SLOTS=1  # tight\nHERD_MIN_FREE_MB='100'\n")
         r = self.run_script("herd-limits", self.herd)
         self.assertEqual(r.returncode, 1, r.stdout)
@@ -204,7 +215,7 @@ class SpawnTest(Base):
     def runs(self):
         return [c for c in self.herdr_calls() if c[:2] == ["pane", "run"]]
 
-    def test_first_worker_creates_herde_tab_and_records_event(self):
+    def test_first_worker_creates_herd_tab_and_records_event(self):
         self.slice("alpha", "tickets: 1\nmodel: claude-fable-5-1\neffort: xhigh", repos=("api", "ui"))
         wr(os.path.join(self.herd, "COMMON.md"), "rules\n")
         r = self.spawn("alpha")
@@ -213,7 +224,7 @@ class SpawnTest(Base):
         split = next(c for c in calls if c[:2] == ["pane", "split"])
         self.assertEqual(split[split.index("--pane") + 1], ANCHOR)
         self.assertIn(["pane", "move", "w1:p11", "--new-tab"], calls)
-        self.assertTrue(any(c[:2] == ["tab", "rename"] and c[3] == "herde" for c in calls))
+        self.assertTrue(any(c[:2] == ["tab", "rename"] and c[3] == "herd" for c in calls))
         self.assertIn(["agent", "focus", ANCHOR], calls)
         ev = he.last(self.herd, "alpha")
         self.assertEqual((ev["phase"], ev["by"], ev["pane"], ev["model"], ev["effort"]),
@@ -241,8 +252,34 @@ class SpawnTest(Base):
         self.assertEqual((ev["model"], ev["effort"]), ("claude-opus-5-5", "high"))
         self.assertIn("beta.ctx.worker.md", self.runs()[0][3])
 
+    def test_reuses_legacy_herde_tab(self):
+        self.add_herd([("w1:p2", 30, "working")], label="herde")
+        self.slice("legacy")
+        self.assertEqual(self.spawn("legacy").returncode, 0)
+        calls = self.herdr_calls()
+        split = next(c for c in calls if c[:2] == ["pane", "split"])
+        self.assertEqual(split[split.index("--pane") + 1], "w1:p2")
+        self.assertFalse(any(c[:2] in (["pane", "move"], ["tab", "rename"]) for c in calls))
+
+    def test_prefers_herd_tab_over_legacy_herde(self):
+        self.add_herd([("w1:p2", 30, "working")], label="herde", tab="w1:t2")
+        self.add_herd([("w1:p3", 30, "working")], label="herd", tab="w1:t3")
+        self.slice("both")
+        self.assertEqual(self.spawn("both").returncode, 0)
+        split = next(c for c in self.herdr_calls() if c[:2] == ["pane", "split"])
+        self.assertEqual(split[split.index("--pane") + 1], "w1:p3")
+
+    def test_explicit_label_ignores_legacy_herde_tab(self):
+        self.add_herd([("w1:p2", 30, "working")], label="herde")
+        self.slice("custom")
+        self.assertEqual(self.spawn("custom", env={"HERD_SPAWN_TAB": "workers"}).returncode, 0)
+        calls = self.herdr_calls()
+        split = next(c for c in calls if c[:2] == ["pane", "split"])
+        self.assertEqual(split[split.index("--pane") + 1], ANCHOR)
+        self.assertTrue(any(c[:2] == ["tab", "rename"] and c[3] == "workers" for c in calls))
+
     def test_splits_tallest_pane_down_then_right(self):
-        self.add_herde([("w1:p2", 20, "working"), ("w1:p3", 30, "working")])
+        self.add_herd([("w1:p2", 20, "working"), ("w1:p3", 30, "working")])
         self.slice("gamma")
         self.assertEqual(self.spawn("gamma").returncode, 0)
         split = next(c for c in self.herdr_calls() if c[:2] == ["pane", "split"])
@@ -310,7 +347,7 @@ class SpawnTest(Base):
         self.assertIn("fix round", ev["note"])
 
     def test_resume_prompts_live_idle_pane(self):
-        self.add_herde([("w1:p2", 40, None)])
+        self.add_herd([("w1:p2", 40, None)])
         sid = str(uuid.uuid4())
         st = self.herdr()
         st["agents"].append({"pane_id": "w1:p2", "tab_id": "w1:t2", "agent_status": "idle",
@@ -330,7 +367,7 @@ class SpawnTest(Base):
         self.assertEqual(he.last(self.herd, "mu")["pane"], "w1:p2")
 
     def test_resume_refuses_running_and_without_session(self):
-        self.add_herde([("w1:p2", 40, "working")])
+        self.add_herd([("w1:p2", 40, "working")])
         self.slice("nu")
         self.phase("nu", "working", pane="w1:p2", session_id="")
         self.phase("nu", "accepted")
@@ -341,7 +378,7 @@ class SpawnTest(Base):
         self.assertIn("still working in w1:p2", self.spawn("xi", "--resume").stderr)
 
     def test_resume_bare_shell_pane_runs_in_place(self):
-        self.add_herde([("w1:p2", 40, None)])
+        self.add_herd([("w1:p2", 40, None)])
         self.slice("omi")
         sid = str(uuid.uuid4())
         self.phase("omi", "working", pane="w1:p2", session_id=sid)
@@ -429,17 +466,17 @@ class WatchTest(Base):
         self.assertEqual(he.last(self.herd, "ee")["phase"], "queued")
         self.assertIn("START FAILED ee", rd(os.path.join(self.herd, "watch.log")))
         st = self.herdr()
-        self.assertFalse([t for t in st["tabs"] if t["label"] == "herde"])   # the failed pane was closed
+        self.assertFalse([t for t in st["tabs"] if t["label"] == "herd"])   # the failed pane was closed
         st["fail"] = []
         self.herdr(st)
         out = self.tick()
         self.assertEqual(he.last(self.herd, "ee")["phase"], "working", out)
 
-    def test_empty_herde_tab_is_not_split(self):
+    def test_empty_herd_tab_is_not_split(self):
         self.slice("ef")
         self.phase("ef", "queued")
         st = self.herdr()
-        st["tabs"].append({"tab_id": "w1:t2", "workspace_id": "w1", "label": "herde"})   # no panes left in it
+        st["tabs"].append({"tab_id": "w1:t2", "workspace_id": "w1", "label": "herd"})   # no panes left in it
         self.herdr(st)
         self.assertIn("STARTED ef", self.tick())
 
@@ -469,7 +506,7 @@ class WatchTest(Base):
         self.assertEqual(he.last(self.herd, "ii")["session_id"], sid)
 
     def live_worker(self, s, status):
-        self.add_herde([("w1:p2", 40, status)])
+        self.add_herd([("w1:p2", 40, status)])
         self.slice(s)
         self.phase(s, "working", pane="w1:p2", session_id="sess", wt=[os.path.join(self.wtroot, "api", s)])
 
@@ -607,7 +644,7 @@ class RecoverTest(Base):
                             re.sub(r"[^A-Za-z0-9]", "-", os.path.join(self.wtroot, "api", "live1")))
         os.makedirs(tdir)
         wr(os.path.join(tdir, "11111111-2222-4333-8444-555555555555.jsonl"), "{}\n")
-        self.add_herde([("w1:p2", 40, None)])   # live1: bare shell left, its TUI died
+        self.add_herd([("w1:p2", 40, None)])   # live1: bare shell left, its TUI died
         self.prs({"acme/api#210": {"state": "MERGED", "headRefOid": "6cb1f80", "mergeCommit": {"oid": "abcdef0123"}},
                   "acme/ui#86": {"state": "MERGED", "headRefOid": "eb59eb7", "mergeCommit": {"oid": "1234567890"}},
                   "cwd:done1#12": {"state": "OPEN", "headRefOid": "ffff"}})
@@ -662,7 +699,7 @@ class RecoverTest(Base):
         self.assertFalse(os.path.exists(self.env["FAKE_GH_LOG"]))
 
     def test_reconcile_v2_herd(self):
-        self.add_herde([("w1:p2", 40, "working")])
+        self.add_herd([("w1:p2", 40, "working")])
         for s in ("alive", "dead", "nosess", "reported", "ok", "closed", "rr"):
             self.slice(s)
         self.phase("alive", "working", pane="w1:p2", session_id="a")

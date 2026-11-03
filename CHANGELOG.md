@@ -6,11 +6,64 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.0-alpha] - 2026-11-03
+
+The factory pipeline: the four side-by-side orchestration paths become one stage-gated path from
+intent to merge (SKILL.md §11, build contract `docs/factory-v3.md`, source PRD `docs/prd/factory-v3.md`).
+MAJOR because the workflow agents follow changes: §11 no longer dispatches `tasks.md` by bash, and
+§9, §12, §13 and §15 are marked legacy. The compiler (`m2herd cut`), default evals (G3) and the blind
+pass on by default follow in 3.0.0.
+
 ### Added
-- Add the objective loop layer: `m2herd eval draft|approve|status` freezes
+- **G0 triage** — `m2herd triage "<intent>" [--files …] [--track T] [--tier T] [--source chat]`
+  (`scripts/m2herd-gate`): a fixed rule table (risk words, new-system words, file areas, quick words)
+  picks quick / standard / full plus a low / medium / high risk tier, marks the answer UNSURE when
+  no rule fired, and records it. `--track` overrides and is recorded; a high-tier run below the full
+  track needs `--force --note`; a high-tier chat intent waits for the STEER inbox (SEC-4).
+- **Gate events** — `.m2herd/factory/<run>/gates.jsonl`, append-only, written only through
+  `herd_events.append_gate` under a lock: `triaged`, `design_review`, `design_ok` with validated
+  transitions (a quick run has no G1; re-triage only raises; `design_ok` is the human's, needs their
+  words verbatim and a review with no open finding). Invisible to the phase reader.
+- **G1 design review** — `m2herd gate record <run> design_review --evidence <findings> --open <n>`,
+  `m2herd gate approve <run> G1 --word "…"`, `m2herd gate status` (who acts next, per run).
+  ORCHESTRATOR.md gains step 0 "Gates before the herd"; MODELS.md rows for the goldfish and the test
+  writer.
+- **Blind pass (G4, opt-in)** — review loop arg `blind: true` (spec name `HERD_REVIEW_BLIND`) starts a
+  goldfish reviewer beside the main reviewer: task ACs, requirement text, diff and repo only, never
+  the worker's report, reviewer context, earlier findings or PR text. Its findings carry
+  `source: blind`, go through the same two skeptics, and duplicates of a main finding are kept once
+  as `also_blind`. Optional `models.goldfish`. Rules in `templates/herd/rules/GOLDFISH.md`.
+- **EGM in onboarding** — `scripts/onboard.sh` step 5 installs the `egm` plugin
+  (google/elephant-goldfish-model), compares the installed commit with `EGM_PIN`, records how the
+  orchestrator gets fresh subagents (native or a headless `claude -p` worker) and writes an `[egm]`
+  block to `~/.config/herdr-factory/config.toml`.
+- `tests/gates/test_gates.py` in `make test-herd`; credits in README, EGM in `NOTICE`.
+- The objective loop layer (was Unreleased): `m2herd eval draft|approve|status` freezes
   checks into `.m2herd/evals/approved/<slice>/` with a checksum, and
   `m2herd loop run|status|promote` runs isolated scored attempts, records
   per-round artifacts, and promotes only the best patch into a clean checkout.
+
+### Changed
+- **The herd view is "Herd".** Worker TUIs open in the tab `herd` (was `herde`); the German board
+  title is "Herd". `herd-spawn`, `herd-limits` and `herd-loop.sh` still recognise a tab labelled
+  `herde` (a `herd` tab wins when both exist) unless `HERD_SPAWN_TAB` / `HERD_TAB` names another
+  label, so running herds keep their slots across the upgrade.
+- SKILL.md §11 rewritten as "The factory pipeline" (G0–G5); the hand-rolled `tasks.md` bash dispatch
+  is gone in favour of herd-flow-v2 slices, `herd-phase … queued` and `herd-watch`. README stack map:
+  start at §11 + §16; §9, §12, §13, §15 legacy. Skill description gains triage/gate/EGM triggers.
+- The dispatch-nudge hook proposes `m2herd triage` before a herd plan.
+- `scripts/lint.sh` and the docs test accept a semver prerelease (`3.0.0-alpha`).
+- `m2herd help` prints the whole usage header (it stopped at a fixed line 58).
+
+### Fixed
+- `m2herd selftest` failed on any machine with `m2herd-steer` on PATH: the `next` steering line says
+  "triage steering" there, not "drain steering".
+
+### Not in this release (see `docs/factory-v3.md` §10)
+- No `factory` block in `.m2herd/settings.json` yet: the `m2herd-tui` settings editor would drop it
+  on save. It lands with the TUI change and rebuilt `prebuilt/`.
+- Gate approvals are not on `herd-board` yet; `m2herd gate status` shows them. There is no
+  "Needs you" lane (removed in 2.10); gate rows will follow the Ready-to-merge pattern.
 
 ## [2.10.0] - 2026-10-23
 

@@ -76,7 +76,7 @@ def synthetic(dst):
         ("RESUME.md", "".join(f"h{i}\n" for i in range(20)) + "## Stand\nx\n### Vorheriger Stand (a)\ny\n", None),
         ("NOTES.md", "<!-- === M2HERD:LIVE === -->\n- [2026-08-01T00:00:00Z] a\n- [2026-10-01T00:00:00Z] b\n", None),
         ("PHASE-NEXT-2026-09-01.md", "p\n", None), ("PHASE-NEXT-2026-10-20.md", "p\n", None),
-        ("dispatch/herde-0101/herd.map", "m\n", old), ("dispatch/old.out.md", "o\n", old),
+        ("dispatch/herd-0101/herd.map", "m\n", old), ("dispatch/old.out.md", "o\n", old),
         ("dispatch/screens/s.png", "s", None), ("x.sqlite3", "d", None), ("__pycache__/a.pyc", "c", None)]:
         p = os.path.join(dst, rel)
         os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -84,7 +84,7 @@ def synthetic(dst):
             f.write(text)
         if mt:
             os.utime(p, (mt, mt))
-    os.utime(os.path.join(dst, "dispatch/herde-0101"), (old, old))
+    os.utime(os.path.join(dst, "dispatch/herd-0101"), (old, old))
 
 
 def files_under(root):

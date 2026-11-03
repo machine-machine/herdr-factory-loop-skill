@@ -179,3 +179,119 @@ def package(herd, slice_name):
         seen.add(s)
         todo.extend(links.get(s, ()))
     return sorted(seen)
+
+
+# ---- factory gates (docs/factory-v3.md §2) ----------------------------------------------------------
+# Gate events belong to a run (one intent from triage to merge), not to a slice. They live in
+# <run>/gates.jsonl and carry `gate` + `event` instead of `slice` + `phase`, so read() above never
+# mistakes one for a phase event. Only the events 3.0.0-alpha writes are listed; the rest of the
+# schema (evals_frozen, eval_pass, eval_fail, drift_found) lands with the compiler and default evals.
+
+GATES_FILE = "gates.jsonl"
+
+TRACKS = ("quick", "standard", "full")
+TIERS = ("low", "medium", "high")
+
+# event -> the gate it belongs to
+GATE_OF = {"triaged": "G0", "design_review": "G1", "design_ok": "G1"}
+
+# from-event -> allowed next events; None = run has no gate event yet
+GATE_TRANSITIONS = {
+    None: {"triaged"},
+    "triaged": {"triaged", "design_review"},
+    "design_review": {"design_review", "design_ok", "triaged"},
+    "design_ok": {"design_review", "triaged"},
+}
+
+GATE_BY = ("orchestrator", "human", "loop")
+
+RUN_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+
+
+def gates_path(run_dir):
+    return os.path.join(run_dir, GATES_FILE)
+
+
+def read_gates(run_dir):
+    """All gate events of a run in file order; torn or foreign lines are skipped."""
+    out = []
+    try:
+        with open(gates_path(run_dir), encoding="utf-8") as f:
+            for line in f:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(ev, dict) and ev.get("gate") and ev.get("event"):
+                    out.append(ev)
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def gate_state(run_dir):
+    """{last, track, tier, gates: {G0: last event of G0, ...}} — the run's position in the pipeline."""
+    evs = read_gates(run_dir)
+    st = {"last": evs[-1] if evs else None, "track": None, "tier": None, "gates": {}}
+    for ev in evs:
+        st["gates"][ev["gate"]] = ev
+        if ev["event"] == "triaged":
+            st["track"], st["tier"] = ev.get("track"), ev.get("tier")
+    return st
+
+
+def append_gate(run_dir, event, by="orchestrator", note=None, force=False, **fields):
+    """Validate and append one gate event under the run's lock. Rules beyond the transition table:
+    a quick run has no G1; re-triage may raise track and tier, never lower them (force + note
+    overrides); design_ok is written by the human only and carries their words verbatim."""
+    if event not in GATE_OF:
+        raise ValueError(f"unknown gate event {event!r} (one of {', '.join(GATE_OF)})")
+    if by not in GATE_BY:
+        raise ValueError(f"unknown writer {by!r} (one of {', '.join(GATE_BY)})")
+    if force and not note:
+        raise ValueError("--force needs a note saying why")
+    if event == "triaged":
+        if fields.get("track") not in TRACKS:
+            raise ValueError(f"triaged needs track in {TRACKS}")
+        if fields.get("tier") not in TIERS:
+            raise ValueError(f"triaged needs tier in {TIERS}")
+    if event == "design_ok":
+        if by != "human":
+            raise ValueError("design_ok is the human's approval (by=human)")
+        if not str(fields.get("word") or "").strip():
+            raise ValueError("design_ok needs the human's words verbatim (word=...)")
+    os.makedirs(run_dir, exist_ok=True)
+    with open(gates_path(run_dir) + ".lock", "w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        st = gate_state(run_dir)
+        frm = st["last"]["event"] if st["last"] else None
+        if not force:
+            if event not in GATE_TRANSITIONS.get(frm, set()):
+                raise TransitionError(f"{frm or 'nothing'} -> {event} is not allowed "
+                                      f"(allowed: {', '.join(sorted(GATE_TRANSITIONS.get(frm, set()))) or 'none'})")
+            if event == "design_review" and st["track"] == "quick":
+                raise TransitionError("a quick run has no G1 — re-triage with --track standard first")
+            if event == "design_ok":
+                rev = st["gates"].get("G1")
+                if rev is None or rev["event"] != "design_review":
+                    raise TransitionError("design_ok needs a design_review first")
+                if int(rev.get("open") or 0) > 0:
+                    raise TransitionError(f"design_review {rev.get('evidence', '')} still has {rev['open']} open "
+                                          "finding(s) — resolve them and record a new design_review")
+            if event == "triaged" and st["track"]:
+                if (TRACKS.index(fields["track"]) < TRACKS.index(st["track"])
+                        or TIERS.index(fields["tier"]) < TIERS.index(st["tier"] or "low")):
+                    raise TransitionError(f"re-triage may raise, never lower: was {st['track']}/{st['tier']}")
+        ev = {"ts": now(), "gate": GATE_OF[event], "event": event, "by": by}
+        for k, v in fields.items():
+            if v is not None:
+                ev[k] = v
+        if note:
+            ev["note"] = note
+        if force:
+            ev["forced_from"] = frm
+        with open(gates_path(run_dir), "a", encoding="utf-8") as f:
+            f.write(json.dumps(ev, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        return ev

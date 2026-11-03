@@ -403,7 +403,8 @@ prompt_agent() {
 # then split down under its last pane; the orchestrator's tab keeps only the
 # orchestrator and its board. Outside herdr: a workspace of its own, which is where
 # the pre-0.9 `agent start --cwd` put it.
-HERD_TAB="${HERD_TAB:-herde}"
+HERD_TAB_LEGACY=""; [ -n "${HERD_TAB:-}" ] || HERD_TAB_LEGACY=herde   # `herde` is the pre-3.0 label
+HERD_TAB="${HERD_TAB:-herd}"
 worker_pane() {
   local cwd="$1" label="$2" self ws tab last
   self="$(cat "$(SELF_FILE)" 2>/dev/null || true)"
@@ -412,8 +413,8 @@ worker_pane() {
     return
   fi
   ws="${self%%:*}"
-  tab="$(herdr tab list 2>/dev/null | jq -r --arg ws "$ws" --arg l "$HERD_TAB" \
-    '[.result.tabs[] | select(.workspace_id==$ws and .label==$l)] | first | .tab_id // empty' || true)"
+  tab="$(herdr tab list 2>/dev/null | jq -r --arg ws "$ws" --arg l "$HERD_TAB" --arg o "$HERD_TAB_LEGACY" \
+    '[.result.tabs[] | select(.workspace_id==$ws and (.label==$l or ($o != "" and .label==$o)))] | sort_by(.label != $l) | first | .tab_id // empty' || true)"
   last=""
   [ -z "$tab" ] || last="$(herdr pane list 2>/dev/null | jq -r --arg t "$tab" \
     '[.result.panes[] | select(.tab_id==$t)] | last | .pane_id // empty' || true)"
@@ -455,7 +456,7 @@ spawn_slice() {
   if herdr_v09; then
     # 0.9: `worktree create` also opens a workspace (tab + root pane) for the new
     # worktree, and one for the repo when none has it open. Inside herdr the worker
-    # goes to the herde tab and both are closed (the worktree stays on disk); outside,
+    # goes to the herd tab and both are closed (the worktree stays on disk); outside,
     # the worktree's own workspace IS the worker's place.
     local wt_json ws_before wt_ws src_ws
     ws_before="$(herdr workspace list 2>/dev/null | jq -r '[.result.workspaces[]?.workspace_id] | join(" ")' || true)"
