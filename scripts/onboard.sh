@@ -294,7 +294,7 @@ step "5/7  EGM — goldfish reviews for gate G1 ($EGM_REPO)"
 say "  G1 reviews spec.md + plan.md in fresh, zero-context subagents (EGM review/resolve)."
 EGM_SHA=""; EGM_OK=false; EGM_SUBAGENTS="unknown"
 egm_installed_sha() {
-  jq -r '[.plugins["egm@egm"][]?.gitCommitSha] | first // empty' "$HOME/.claude/plugins/installed_plugins.json" 2>/dev/null || true
+  jq -r '[.plugins["egm@egm"][]?.gitCommitSha] | first // empty' "${CLAUDE_CONFIG_DIR:-$HOME/.claude}/plugins/installed_plugins.json" 2>/dev/null || true
 }
 if ! command -v claude >/dev/null 2>&1; then
   warn "claude CLI not found — EGM needs Claude Code (it is also the G1 route for a Hermes/Cursor/pi orchestrator)"

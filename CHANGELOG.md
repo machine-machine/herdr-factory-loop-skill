@@ -89,6 +89,8 @@ pass on by default follow in 3.0.0.
 - Found by the release review, low: a blind finding on the same spot as a main-reviewer finding
   now keeps the higher severity; `gate record --open` must be ≥ 0; a refused event on an unknown
   run leaves no empty run dir; file areas keep dotfiles (`.github` is not `github`).
+- onboard read the EGM install from `~/.claude` even when `CLAUDE_CONFIG_DIR` points elsewhere.
+- `m2herd-up selftest` judged the spawned pid before `nohup` had exec'd the command (CI flake).
 - `m2herd selftest` failed on any machine with `m2herd-steer` on PATH: the `next` steering line says
   "triage steering" there, not "drain steering".
 
