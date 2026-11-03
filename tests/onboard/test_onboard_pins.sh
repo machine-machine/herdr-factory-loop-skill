@@ -10,7 +10,7 @@ mkdir -p "$T/bin" "$T/uvtools" "$T/home"
 printf '#!/bin/sh\necho specify\n' > "$T/bin/specify"
 printf '#!/bin/sh\n[ "$1 $2" = "tool dir" ] && echo %s/uvtools\n' "$T" > "$T/bin/uv"
 chmod +x "$T/bin/specify" "$T/bin/uv"
-run() { HOME="$T/home" PATH="$T/bin:$PATH" M2HERD_AUTO_UPDATE=0 bash "$REPO/scripts/onboard.sh" --yes --orchestrator cursor > "$T/out" 2>&1; }
+run() { HOME="$T/home" XDG_CONFIG_HOME="$T/home/.config" PATH="$T/bin:$PATH" M2HERD_AUTO_UPDATE=0 bash "$REPO/scripts/onboard.sh" --yes --orchestrator cursor > "$T/out" 2>&1; }
 cfg="$T/home/.config/herdr-factory/config.toml"
 
 run; rc=$?
