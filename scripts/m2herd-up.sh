@@ -2626,7 +2626,11 @@ selftest() {
   PATH="$old_path"
 
   spawn_detached "$td" "$td/out" "$td/err" "$td/pid" sleep 30
-  pid="$(cat "$td/pid")"; comm="$(ps -o comm= -p "$pid" | tr -d ' ')"
+  pid="$(cat "$td/pid")"
+  # nohup execs the command a moment after the fork: give it up to 2 s before judging the name
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    comm="$(ps -o comm= -p "$pid" | tr -d ' ')"; [ "$comm" = nohup ] || break; sleep 0.2
+  done
   [ "$comm" = sleep ] || { echo "selftest FAIL: recorded pid $pid belongs to '$comm', not sleep" >&2; exit 1; }
   kill "$pid" 2>/dev/null || true
   echo 'm2herd-up selftest: PASS'
