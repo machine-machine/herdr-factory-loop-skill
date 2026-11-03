@@ -13,6 +13,8 @@
 set -u
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
+# the session hook starts `m2herd self-update --auto` when m2herd is on PATH — never from a smoke run
+export M2HERD_AUTO_UPDATE=0
 PASS=0
 FAIL=0
 SKIP=0

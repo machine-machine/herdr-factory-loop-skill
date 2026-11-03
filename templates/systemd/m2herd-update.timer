@@ -1,0 +1,12 @@
+# m2herd-update.timer — runs m2herd-update.service once a day (randomised within 2 h, so a fleet does not
+# fetch all at once); Persistent=true catches up a run missed while the machine was off.
+[Unit]
+Description=Daily m2herd auto-update
+
+[Timer]
+OnCalendar=daily
+RandomizedDelaySec=2h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

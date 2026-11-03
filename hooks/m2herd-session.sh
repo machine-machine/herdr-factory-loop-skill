@@ -23,6 +23,13 @@ while IFS= read -r -t 5 _line 2>/dev/null; do _stdin="${_stdin}${_line}"; done |
 # partial in $_line — append it so a newline-less payload isn't dropped.
 if [ -n "${_line:-}" ]; then _stdin="${_stdin}${_line}"; fi
 
+# Auto-update (every session, any cwd): `m2herd self-update --auto` moves the engine to the
+# newest release at most once a day and never fails. Detached with every fd closed, so the
+# hook returns at once; M2HERD_AUTO_UPDATE=0 opts out (scripts/m2herd.sh self_update_auto).
+if [ "${M2HERD_AUTO_UPDATE:-1}" != 0 ] && command -v m2herd >/dev/null 2>&1; then
+  ( m2herd self-update --auto </dev/null >/dev/null 2>&1 & ) 2>/dev/null || true
+fi
+
 # jq is required for safe JSON encoding; without it, stay silent.
 command -v jq >/dev/null 2>&1 || exit 0
 
