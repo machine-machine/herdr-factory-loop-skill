@@ -160,6 +160,12 @@ if [ -n "$NEXT" ]; then
   MSG="${MSG}
 ${NEXT}"
 fi
+# an auto-update brought a release whose hooks/installer changed: tell the orchestrator (the
+# m2herd-tui banner cannot show it); install.sh removes the marker
+if [ -s "$HOME/.cache/m2herd/relink-needed" ]; then
+  MSG="${MSG}
+m2herd update: $(head -1 "$HOME/.cache/m2herd/relink-needed" 2>/dev/null) (tell the user; it edits agent settings)"
+fi
 # Budget-aware nudge: above 60% the digest itself must stay lean and the
 # orchestrator should lean on the fabric, not the transcript.
 if [ -n "$CTX_PCT" ] && [ "$CTX_PCT" -ge 60 ]; then

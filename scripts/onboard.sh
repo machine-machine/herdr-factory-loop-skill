@@ -248,14 +248,29 @@ esac
 # ---------- step 4: spec-kit CLI ------------------------------------------------
 
 step "4/7  spec-kit (github/spec-kit)"
-SPECIFY_BIN=""
+SPECIFY_BIN=""; SPECIFY_SHA=""
+# commit of a `uv tool install … --from git+…@<sha>` install (PEP 610 direct_url.json); empty when unknown
+specify_installed_sha() {
+  local d f
+  d=$(uv tool dir 2>/dev/null) || return 0
+  for f in "$d"/specify-cli/lib/python*/site-packages/specify_cli-*.dist-info/direct_url.json; do
+    [ -f "$f" ] && jq -r '.vcs_info.commit_id // empty' "$f" 2>/dev/null && return 0
+  done
+}
 if command -v specify >/dev/null 2>&1; then
   SPECIFY_BIN=$(command -v specify)
   ok "specify CLI already installed: $SPECIFY_BIN"
+  SPECIFY_SHA=$(specify_installed_sha)
+  if [ "$SPECIFY_SHA" = "$SPEC_KIT_REF" ]; then
+    ok "spec-kit at the pinned commit ${SPEC_KIT_REF:0:12}"
+  else
+    # never replaced silently: a newer spec-kit may be in use on purpose
+    warn "spec-kit is at ${SPECIFY_SHA:-an unknown commit}, pin is ${SPEC_KIT_REF:0:12} — to pin: uv tool install --force specify-cli --from $SPEC_KIT_GIT"
+  fi
 elif command -v uv >/dev/null 2>&1; then
   if confirm "Install the specify CLI via 'uv tool install'?"; then
     uv tool install specify-cli --from "$SPEC_KIT_GIT"
-    SPECIFY_BIN=$(command -v specify || true)
+    SPECIFY_BIN=$(command -v specify || true); SPECIFY_SHA=$(specify_installed_sha)
     # uv installs into ~/.local/bin, which may not be on PATH yet
     [ -z "$SPECIFY_BIN" ] && [ -x "$HOME/.local/bin/specify" ] && SPECIFY_BIN="$HOME/.local/bin/specify"
     [ -n "$SPECIFY_BIN" ] && ok "installed specify CLI: $SPECIFY_BIN" || warn "install ran but 'specify' is not on PATH — check 'uv tool list'"
@@ -396,6 +411,7 @@ primary = "$ORCHESTRATOR"
 
 [speckit]
 ref = "$SPEC_KIT_REF"
+installed = "${SPECIFY_SHA:-}"
 cli = "${SPECIFY_BIN:-uvx --from $SPEC_KIT_GIT specify}"
 last_repo = "${TARGET_REPO:-}"
 initialized = $SPECKIT_INITIALIZED

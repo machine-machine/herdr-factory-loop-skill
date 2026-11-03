@@ -1083,7 +1083,8 @@ and stays a branch; any other branch, uncommitted changes or commits the tag lac
 logged. Only tags on origin count. One line per run in
 `~/.cache/m2herd/update.log`; `M2HERD_AUTO_UPDATE=0` opts out; machines without sessions can
 enable `templates/systemd/m2herd-update.timer`. When a release changes `install.sh` or `hooks/`,
-the log line says to re-run `scripts/install.sh --local`.
+`~/.cache/m2herd/relink-needed` names it: the dashboard and the SessionStart digest show it until
+`scripts/install.sh --local` runs again (it edits agent settings, so tell the user first).
 
 #### 16.6 Settings — `.m2herd/settings.json`
 

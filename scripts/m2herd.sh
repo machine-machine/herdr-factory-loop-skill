@@ -924,20 +924,23 @@ engine_repo() { cd "$(dirname "$(self_path)")/.." 2>/dev/null && pwd; }
 UPDATE_CHANNEL="${M2HERD_UPDATE_CHANNEL:-release}"
 UPDATE_LOG="$HOME/.cache/m2herd/update.log"
 UPDATE_STAMP="$HOME/.cache/m2herd/update-auto.stamp"
+# written by an update whose release changed install.sh or hooks/; removed by install.sh, shown by the
+# dashboard and the SessionStart digest until then (a status write never touches it)
+UPDATE_RELINK="$HOME/.cache/m2herd/relink-needed"
 
 # newest release tag ON ORIGIN by semver (a local or deleted tag never counts) — a prerelease
 # sorts below its release ("-" → "~" for sort -V)
-latest_release_tag() { # latest_release_tag <repo> <channel>
-  GIT_TERMINAL_PROMPT=0 git -C "$1" ls-remote --tags --refs origin 'v*' 2>/dev/null | sed 's|.*refs/tags/||' \
+latest_release_tag() { # latest_release_tag <channel>  (stdin: `git ls-remote --tags --refs` lines)
+  sed 's|.*refs/tags/||' \
     | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$' \
-    | { if [ "$2" = stable ]; then grep -v -- '-'; else cat; fi; } \
+    | { if [ "$1" = stable ]; then grep -v -- '-'; else cat; fi; } \
     | sed 's/-/~/' | sort -V | tail -1 | sed 's/~/-/' || true
 }
 
-# fetch and compare: sets UPD_STATE (behind|up-to-date|diverged|none|unknown), UPD_N, UPD_TARGET
+# fetch and compare: sets UPD_STATE (behind|up-to-date|diverged|branch|none|unknown), UPD_N, UPD_TARGET
 update_resolve() { # update_resolve <repo>
   local repo="$1"
-  UPD_STATE=unknown; UPD_N=0; UPD_TARGET=""
+  UPD_STATE=unknown; UPD_N=0; UPD_TARGET=""; UPD_BRANCH=""
   case "$UPDATE_CHANNEL" in
     release|stable|main) ;;
     *) echo "self-update: M2HERD_UPDATE_CHANNEL must be release|stable|main (got: $UPDATE_CHANNEL)" >&2; return 2 ;;
@@ -951,14 +954,20 @@ update_resolve() { # update_resolve <repo>
     if [ "$(git -C "$repo" rev-parse --is-shallow-repository 2>/dev/null)" = true ]; then
       GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet --unshallow --tags origin 2>/dev/null || return 0
     fi
-    UPD_TARGET="$(latest_release_tag "$repo" "$UPDATE_CHANNEL")"
+    local remote_tags
+    remote_tags="$(GIT_TERMINAL_PROMPT=0 git -C "$repo" ls-remote --tags --refs origin 'v*' 2>/dev/null)" || return 0
+    UPD_TARGET="$(printf '%s\n' "$remote_tags" | latest_release_tag "$UPDATE_CHANNEL")"
     if [ -z "$UPD_TARGET" ]; then UPD_STATE=none; return 0; fi
+    # a tag pushed between the fetch and ls-remote: fetch it by name, or the engine reads as diverged
+    git -C "$repo" rev-parse --quiet --verify "refs/tags/$UPD_TARGET" >/dev/null 2>&1 \
+      || GIT_TERMINAL_PROMPT=0 git -C "$repo" fetch --quiet --force origin "refs/tags/$UPD_TARGET:refs/tags/$UPD_TARGET" 2>/dev/null \
+      || { UPD_STATE=unknown; return 0; }
   fi
   local br; br="$(git -C "$repo" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
   if git -C "$repo" merge-base --is-ancestor "$UPD_TARGET" HEAD 2>/dev/null; then
     UPD_STATE=up-to-date
   elif [ -n "$br" ] && [ "$br" != main ]; then
-    UPD_STATE=diverged   # on a working branch: someone develops here, the update never moves it
+    UPD_STATE=branch; UPD_BRANCH="$br"   # a working branch: someone develops here, the update never moves it
   elif git -C "$repo" merge-base --is-ancestor HEAD "$UPD_TARGET" 2>/dev/null; then
     UPD_STATE=behind; UPD_N="$(git -C "$repo" rev-list --count "HEAD..$UPD_TARGET" 2>/dev/null || echo 0)"
   else
@@ -980,9 +989,11 @@ update_apply() { # update_apply <repo>
 }
 
 # a release that changes install.sh or hooks/ may add links or hook entries the running install lacks
-update_relink_hint() { # update_relink_hint <repo> <old-sha>
-  git -C "$1" diff --quiet "$2" HEAD -- scripts/install.sh hooks/ 2>/dev/null \
-    || echo "install.sh or hooks/ changed in this release — run: $1/scripts/install.sh --local"
+update_relink_hint() { # update_relink_hint <repo> <old-sha>  — prints the hint and leaves the marker
+  git -C "$1" diff --quiet "$2" HEAD -- scripts/install.sh hooks/ 2>/dev/null && return 0
+  local hint="release $UPD_TARGET changed install.sh or hooks/ — run: $1/scripts/install.sh --local"
+  printf '%s\n' "$hint" > "$UPDATE_RELINK" 2>/dev/null || true
+  echo "$hint"
 }
 
 self_update_cmd() {
@@ -998,6 +1009,7 @@ self_update_cmd() {
       behind)     echo "update available: $UPD_N commit(s) behind $UPD_TARGET — run: m2herd self-update" ;;
       up-to-date) echo "m2herd up-to-date ($UPDATE_CHANNEL: $UPD_TARGET)" ;;
       diverged)   echo "m2herd engine has commits $UPD_TARGET lacks (local work or a branch) — not updated automatically" ;;
+      branch)     echo "m2herd engine is on working branch $UPD_BRANCH — never moved; check out main or $UPD_TARGET to follow releases" ;;
       none)       echo "no release tag on origin yet (channel $UPDATE_CHANNEL)" ;;
       *)          echo "self-update: fetch failed (offline?) — status unknown" ;;
     esac
@@ -1011,6 +1023,7 @@ self_update_cmd() {
     none)       log "self-update: no release tag on origin yet (channel $UPDATE_CHANNEL)"; return 0 ;;
     unknown)    echo "self-update: fetch failed (offline?)" >&2; exit 1 ;;
     diverged)   echo "self-update: REFUSING — $repo has commits $UPD_TARGET lacks; check out $UPD_TARGET yourself if you mean to drop them" >&2; exit 2 ;;
+    branch)     echo "self-update: REFUSING — $repo is on working branch $UPD_BRANCH; check out main (or $UPD_TARGET) to follow releases" >&2; exit 2 ;;
   esac
   old="$(git -C "$repo" rev-parse HEAD)"
   update_apply "$repo"
@@ -1041,10 +1054,8 @@ self_update_auto() { # self_update_auto <repo>
     else
       old="$(git -C "$repo" rev-parse --short HEAD)"
       if update_apply "$repo" >/dev/null 2>&1; then
-        UPD_STATE=up-to-date; UPD_N=0
+        UPD_STATE=up-to-date; UPD_N=0; update_status_write
         hint="$(update_relink_hint "$repo" "$old")"
-        [ -z "$hint" ] || UPD_STATE=relink   # the dashboard shows it until install.sh runs again
-        update_status_write
         msg="updated $old -> $UPD_TARGET${hint:+; $hint}"
       else
         msg="update to $UPD_TARGET failed"
@@ -1059,9 +1070,8 @@ update_row() {
   local Y="$1" R="$2" word n when target age now ep
   [ -f "$UPDATE_CACHE" ] || return 0
   read -r word n when target < "$UPDATE_CACHE" 2>/dev/null || return 0
-  if [ "$word" = relink ]; then   # set by --auto; cleared by the next check after install.sh ran
-    printf 'update:    %sat %s — hooks/installer changed: run %s/scripts/install.sh --local%s\n' \
-      "$Y" "${target:-}" "$(engine_repo)" "$R"; return 0
+  if [ -s "$UPDATE_RELINK" ]; then   # until install.sh runs again (it removes the marker)
+    printf 'update:    %s%s%s\n' "$Y" "$(head -1 "$UPDATE_RELINK")" "$R"; return 0
   fi
   [ "$word" = "behind" ] || return 0
   now="$(date -u +%s)"

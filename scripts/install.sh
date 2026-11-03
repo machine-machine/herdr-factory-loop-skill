@@ -707,5 +707,7 @@ fi
 if [ "$uninstall" -eq 1 ]; then
   echo "Uninstall complete."
 else
+  # a release that changed install.sh or hooks/ asked for exactly this run (m2herd self-update)
+  rm -f "$HOME/.cache/m2herd/relink-needed"
   echo "Install complete. Restart your agent session to load the skill."
 fi

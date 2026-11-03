@@ -37,16 +37,18 @@ pass on by default follow in 3.0.0.
 - **EGM in onboarding** — `scripts/onboard.sh` step 5 installs the `egm` plugin
   (google/elephant-goldfish-model), compares the installed commit with `EGM_PIN`, records how the
   orchestrator gets fresh subagents (native or a headless `claude -p` worker) and writes an `[egm]`
-  block to `~/.config/herdr-factory/config.toml`. spec-kit is pinned the same way (`SPEC_KIT_REF`,
-  recorded as `[speckit] ref`).
+  block to `~/.config/herdr-factory/config.toml`. spec-kit is pinned the same way (`SPEC_KIT_REF`): a fresh install
+  uses it; an existing `specify` is compared with it and a mismatch is warned about, never replaced
+  silently; config.toml records both `ref` and `installed`.
 - **Auto-update to the newest release** — `m2herd self-update` now moves the engine repo to the
   newest release tag (`M2HERD_UPDATE_CHANNEL=release`, prereleases included; `stable`; `main` keeps
   the old ff-only pull of main). Forward only: an engine at or ahead of the tag stays, one with
   uncommitted changes or commits the tag lacks is refused. A detached engine moves to the tag, a
   checkout of `main` is fast-forwarded to it (stays a branch), any other branch is never moved.
   Only tags on origin count; the installer's shallow clone is unshallowed once so it is not
-  mistaken for diverged. A release that changes `install.sh` or `hooks/` leaves a `relink` state
-  the dashboard shows until `install.sh --local` runs. `--auto` is the routine: quiet, once per
+  mistaken for diverged; a working branch is reported as such and never moved. A release that
+  changes `install.sh` or `hooks/` leaves `~/.cache/m2herd/relink-needed`: the dashboard and the
+  SessionStart digest show it until `install.sh` runs again, which removes it. `--auto` is the routine: quiet, once per
   `M2HERD_UPDATE_INTERVAL_HOURS` (24), one runner at a time, never fails, logs to
   `~/.cache/m2herd/update.log`; `m2herd-session.sh` starts it detached on every session
   (`M2HERD_AUTO_UPDATE=0` opts out); `templates/systemd/m2herd-update.{service,timer}` for machines

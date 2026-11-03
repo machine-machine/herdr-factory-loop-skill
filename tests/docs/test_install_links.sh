@@ -30,7 +30,9 @@ ln -s "$tmp/own/herd-limits" "$HOME/.local/bin/herd-limits-own"
 # a hand-placed real file where a link goes is moved aside, never deleted
 printf '#!/bin/sh\necho local\n' > "$HOME/.local/bin/herd-clash"
 
+mkdir -p "$HOME/.cache/m2herd" && echo "release vX changed hooks/" > "$HOME/.cache/m2herd/relink-needed"
 out1="$(bash "$REPO/scripts/install.sh" --claude 2>&1)" || { echo "$out1"; echo "FAIL install exit"; exit 1; }
+check "install removes the relink marker of an auto-update" '[ ! -e "$HOME/.cache/m2herd/relink-needed" ]'
 for b in $bins; do
   s="${src[$b]:-$b}"
   check "linked $b" '[ -L "$HOME/.local/bin/$b" ] && [ "$(readlink "$HOME/.local/bin/$b")" = "$REPO/scripts/$s" ]'

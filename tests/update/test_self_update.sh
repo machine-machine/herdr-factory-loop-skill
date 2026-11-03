@@ -82,7 +82,8 @@ engine v1.0.0
 git -C "$T/eng" checkout -q -b my-feature v1.0.0
 M2HERD_UPDATE_INTERVAL_HOURS=0 m2 self-update --auto
 check "working branch: auto never moves it" 'head_is v1.0.0 && [ "$(git -C "$T/eng" symbolic-ref --short HEAD)" = my-feature ]'
-check "working branch: logged as diverged" 'tail -1 "$HOME/.cache/m2herd/update.log" | grep -q "^[0-9T:-]*Z diverged"'
+check "working branch: logged as a branch, not diverged" 'tail -1 "$HOME/.cache/m2herd/update.log" | grep -q "^[0-9T:-]*Z branch"'
+check "working branch: --check names the branch" 'm2 self-update --check | grep -q "working branch my-feature"'
 rm -f "$HOME/.cache/m2herd/update-auto.stamp"
 
 # main channel keeps the pre-3.0 behaviour: ff-only pull of main
@@ -114,9 +115,26 @@ check "auto offline: exit 0, logged unknown" '[ "$rc" -eq 0 ] && tail -1 "$HOME/
 (cd "$T/seed" && mkdir -p hooks && echo x > hooks/new-hook.sh && git add -A && git commit -qm hook && git tag v2.0.0 && git push -q origin main --tags)
 engine v2.0.0-alpha
 M2HERD_UPDATE_INTERVAL_HOURS=0 m2 self-update --auto
-check "auto to a release that changed hooks: relink state" 'head_is v2.0.0 && cache | grep -q "^relink 0 .* v2.0.0$"'
+check "auto to a release that changed hooks: relink marker" 'head_is v2.0.0 && grep -q "release v2.0.0 changed install.sh or hooks/" "$HOME/.cache/m2herd/relink-needed"'
+m2 self-update --check >/dev/null
+check "a later status check keeps the marker" '[ -s "$HOME/.cache/m2herd/relink-needed" ]'
 row="$(cd "$T" && rm -rf d0 && git init -q d0 && cd d0 && bash "$REPO/scripts/m2herd.sh" init --goal t >/dev/null && NO_COLOR=1 bash "$REPO/scripts/m2herd.sh" dashboard 2>/dev/null | grep '^update:')"
 check "dashboard shows the relink row" 'printf "%s" "$row" | grep -q "install.sh --local"'
+ctx="$(echo '{}' | M2HERD_AUTO_UPDATE=0 M2HERD_DIR="$T/d0" bash "$REPO/hooks/m2herd-session.sh" 2>/dev/null | jq -r .hookSpecificOutput.additionalContext)"
+check "session digest carries the relink hint" 'printf "%s" "$ctx" | grep -q "m2herd update: release v2.0.0 changed"'
+rm -f "$HOME/.cache/m2herd/relink-needed"
+
+# a tag pushed between the fetch and ls-remote is fetched by name, not reported as diverged
+engine v2.0.0
+mkdir -p "$T/shim"; REALGIT="$(command -v git)"
+cat > "$T/shim/git" <<SHIM
+#!/bin/sh
+case " \$* " in *" ls-remote "*) [ -e "$T/raced" ] || { touch "$T/raced"; (cd "$T/seed" && echo late > v.txt && "$REALGIT" commit -qam late && "$REALGIT" tag v2.1.0 && "$REALGIT" push -q origin main --tags); } ;; esac
+exec "$REALGIT" "\$@"
+SHIM
+chmod +x "$T/shim/git"
+out="$(PATH="$T/shim:$PATH" m2 self-update --check)"
+check "tag pushed mid-check: behind, not diverged" 'printf "%s" "$out" | grep -q "behind v2.1.0" && git -C "$T/eng" rev-parse -q --verify refs/tags/v2.1.0 >/dev/null'
 
 # the dashboard row reads the four-field cache
 printf 'behind 2 %s v9.9.9\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$HOME/.cache/m2herd/update-status"
