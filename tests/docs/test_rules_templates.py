@@ -55,7 +55,7 @@ def _section(text, heading, level="## "):
     return body.split(f"\n{level}", 1)[0]
 
 
-PATH_TOKEN = re.compile(r"`([^`\s]*/[^`\s]*)`")
+PATH_TOKEN = re.compile(r"`([^`\s]*/[^`\s]*)`|(https?://\S+)")
 
 
 def check_full_track():
@@ -64,6 +64,15 @@ def check_full_track():
     templates carry the sections and columns the full track relies on."""
     lenses = _read("templates", "herd", "rules", "G1-LENSES.md")
     check("G1-LENSES has no {{placeholders}}", "{{" not in lenses)
+    # the common part (title to the first lens heading) goes into every prompt: it carries the
+    # output shape and names no path or URL of its own
+    common = lenses.split("\n## Domain\n", 1)[0]
+    check("G1-LENSES common part carries the output shape", "## Output (every lens)" in common
+          and "lens: <name>" in common and "`REVIEWER.md`" in common and "## Findings" in common)
+    stray = sorted({a or b for a, b in PATH_TOKEN.findall(common)})
+    check("G1-LENSES common part names no path or URL", not stray, ", ".join(stray))
+    check("G1-LENSES orchestrator notes stay out of the prompt", "## For the orchestrator" in lenses
+          and lenses.index("## For the orchestrator") > lenses.index("## Comprehension"))
     for name in LENSES:
         sec = _section(lenses, name)
         check(f"G1-LENSES section {name}", bool(sec))
@@ -73,15 +82,14 @@ def check_full_track():
         listed = set()
         for label in ("**Reads**", "**Never reads**"):
             block = sec.split(label, 1)[1].split("\n**", 1)[0] if label in sec else ""
-            listed |= set(PATH_TOKEN.findall(block))
-        stray = sorted(set(PATH_TOKEN.findall(sec)) - listed)
+            listed |= {a or b for a, b in PATH_TOKEN.findall(block)}
+        stray = sorted({a or b for a, b in PATH_TOKEN.findall(sec)} - listed)
         check(f"G1-LENSES {name} names only its reading list", not stray, ", ".join(stray))
     reads_shell = _section(lenses, "Domain") + _section(lenses, "Architecture")
     check("G1-LENSES domain + architecture run with a shell", reads_shell.count("General subagent with a shell") == 2)
     check("G1-LENSES architecture never reads the working tree", "working tree" in _section(lenses, "Architecture")
           and "git -C <repo> show <sha>:<path>" in _section(lenses, "Architecture"))
     check("G1-LENSES domain reads the copied sources", "`specs/<feature>/sources/`" in _section(lenses, "Domain"))
-    check("G1-LENSES finding format is REVIEWER.md + lens name", "`REVIEWER.md`" in lenses and "lens: <name>" in lenses)
 
     # one home for the lens list: the factory-v3 §4 table; the other mentions point there
     v3 = _section(_read("docs", "factory-v3.md"), "4. G1")

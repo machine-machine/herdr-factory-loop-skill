@@ -115,14 +115,15 @@ Why these four: a replay of six lenses on three past slices with known findings 
 catches only by architecture (needing the repo) and domain (which, working from memory, once
 recommended the known error itself — hence the copied source texts); product and zoom-out merged
 into scope; QA left G1 and returns with executable evals at G3. Each lens is a fresh subagent on
-another model family than the spec author's; its prompt is its section of `G1-LENSES.md` plus the
-run's values, and it names only the paths of its reading list (`tests/docs/test_rules_templates.py`
-checks that; the first real run's transcripts are read once by hand for reads outside the list).
+another model family than the spec author's; its prompt is the common part of `G1-LENSES.md` (role,
+principles, output shape), its own section and the run's values, and that prompt names only the
+paths of its reading list (`tests/docs/test_rules_templates.py` checks that; the first real run's
+transcripts are read once by hand for reads outside the list).
 
 ### 4.2 A full-track round
 
-1. **Base sha** per repo, pinned at round start, recorded in g1-<n>.md and copied into every
-   `<slice>.repos` at the cut.
+1. **Base sha** per repo, pinned at round start after a fetch, recorded in g1-<n>.md and copied
+   into every `<slice>.repos` at the cut.
 2. **Sources** copied to `specs/<feature>/sources/`; a source the orchestrator cannot obtain makes the
    rule provisional — an orchestrator item, never a team ticket.
 3. **One subagent per lens**, then one **synthesizer** step into `reviews/g1-<n>.md`: a header with

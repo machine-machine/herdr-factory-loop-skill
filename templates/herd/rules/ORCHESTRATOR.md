@@ -50,16 +50,18 @@ packages, clashes, phases and a register excerpt), at herd start and after every
   `m2herd gate record <run> design_review --evidence <file> --open <n>`.
 - G1 on the full track runs the lenses listed in `docs/factory-v3.md` §4 (rule text per lens in
   `G1-LENSES.md`, next to this file). Per round `<n>`:
-  1. **Pin the base.** For every repo the plan names, record the commit of its default branch at
-     round start (`git -C <repo> rev-parse origin/<default>`). It goes into g1-<n>.md and, at the cut,
-     into every `<slice>.repos` — the lenses, the cut check and the workers see one tree.
+  1. **Pin the base.** For every repo the plan names, fetch, then record the commit of its default
+     branch at round start (`git -C <repo> fetch origin` and `git -C <repo> rev-parse
+     origin/<default>`). It goes into g1-<n>.md and, at the cut, into every `<slice>.repos` — the
+     lenses, the cut check and the workers see one tree.
   2. **Copy the sources.** Every source the spec's rules table cites goes to
      `specs/<feature>/sources/` (from the project's source folders or a fetched URL), named so the
      row's locator finds it. A source you cannot obtain: mark that rule provisional in the spec and
      keep the item on your own list — it is an orchestrator item, never a team ticket; the domain
      lens names the claim it could not check.
   3. **Spawn one fresh subagent per lens**, another model family than the spec author's
-     (`MODELS.md`, goldfish row). The prompt is the lens's section of `G1-LENSES.md` followed by the
+     (`MODELS.md`, goldfish row). The prompt is the common part of `G1-LENSES.md` (everything above
+     its first lens heading: role, principles, output shape), then that lens's section, then the
      run's values: the feature directory, the register path, repo path and base sha per repo, the
      list of copied sources — nothing else, no chat, no earlier round. Domain and architecture need
      a shell (general subagent); scope and comprehension may run as EGM reviewer types. Keep the

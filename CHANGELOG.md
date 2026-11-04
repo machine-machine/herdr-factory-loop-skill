@@ -17,7 +17,7 @@ and its G1 runs four zero-context lenses with pinned base shas and copied source
   `<dir>/.m2herd/rules/domain-words.txt` — case-insensitive whole words, `word*` for any ending,
   ü/ö/ä/ß matching ue/oe/ae/ss, paths never matched — and picks **full** when the intent contains
   one; the reason names the word. The skill ships no list. Full is the normal track for domain
-  work; touching several repositories no longer sends work to full on its own.
+  work.
 - **G1 lens rules** — `templates/herd/rules/G1-LENSES.md`: domain, architecture, scope (product +
   zoom-out) and comprehension, each with its question, reading list, never-read list, checks and
   agent type; findings in the `REVIEWER.md` format plus the lens name. Domain reads the cited
