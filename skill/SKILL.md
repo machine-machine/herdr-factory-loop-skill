@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 3.0.0-alpha
+version: 3.0.0-alpha.2
 description: 'Orchestrate parallel AI coding agents with herdr, the terminal workspace manager (workspaces/tabs/panes) on this machine: spawn agents (claude/codex/cursor/etc.), dispatch work, watch lifecycle (idle/working/blocked), unblock approvals, fan out and converge herds; manage agent integrations. Triggers: herdr, "the fleet", orchestrate agents, spawn an agent, "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or driving agents in herdr panes. Also triggers: chat-channel intents (Mattermost/Discord/Slack) needing parallel workers, report back on the same channel; the factory pipeline (triage, quick/standard/full track, gates G0–G5, EGM goldfish/blind review, spec-kit, /speckit.*, onboard the factory); meta-orchestration (meta-orchestrator, fleet-loop/fleet-control, multi-mission /goal portfolios); m2herd — the Claude main-orchestrator context fabric (.m2herd dir; the folder holds the context, the orchestrator holds pointers; refile/notes/areas, fleet-memory gists, RESUME.md).'
 ---
 
@@ -409,15 +409,17 @@ m2herd gate status                                        # every run: where it 
 ```
 
 Rules, not judgement: risk words (auth, payment, migration, infrastructure, client data, …) → **full**
-and tier **high**; new-system words → **full**; two or more file areas → **standard**; a quick word
-(typo, config, rename, failing test, …) in one area → **quick**; nothing fired → standard, marked
-UNSURE — then the **human** picks, not you. Table: `docs/factory-v3.md` §3.
+and tier **high**; new-system words → **full**; a **domain word** from the project's list
+(`<dir>/.m2herd/rules/domain-words.txt`; the skill ships none) → **full** — full is the normal track
+for domain work, not a rare one; two or more file areas → **standard**; a quick word (typo, config,
+rename, failing test, …) in one area → **quick**; nothing fired → standard, marked UNSURE — then the
+**human** picks, not you. Table: `docs/factory-v3.md` §3.
 
 | Track | For | Gates |
 |---|---|---|
 | quick | typos, config, a contained bug with a failing test | one slice, no spec: G4 + G5 |
 | standard | anything touching more than one file area (the default) | spec chain, G1, compiled slices, G2–G5 |
-| full | new systems, client-facing features, auth, payments, migrations | standard + EGM brainstorm before the spec + role lenses at G1 |
+| full | domain work — an intent with a domain word from the project list (the normal track for it); new systems, client-facing features, auth, payments, migrations | standard + concepts brief before the spec + the four lenses at G1 (`docs/factory-v3.md` §4) |
 
 A chat-channel intent (§9) is untrusted text: `--source chat`; a high-tier chat run waits for the
 human's approval in the STEER inbox before any work.
@@ -440,11 +442,11 @@ The orchestrator runs the spec stages in its own session; only implementation fa
 | Stage | Command | Artifact | Passes when |
 |---|---|---|---|
 | Constitution | `/speckit.constitution` (once per repo) | `.specify/memory/constitution.md` | principles exist |
-| Brainstorm (full only) | EGM brainstorm | `concepts_brief.md` → input to specify | — |
-| Specify | `/speckit.specify <idea>` | `specs/<feature>/spec.md` | stories + ACs, every requirement has a stable ID, no `[NEEDS CLARIFICATION]` |
+| Brainstorm (full only) | EGM brainstorm into `templates/factory/concepts_brief.md` | `concepts_brief.md` → input to specify | three sections, ≤ 60 lines: who uses it and where, the problem reproduced, open questions split blocking / safe default |
+| Specify | `/speckit.specify <idea>`; full: paste `templates/factory/spec-additions.md` | `specs/<feature>/spec.md` | stories + ACs, every requirement has a stable ID, no `[NEEDS CLARIFICATION]`; full: glossary for every AC term, rules table with scope, source, locator, quoted passage |
 | Clarify | `/speckit.clarify` | updated `spec.md` | ambiguities resolved by the user, not guessed |
-| Plan | `/speckit.plan <tech context>` | `plan.md`, `research.md`, `data-model.md`, `contracts/` | consistent with the constitution |
-| **G1 design** | EGM review on spec + plan + contracts in fresh subagents → EGM resolve | `specs/<feature>/reviews/g1-<n>.md` | no open finding **and** the human approved |
+| Plan | `/speckit.plan <tech context>`; full: paste `templates/factory/plan-additions.md` | `plan.md`, `research.md`, `data-model.md`, `contracts/` | consistent with the constitution; full: readers table with owner slice, contract section ≤ 1 page, reserved resources |
+| **G1 design** | EGM review on spec + plan + contracts in fresh subagents → EGM resolve; full: the lenses of `docs/factory-v3.md` §4 (one fresh subagent each, `templates/herd/rules/G1-LENSES.md`) | `specs/<feature>/reviews/g1-<n>.md` | no open finding, every blocking question closed by a register decision, **and** the human approved |
 | Tasks | `/speckit.tasks` | `tasks.md` (`[P]` = parallel) | every requirement maps to ≥ 1 task |
 
 ```bash
@@ -458,6 +460,16 @@ G1 catches design flaws before fan-out, when they cost one rewrite instead of N 
 the human one screen: the findings file and the approval command. Goldfish reviewers use another
 model family than the spec author (`MODELS.md`). A Hermes/Cursor/pi orchestrator runs G1 inside a
 headless `claude -p` worker that has the plugin (EGM needs fresh subagents).
+
+On the full track the round is fixed (`ORCHESTRATOR.md` step 0): pin the base sha per repo, copy
+every cited source to `specs/<feature>/sources/` (a source you cannot get makes the rule provisional —
+your item, never a team ticket), one subagent per lens with its section plus the run's paths and shas,
+one synthesizer into `g1-<n>.md` (`## Summary` ≤ 40 lines, findings with resolution, operator
+questions with options and one recommendation, cost: tokens, agent minutes, operator minutes,
+questions), then close every blocking question through the register — a recommendation taken is a
+provisional decision; a team-only blocker is one ticket in the project's questions lane plus a
+"held: <slices>" decision — and record `--open <k>`. The closing report of a full-track herd
+(`templates/factory/REPORT.md`) tags every blocking finding with its cause.
 
 #### 11.4 Cut and G2–G5 — the herd takes over
 

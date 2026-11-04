@@ -16,6 +16,9 @@ import tempfile
 HERE = os.path.dirname(os.path.realpath(__file__))
 REPO = os.path.normpath(os.path.join(HERE, "..", ".."))
 RULES = os.path.join(REPO, "templates", "herd", "rules")
+FACTORY = os.path.join(REPO, "templates", "factory")
+FACTORY_TEMPLATES = ("concepts_brief.md", "spec-additions.md", "plan-additions.md", "REPORT.md")
+LENSES = ("Domain", "Architecture", "Scope", "Comprehension")
 CTX = os.path.join(REPO, "scripts", "herd-context")
 sys.path.insert(0, os.path.join(REPO, "scripts"))
 import herd_events as he  # noqa: E402
@@ -38,11 +41,90 @@ _LOCAL = [re.escape(w.strip()) for w in os.environ.get("HERD_LEAK_WORDS", "").sp
 PROJECT_WORDS = re.compile("|".join([r"workspace-\d", r"herde-\d"] + _LOCAL), re.I)
 
 
+def _read(*parts):
+    with open(os.path.join(REPO, *parts), encoding="utf-8") as f:
+        return f.read()
+
+
+def _section(text, heading, level="## "):
+    """The body of `<level><heading>` up to the next heading of the same level ("" when absent)."""
+    marker = f"\n{level}{heading}"
+    if marker not in text:
+        return ""
+    body = text.split(marker, 1)[1].split("\n", 1)[1]
+    return body.split(f"\n{level}", 1)[0]
+
+
+PATH_TOKEN = re.compile(r"`([^`\s]*/[^`\s]*)`")
+
+
+def check_full_track():
+    """G1-LENSES.md: four lens sections, no placeholders, each lens names only the paths of its own
+    reading list (spec FT-05 AC2); the lens list has one home (docs/factory-v3.md §4); the factory
+    templates carry the sections and columns the full track relies on."""
+    lenses = _read("templates", "herd", "rules", "G1-LENSES.md")
+    check("G1-LENSES has no {{placeholders}}", "{{" not in lenses)
+    for name in LENSES:
+        sec = _section(lenses, name)
+        check(f"G1-LENSES section {name}", bool(sec))
+        for part in ("**Question.**", "**Reads**", "**Never reads**", "**Checks**", "**Agent type.**"):
+            check(f"G1-LENSES {name} has {part}", part in sec)
+        # every path a lens section names must stand in its Reads or Never-reads list
+        listed = set()
+        for label in ("**Reads**", "**Never reads**"):
+            block = sec.split(label, 1)[1].split("\n**", 1)[0] if label in sec else ""
+            listed |= set(PATH_TOKEN.findall(block))
+        stray = sorted(set(PATH_TOKEN.findall(sec)) - listed)
+        check(f"G1-LENSES {name} names only its reading list", not stray, ", ".join(stray))
+    reads_shell = _section(lenses, "Domain") + _section(lenses, "Architecture")
+    check("G1-LENSES domain + architecture run with a shell", reads_shell.count("General subagent with a shell") == 2)
+    check("G1-LENSES architecture never reads the working tree", "working tree" in _section(lenses, "Architecture")
+          and "git -C <repo> show <sha>:<path>" in _section(lenses, "Architecture"))
+    check("G1-LENSES domain reads the copied sources", "`specs/<feature>/sources/`" in _section(lenses, "Domain"))
+    check("G1-LENSES finding format is REVIEWER.md + lens name", "`REVIEWER.md`" in lenses and "lens: <name>" in lenses)
+
+    # one home for the lens list: the factory-v3 §4 table; the other mentions point there
+    v3 = _section(_read("docs", "factory-v3.md"), "4. G1")
+    for name in LENSES:
+        check(f"factory-v3 §4 lists lens {name.lower()}", f"\n| {name.lower()} |" in v3)
+    for rel in ("templates/herd/rules/ORCHESTRATOR.md", "skill/SKILL.md"):
+        text = _read(*rel.split("/"))
+        check(f"{rel} points to factory-v3 §4 instead of listing lenses",
+              "docs/factory-v3.md` §4" in text and not re.search(r"product, architecture, UX", text))
+    orch = _section(_read("templates", "herd", "rules", "ORCHESTRATOR.md"), "0. Gates", "### ")
+    for need in ("Pin the base", "Copy the sources", "never a team ticket", "subagent per lens", "at most 40 lines",
+                 "one recommendation", "operator minutes", "provisional decision", "held: <slices>", "--open <k>"):
+        check(f"ORCHESTRATOR step 0 says: {need}", need.lower() in orch.lower())
+
+    brief = _read("templates", "factory", "concepts_brief.md")
+    check("concepts_brief ≤ 60 lines", brief.count("\n") <= 60, str(brief.count("\n")))
+    for h in ("## Who uses it and where", "## The problem reproduced", "## Open questions"):
+        check(f"concepts_brief has {h}", f"\n{h}\n" in brief)
+    check("concepts_brief has exactly three sections", brief.count("\n## ") == 3)
+    spec = _read("templates", "factory", "spec-additions.md")
+    check("spec-additions has a glossary", "\n## Glossary\n" in spec)
+    for col in ("Rule", "Scope (Bundesland or federal)", "Source", "Locator", "Quoted passage", "Provisional"):
+        check(f"spec-additions rules table has column {col}", f"| {col}" in spec)
+    check("spec-additions links the contract section in plan-additions", "templates/factory/plan-additions.md" in spec
+          and "## Contract section" not in spec)
+    plan = _read("templates", "factory", "plan-additions.md")
+    check("plan-additions readers table", "| Concept | Readers" in plan and "| Command used | Owner slice |" in plan)
+    check("plan-additions has the contract section", "\n## Contract section\n" in plan and "one page" in plan)
+    check("plan-additions has reserved resources", "\n## Reserved resources\n" in plan)
+    report = _read("templates", "factory", "REPORT.md")
+    check("REPORT has the cause column", "| Cause |" in report and "spec / cut / domain / code / integration" in report)
+    check("REPORT counts questions at G1 vs after start", "found at g1" in report.lower() and "after start" in report.lower())
+
+
 def main():
-    files = ["WORKER.md", "REVIEWER.md", "FIXER.md", "MODELS.md", "ORCHESTRATOR.md", "HERD-CUT.md", "STEER.md", "GOLDFISH.md"]
+    files = ["WORKER.md", "REVIEWER.md", "FIXER.md", "MODELS.md", "ORCHESTRATOR.md", "HERD-CUT.md", "STEER.md", "GOLDFISH.md",
+             "G1-LENSES.md"]
     for n in files:
         check(f"{n} exists", os.path.isfile(os.path.join(RULES, n)))
     extra = [os.path.join(REPO, "templates", "herd", n) for n in ("COMMON.md", "task.md.example")]
+    for n in FACTORY_TEMPLATES:
+        check(f"templates/factory/{n} exists", os.path.isfile(os.path.join(FACTORY, n)))
+    extra += [os.path.join(FACTORY, n) for n in FACTORY_TEMPLATES]
     for p in [os.path.join(RULES, n) for n in files] + extra:
         with open(p, encoding="utf-8") as f:
             text = f.read()
@@ -136,10 +218,13 @@ def main():
 
     # the published docs carry examples, never the source fabric's ticket ids or memory file names
     leaks = re.compile("|".join([r"\b\d{11}\b"] + _LOCAL), re.I)
-    for rel in ("docs/herd-flow-v2.md", "README.md", "CHANGELOG.md", "skill/SKILL.md", "templates/herd/workflows/README.md"):
+    for rel in ("docs/herd-flow-v2.md", "README.md", "CHANGELOG.md", "skill/SKILL.md", "templates/herd/workflows/README.md",
+                "docs/factory-v3.md", "templates/herd/rules/G1-LENSES.md") + tuple(f"templates/factory/{n}" for n in FACTORY_TEMPLATES):
         with open(os.path.join(REPO, rel), encoding="utf-8") as f:
             hits = sorted({m.group(0) for m in leaks.finditer(f.read())})
         check(f"{rel} carries no project ids", not hits, ", ".join(hits))
+
+    check_full_track()
 
     print(f"test_rules_templates: {ok} passed, {fail} failed")
     return 0 if fail == 0 else 1

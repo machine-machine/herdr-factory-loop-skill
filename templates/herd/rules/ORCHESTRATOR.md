@@ -41,11 +41,46 @@ packages, clashes, phases and a register excerpt), at herd start and after every
 
 - Every intent starts with `m2herd triage "<intent>" --files <paths>`. **quick**: one slice, no spec,
   straight to step 2. **standard / full**: the spec-kit chain first, then G1. An UNSURE triage is the
-  human's pick, not yours.
-- G1: run EGM review on `spec.md` + `plan.md` + `contracts/` in fresh subagents (full track adds the
-  product, architecture, UX and QA lenses), findings to `specs/<feature>/reviews/g1-<n>.md`, work them
-  through with EGM resolve, then `m2herd gate record <run> design_review --evidence <file> --open <n>`.
-  With nothing open, hand the human the findings file and the exact approval command
+  human's pick, not yours. A full run starts with the concepts brief
+  (`templates/factory/concepts_brief.md`, three sections, one page) and pastes the spec and plan
+  additions (`templates/factory/spec-additions.md`, `plan-additions.md`) after `/speckit.specify` and
+  `/speckit.plan`.
+- G1 on the standard track: run EGM review on `spec.md` + `plan.md` + `contracts/` in fresh subagents,
+  findings to `specs/<feature>/reviews/g1-<n>.md`, work them through with EGM resolve, then
+  `m2herd gate record <run> design_review --evidence <file> --open <n>`.
+- G1 on the full track runs the lenses listed in `docs/factory-v3.md` §4 (rule text per lens in
+  `G1-LENSES.md`, next to this file). Per round `<n>`:
+  1. **Pin the base.** For every repo the plan names, record the commit of its default branch at
+     round start (`git -C <repo> rev-parse origin/<default>`). It goes into g1-<n>.md and, at the cut,
+     into every `<slice>.repos` — the lenses, the cut check and the workers see one tree.
+  2. **Copy the sources.** Every source the spec's rules table cites goes to
+     `specs/<feature>/sources/` (from the project's source folders or a fetched URL), named so the
+     row's locator finds it. A source you cannot obtain: mark that rule provisional in the spec and
+     keep the item on your own list — it is an orchestrator item, never a team ticket; the domain
+     lens names the claim it could not check.
+  3. **Spawn one fresh subagent per lens**, another model family than the spec author's
+     (`MODELS.md`, goldfish row). The prompt is the lens's section of `G1-LENSES.md` followed by the
+     run's values: the feature directory, the register path, repo path and base sha per repo, the
+     list of copied sources — nothing else, no chat, no earlier round. Domain and architecture need
+     a shell (general subagent); scope and comprehension may run as EGM reviewer types. Keep the
+     tokens and minutes of each result line.
+  4. **Synthesize** `specs/<feature>/reviews/g1-<n>.md`: a header (run, files reviewed, lenses and
+     models, base shas), a `## Summary` block of at most 40 lines, a findings table with one
+     resolution per finding (duplicates merged, lows last), then "Questions only the operator can
+     answer" — each with its options, one recommendation and what it blocks — and the cost of the
+     round: tokens, agent minutes, operator minutes, number of operator questions.
+  5. **Resolve and close.** Every finding gets a resolution (EGM resolve: changed in spec/plan
+     v<x>, or rejected with the reason). Every blocking question is closed through the register
+     before `design_ok`: taking the recommendation records a provisional decision (the question is
+     deleted in the same edit); a question only the team can answer *and* that blocks becomes one
+     ticket in the project's questions lane plus a decision "held: <slices> until <ticket> is
+     answered" — the held slices leave the cut, the rest of the run continues, and the held slices
+     re-enter through a new `design_review` once the answer is recorded. Never ask the team what a
+     recommendation can settle.
+  6. **Record** `m2herd gate record <run> design_review --evidence specs/<feature>/reviews/g1-<n>.md
+     --open <k>` with `<k>` = blocking findings without a resolution + blocking questions without a
+     register decision id.
+- With nothing open, hand the human the findings file and the exact approval command
   (`m2herd gate approve <run> G1 --word "<their words>"`); you never approve it yourself.
 - `m2herd gate status` says who acts next for every run. Batch approvals per herd so the human reads
   one screen per gate, not one per slice.

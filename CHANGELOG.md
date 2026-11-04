@@ -6,6 +6,53 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.0-alpha.2] - 2026-11-04
+
+The full track becomes runnable for domain work: triage sends an intent with a domain word to it,
+and its G1 runs four zero-context lenses with pinned base shas and copied source texts (SKILL.md
+§11.1 / §11.3, `docs/factory-v3.md` §4). Documents and one triage rule; no new command.
+
+### Added
+- **A domain word sends work to the full track** (G0): `m2herd triage` reads the project's list
+  `<dir>/.m2herd/rules/domain-words.txt` — case-insensitive whole words, `word*` for any ending,
+  ü/ö/ä/ß matching ue/oe/ae/ss, paths never matched — and picks **full** when the intent contains
+  one; the reason names the word. The skill ships no list. Full is the normal track for domain
+  work; touching several repositories no longer sends work to full on its own.
+- **G1 lens rules** — `templates/herd/rules/G1-LENSES.md`: domain, architecture, scope (product +
+  zoom-out) and comprehension, each with its question, reading list, never-read list, checks and
+  agent type; findings in the `REVIEWER.md` format plus the lens name. Domain reads the cited
+  sources copied to `specs/<feature>/sources/`; architecture reads the repos at the base sha with
+  `git show` / `git grep`, never a working tree. Domain and architecture run as general subagents
+  with a shell, scope and comprehension may run as EGM reviewer types.
+- **The full-track G1 round** — `ORCHESTRATOR.md` step 0: pin the base sha per repo at round start
+  (copied into `<slice>.repos` at the cut); copy every cited source (a source the orchestrator cannot
+  obtain makes the rule provisional — an orchestrator item, never a team ticket); one fresh subagent
+  per lens with its section plus the run's paths, shas and sources; one synthesizer step into
+  `reviews/g1-<n>.md` (`## Summary` ≤ 40 lines, findings table with a resolution each, operator
+  questions with options and one recommendation, cost: tokens, agent minutes, operator minutes,
+  question count); every blocking question closed through the register (a recommendation taken is
+  a provisional decision; a team-only blocker is one ticket in the project's questions lane plus a
+  "held: <slices>" decision); `m2herd gate record … design_review --open <k>`.
+- **Factory templates** — `templates/factory/`: `concepts_brief.md` (three sections, ≤ 60 lines),
+  `spec-additions.md` (glossary; rules table with scope, source, locator, quoted passage,
+  provisional flag), `plan-additions.md` (readers table with the command used and the owner slice;
+  the contract section, ≤ 1 page; reserved resources), `REPORT.md` (closing report: one cause per
+  blocking finding — spec, cut, domain, code or integration — and blocking questions found at G1
+  vs after the first `working` event).
+- `tests/docs/test_rules_templates.py` covers the new rules file and the factory templates:
+  project-neutral, no placeholders, each lens names only the paths of its own reading list, the
+  brief stays under 60 lines, the report has its cause column.
+
+### Changed
+- **One home for the lens list**: `docs/factory-v3.md` §4. SKILL.md §11, `ORCHESTRATOR.md` and
+  the next-step text of `m2herd triage` point there instead of repeating it. The set is domain,
+  architecture, scope and comprehension, not the PRD's product / architecture / UX / QA group
+  (§10): a replay of six lenses on three past slices showed unique catches only by domain (with
+  the source texts) and architecture (with the repo); QA returns as executable evals at G3.
+- SKILL.md §11.1 names domain work as the full track's normal case in the triage prose and the
+  track table; §11.3 names the brief and the spec / plan additions per stage and the fixed G1 round.
+- `MODELS.md`: the rules-file table gains `G1-LENSES.md` (goldfish row).
+
 ## [3.0.0-alpha] - 2026-11-03
 
 The factory pipeline: the four side-by-side orchestration paths become one stage-gated path from
