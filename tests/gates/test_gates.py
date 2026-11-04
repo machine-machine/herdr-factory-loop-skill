@@ -154,6 +154,68 @@ class Triage(unittest.TestCase):
                          ["README.md", "src", "src/api"])   # a file right under src/ is area src
 
 
+class DomainWords(unittest.TestCase):
+    INTENT = "Vollständigkeits-Regelset für Windenergie in NRW ergänzen"
+
+    def check(self, intent, files, track, tier, words=("Regelset*",)):
+        d = gate.triage(intent, files, domain_words=list(words))
+        self.assertEqual((d["track"], d["tier"], d["sure"]), (track, tier, True), (intent, d))
+        return d
+
+    def test_domain_word_sends_to_full(self):
+        d = self.check(self.INTENT, [], "full", "medium")
+        self.assertEqual(d["domain_words"], ["regelset"])
+        self.assertIn("regelset", d["reasons"][0])
+        self.assertEqual(gate.triage(self.INTENT, [])["track"], "standard")   # no list, no domain row
+
+    def test_matcher_case_and_whole_words(self):
+        dh = gate.domain_hits
+        self.assertEqual(dh(["regelset"], "REGELSET prüfen"), ["regelset"])
+        self.assertEqual(dh(["Regelset"], "die Regelsetzung"), [])           # no * → whole word only
+        self.assertEqual(dh(["Regelset*"], "die Regelsetzung"), ["regelsetzung"])
+        self.assertEqual(dh(["Regelset*"], "das Unterregelset"), [])         # no match inside a word
+        self.assertEqual(dh(["Windenergie"], "Windenergie-Erlass lesen"), ["windenergie"])   # hyphen splits
+        self.assertEqual(dh(["Brutvogel*", "NRW"], "Brutvogelarten in NRW, Brutvogelatlas"),
+                         ["brutvogelarten", "brutvogelatlas", "nrw"])
+        self.assertEqual(dh([], self.INTENT), [])
+        self.assertEqual(dh(["*", "  "], self.INTENT), [])                    # a bare * matches nothing
+
+    def test_matcher_umlauts_both_directions(self):
+        dh = gate.domain_hits
+        self.assertEqual(dh(["Gefährdung"], "Gefaehrdung bewerten"), ["gefaehrdung"])
+        self.assertEqual(dh(["Gefaehrdung"], "Gefährdung bewerten"), ["gefaehrdung"])
+        self.assertEqual(dh(["Störung*"], "Stoerungen"), ["stoerungen"])
+        self.assertEqual(dh(["Prüfung"], "PRÜFUNG"), ["pruefung"])
+        self.assertEqual(dh(["Maßnahme*"], "Massnahmen planen"), ["massnahmen"])
+        self.assertEqual(dh(["Massnahme*"], "Maßnahmen planen"), ["massnahmen"])
+        self.assertEqual(dh(["Prüfung"], "Prüfung"), ["pruefung"])          # decomposed ü
+
+    def test_list_file_skips_comments_and_blank_lines(self):
+        with tempfile.TemporaryDirectory() as base:
+            self.assertEqual(gate.load_domain_words(base), [])                # no file: empty list
+            os.makedirs(os.path.join(base, ".m2herd", "rules"))
+            with open(os.path.join(base, ".m2herd", "rules", "domain-words.txt"), "w", encoding="utf-8") as f:
+                f.write("# Artenschutz\n\nRegelset*   # Fachquellen\n   \n  NRW\n#Windenergie\n")
+            self.assertEqual(gate.load_domain_words(base), ["Regelset*", "NRW"])
+
+    def test_paths_are_not_matched(self):
+        for files in (["regelset/rules.py"], ["src/regelset/a.py", "src/regelset/b.py"]):
+            d = self.check("fix typo in the loader", files, "quick", "medium")
+            self.assertEqual(d.get("domain_words"), None)
+            self.assertEqual(d, gate.triage("fix typo in the loader", files))
+
+    def test_rule_order(self):
+        d = self.check("fix typo in the Regelset wording", ["src/rules/x.py"], "full", "medium")   # beats row 4
+        self.assertIn("domain words", d["reasons"][0])
+        self.check("show the Regelset in api and ui", ["api/a.py", "ui/b.ts"], "full", "medium")  # beats row 3
+        d = self.check("Regelset migration", [], "full", "high")                                  # row 1 first
+        self.assertIn("risk words", d["reasons"][0])
+        self.assertEqual(d["domain_words"], ["regelset"])
+        d = self.check("new service for the Regelset", [], "full", "medium")                      # row 2 first
+        self.assertIn("new-system words", d["reasons"][0])
+        self.check("Regelset docs", [], "full", "low")                                            # tier rules stay
+
+
 class Cli(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -200,6 +262,37 @@ class Cli(unittest.TestCase):
         self.assertFalse(os.path.exists(os.path.join(self.base, ".m2herd")), "dry run wrote nothing")
         _, out, _ = cli(self.base, "triage", "add payment page", "--source", "chat", "--id", "pay")
         self.assertIn("STEER inbox", out)
+
+    def write_words(self, *lines):
+        os.makedirs(os.path.join(self.base, ".m2herd", "rules"), exist_ok=True)
+        with open(os.path.join(self.base, ".m2herd", "rules", "domain-words.txt"), "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+
+    def test_cli_reads_domain_words_and_records_them(self):
+        self.write_words("# Artenschutz", "Regelset*")
+        rc, out, err = cli(self.base, "triage", DomainWords.INTENT, "--id", "d1")
+        self.assertEqual(rc, 0, err)
+        self.assertIn("track: full (tier medium)", out)
+        self.assertIn("domain words: regelset", out)
+        ev = he.read_gates(os.path.join(self.base, ".m2herd", "factory", "d1"))[0]
+        self.assertEqual((ev["track"], ev["domain_words"]), ("full", ["regelset"]))
+        _, out, _ = cli(self.base, "triage", DomainWords.INTENT, "--dry-run", "--json")
+        self.assertEqual(json.loads(out)["domain_words"], ["regelset"])
+
+    def test_cli_path_with_domain_word_keeps_track(self):
+        self.write_words("Regelset*")
+        _, out, _ = cli(self.base, "triage", "fix typo in the loader", "--files", "regelset/load.py",
+                        "--dry-run", "--json")
+        ev = json.loads(out)
+        self.assertEqual(ev["track"], "quick")
+        self.assertNotIn("domain_words", ev)
+
+    def test_full_next_step_points_to_the_lenses_section(self):
+        self.write_words("Regelset*")
+        _, out, _ = cli(self.base, "triage", DomainWords.INTENT, "--id", "d2")
+        self.assertIn("G1 with the lenses in docs/factory-v3.md §4", out)
+        for gone in ("role lenses", "product", "UX", "QA"):
+            self.assertNotIn(gone, gate.NEXT["full"])
 
     def test_cli_override_after_unsure_triage(self):
         cli(self.base, "triage", "review the open pull request", "--id", "r1")       # no rule fires: UNSURE

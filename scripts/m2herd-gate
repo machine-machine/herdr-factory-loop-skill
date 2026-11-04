@@ -10,6 +10,8 @@
 Every run lives in <dir>/.m2herd/factory/<id>/gates.jsonl (written only through herd_events.append_gate,
 under a lock). `m2herd triage` and `m2herd gate …` call this script with --dir. Rules only, no LLM, no
 network: triage is a table of words and file areas, so the same intent always gets the same track.
+The project's domain words come from <dir>/.m2herd/rules/domain-words.txt (one per line, # comments);
+the skill ships none.
 """
 import argparse
 import hashlib
@@ -17,6 +19,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 import herd_events as he  # noqa: E402
@@ -33,14 +36,16 @@ LOW_TIER = ["doc", "docs", "documentation", "readme", "changelog", "test", "test
 LOW_PATHS = re.compile(r"(^|/)(docs?|tests?|spec|\.github|\.forgejo)/|\.md$|(^|/)test_[^/]*$|_test\.[a-z]+$")
 # a path's area is its first component, or the first two under these container dirs
 CONTAINERS = {"src", "lib", "app", "apps", "packages", "services", "internal", "cmd", "pkg"}
+# the project's domain words: a hit sends the intent to full; the skill ships no list
+DOMAIN_WORDS_FILE = os.path.join(".m2herd", "rules", "domain-words.txt")
 
 NEXT = {
     "quick": "one slice, no spec: write <slice>.task.md, herd-phase <herd> <slice> queued — gates G4 + G5 only",
     "standard": "/speckit.specify → /speckit.clarify → /speckit.plan, then G1: EGM review of spec.md + plan.md + "
                 "contracts/ in fresh subagents → m2herd gate record {id} design_review --evidence "
                 "specs/<feature>/reviews/g1-1.md --open <n>",
-    "full": "EGM brainstorm → concepts_brief.md → /speckit.specify …, then G1 with the role lenses "
-            "(product, architecture, UX, QA) → m2herd gate record {id} design_review …",
+    "full": "EGM brainstorm → concepts_brief.md → /speckit.specify …, then G1 with the lenses in "
+            "docs/factory-v3.md §4 → m2herd gate record {id} design_review …",
 }
 
 
@@ -56,6 +61,37 @@ def hits(kind, text):
     return sorted({m.group(1).lower() for m in RX[kind].finditer(text or "")})
 
 
+def fold(text):
+    """Case and umlaut folding for domain words: Gefährdung, GEFAEHRDUNG and gefaehrdung are one word."""
+    s = unicodedata.normalize("NFC", text or "").casefold()   # casefold also turns ß into ss
+    return s.replace("ä", "ae").replace("ö", "oe").replace("ü", "ue")
+
+
+def domain_hits(words, text):
+    """Domain words in the text, folded. Unlike the rule words a hyphen splits words here, so a German
+    compound like Vollständigkeits-Regelset still names Regelset."""
+    alts = []
+    for w in words or []:
+        w = fold(w).strip()
+        stem = w[:-1] if w.endswith("*") else w
+        if stem.strip():
+            alts.append(r"\s+".join(map(re.escape, stem.split())) + (r"\w*" if w.endswith("*") else ""))
+    if not alts:
+        return []
+    rx = re.compile(r"(?<!\w)(" + "|".join(alts) + r")(?!\w)")
+    return sorted({m.group(1) for m in rx.finditer(fold(text))})
+
+
+def load_domain_words(base):
+    """The project's list; a missing file is an empty list."""
+    try:
+        with open(os.path.join(base, DOMAIN_WORDS_FILE), encoding="utf-8") as f:
+            lines = f.read().splitlines()
+    except FileNotFoundError:
+        return []
+    return [w for w in (ln.split("#", 1)[0].strip() for ln in lines) if w]
+
+
 def areas(files):
     out = set()
     for f in files:
@@ -66,8 +102,15 @@ def areas(files):
     return sorted(out)
 
 
-def triage(intent, files=None):
-    """-> {track, tier, sure, reasons, areas}. Pure function of the intent text and the file list."""
+def triage(intent, files=None, domain_words=None):
+    """-> {track, tier, sure, reasons, areas[, domain_words]}. Pure function of the intent text, the file
+    list and the project's domain words; only the intent is matched against the words, never the paths."""
+    dom = domain_hits(domain_words, intent)
+    d = _rows(intent, files, dom)
+    return dict(d, domain_words=dom) if dom else d
+
+
+def _rows(intent, files, dom):
     files = [f for f in (files or []) if f.strip()]
     ar = areas(files)
     high, full, quick = hits("high", intent), hits("full", intent), hits("quick", intent)
@@ -79,6 +122,9 @@ def triage(intent, files=None):
     if full:
         return {"track": "full", "tier": tier, "sure": True, "areas": ar,
                 "reasons": [f"new-system words: {', '.join(full)}"]}
+    if dom:
+        return {"track": "full", "tier": tier, "sure": True, "areas": ar,
+                "reasons": [f"domain words: {', '.join(dom)}"]}
     if len(ar) > 1:
         return {"track": "standard", "tier": tier, "sure": True, "areas": ar,
                 "reasons": [f"{len(ar)} file areas: {', '.join(ar)}"]}
@@ -184,7 +230,7 @@ def main(argv=None):
     try:
         if o.cmd == "triage":
             files = [f for f in o.files.split(",") if f.strip()]
-            d = triage(o.intent, files)
+            d = triage(o.intent, files, load_domain_words(base))
             if o.tier and he.TIERS.index(o.tier) > he.TIERS.index(d["tier"]):
                 d["tier"], d["reasons"] = o.tier, d["reasons"] + [f"tier raised to {o.tier} by --tier"]
             if o.track:   # the human's pick, also when it confirms the rule's (UNSURE) answer
@@ -196,7 +242,7 @@ def main(argv=None):
                                          "use --force --note '<why the risk words are a false alarm>'")
             rid = o.id or slug(o.intent)
             fields = dict(track=d["track"], tier=d["tier"], sure=d["sure"], override=d.get("override"),
-                          reasons=d["reasons"], intent=o.intent,
+                          reasons=d["reasons"], intent=o.intent, domain_words=d.get("domain_words"),
                           files=files or None, areas=d["areas"] or None, feature=o.feature, source=o.source,
                           needs_approval=True if (o.source == "chat" and d["tier"] == "high") else None)
             if o.dry_run:
