@@ -88,9 +88,8 @@ high-tier chat run records `needs_approval` and `gate status` sends it to the ST
 ## 4. G1 — the design review
 
 Standard and full runs only. The orchestrator runs EGM review on `spec.md` + `plan.md` +
-`contracts/` in fresh subagents (full track: plus the product, architecture, UX and QA lenses
-through EGM review loop), writes the findings to `specs/<feature>/reviews/g1-<n>.md`, works them
-through with EGM resolve, and records `m2herd gate record <run> design_review --evidence <file>
+`contracts/` in fresh subagents, writes the findings to `specs/<feature>/reviews/g1-<n>.md`, works
+them through with EGM resolve, and records `m2herd gate record <run> design_review --evidence <file>
 --open <n>`. With `open: 0` it hands the human the findings file and the approval command; the
 human's words go in verbatim (`m2herd gate approve <run> G1 --word "…"`). Goldfish reviewers use a
 different model family from the spec author when one is configured (`MODELS.md`).
@@ -98,6 +97,52 @@ different model family from the spec author when one is configured (`MODELS.md`)
 A Hermes, Cursor or pi orchestrator cannot start the subagents EGM needs; G1 then runs inside a
 headless `claude -p` worker that has the plugin, and its findings file is collected like a slice
 report. `scripts/onboard.sh` records which route applies (`[egm] subagents = native | claude-p`).
+
+### 4.1 Full track: the four lenses
+
+This table is the one home of the lens list; SKILL.md §11, `ORCHESTRATOR.md` step 0, the `m2herd
+triage` next-step text and the rule text per lens (`templates/herd/rules/G1-LENSES.md`) point here
+instead of repeating it.
+
+| Lens | Question | Reads | Runs as |
+|---|---|---|---|
+| domain | glossary complete; does each quoted passage say the rule, for the scope the row names; register consistent? | `spec.md`, the decisions register, `specs/<feature>/sources/` — every cited source, copied there by the orchestrator before spawn | general subagent with a shell |
+| architecture | readers, owners, contracts, slice boundaries; fits the code at the base sha? | `spec.md`, `plan.md`, the repos at the base sha through `git show` / `git grep` — never a working tree; repo paths and shas are appended to the prompt at spawn | general subagent with a shell |
+| scope | does this solve the reproduced problem for the named user in the form they use; is there a simpler cut; what is out of scope? (product + zoom-out) | `concepts_brief.md`, `spec.md`, `plan.md` | EGM reviewer type or general subagent |
+| comprehension | can a newcomer build from spec + plan alone? | `spec.md`, `plan.md` | EGM reviewer type or general subagent |
+
+Why these four: a replay of six lenses on three past slices with known findings showed unique
+catches only by architecture (needing the repo) and domain (which, working from memory, once
+recommended the known error itself — hence the copied source texts); product and zoom-out merged
+into scope; QA left G1 and returns with executable evals at G3. Each lens is a fresh subagent on
+another model family than the spec author's; its prompt is the common part of `G1-LENSES.md` (role,
+principles, output shape), its own section and the run's values, and that prompt names only the
+paths of its reading list (`tests/docs/test_rules_templates.py` checks that; the first real run's
+transcripts are read once by hand for reads outside the list).
+
+### 4.2 A full-track round
+
+1. **Base sha** per repo, pinned at round start after a fetch, recorded in g1-<n>.md and copied
+   into every `<slice>.repos` at the cut.
+2. **Sources** copied to `specs/<feature>/sources/`; a source the orchestrator cannot obtain makes the
+   rule provisional — an orchestrator item, never a team ticket.
+3. **One subagent per lens**, then one **synthesizer** step into `reviews/g1-<n>.md`: a header with
+   run, files, lenses, models and base shas; `## Summary` of at most 40 lines; a findings table with a
+   resolution per finding; "Questions only the operator can answer", each with options and one
+   recommendation; the round's cost — tokens and agent minutes (the Agent tool's result line, or
+   `usage` / `duration_ms` of `claude -p --output-format json`), operator minutes, number of operator
+   questions. Estimate from the replay: about 250 k tokens and 4 minutes for four lenses.
+4. **Questions** close through the register before `design_ok`: a recommendation taken becomes a
+   provisional decision; a team-only question that blocks becomes one ticket in the project's
+   questions lane and a decision "held: <slices> until <ticket> is answered" — held slices leave the
+   cut and re-enter through a new `design_review` once the answer is recorded (the cut check's
+   refusal of a held slice follows with the `changes:` header).
+5. **Record** `design_review --open <k>`, `<k>` = blocking findings without a resolution + blocking
+   questions without a register decision id; `design_ok` stays refused while `<k>` > 0.
+
+Procedure in full: `templates/herd/rules/ORCHESTRATOR.md` step 0. Templates for the brief, the spec
+and plan additions and the closing report: `templates/factory/` (the check commands `check-brief` and
+`check-report` follow after the first full-track herd).
 
 ## 5. Cut — the compiler (`m2herd cut`, 3.0.0)
 
@@ -174,6 +219,11 @@ loop` (P2).
   rewrites the file from its own struct and would drop an unknown block; the block lands together
   with the TUI change (and a rebuilt `prebuilt/`). Until then: `--track`, `--tier` and the review
   loop's `blind` arg.
+- **Full-track lenses.** The PRD (FR-06) gives the full track a product, architecture, UX and QA
+  lens group through the EGM review loop. The alpha runs four lenses — domain, architecture, scope,
+  comprehension (§4.1) — as fresh subagents the orchestrator starts itself; no workflow script, because
+  a Workflow cannot read files, write the review or pick EGM agent types. The brief of FR-03 is a
+  template with three fixed sections (`templates/factory/concepts_brief.md`).
 - **The herd view is "Herd".** Worker TUIs go to the tab `herd` (was `herde`); a tab still labelled
   `herde` is recognised until it closes, unless `HERD_SPAWN_TAB` names another label.
 
