@@ -2224,7 +2224,8 @@ def render(anchor, given):
         words = []
         for i, k in enumerate(sorted(merged, key=lambda k: (-len(merged[k]), k))):
             words += ([f"{DIM}·{RST}"] if i else []) + [f"{DIM}{k}{RST}"] + [f"{GREEN}{n}{RST}" for n in sorted(merged[k])]
-        merged_lines, cur = [f"{BOLD}{GREEN}{t('merged').strip()}{RST}"], ""
+        total = sum(len(v) for v in merged.values())
+        merged_lines, cur = [f"{BOLD}{GREEN}{t('merged').strip()}{RST} {DIM}({total}){RST}"], ""
         for wd in words:
             if cur and len(ANSI.sub("", cur)) + 1 + len(ANSI.sub("", wd)) > w:
                 merged_lines.append(cur)
@@ -2810,7 +2811,7 @@ def newer_checks(herd, tmp, heads, sha, iso, now, strip, check):
           and repo_label("acme/web") == "web")
     ml = merged_block(lines)
     check("merged today: title alone, repos flow from column 0", re.search(r"\bapp 5\b", ml) is not None
-          and "lib 41" in ml and "·" in ml and ml.split("\n")[0].strip() == t("merged").strip())
+          and "lib 41" in ml and "·" in ml and ml.split("\n")[0].strip() == f"{t('merged').strip()} (2)")
     g["active_units"] = lambda: []
 
 
