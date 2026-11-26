@@ -2219,36 +2219,19 @@ def render(anchor, given):
             merged.setdefault(repo_label(k), set()).update(v)
     merged_lines = []
     if any(merged.values()):
-        # title with the count on its own line, then one indented line per repo; every number spelled out
-        spans = lambda ns: [str(n) for n in sorted(ns)]
-        total = sum(len(v) for v in merged.values())
-        merged_lines = [f"{BOLD}{GREEN}{t('merged').strip()}{RST} {DIM}{total}{RST}"]
-        keys = sorted(merged, key=lambda k: (-len(merged[k]), k))
-        lw = max(len(k) for k in keys)
-        for k in keys:
-            ind = "  " + " " * (lw + 1)
-            cur = f"  {DIM}{k:<{lw}}{RST}"
-            filled = False
-            for wd in spans(merged[k]):
-                vis = len(ANSI.sub("", cur)) + 1 + len(wd)
-                if filled and vis > w:
-                    merged_lines.append(cur)
-                    cur, filled = ind + f"{GREEN}{wd}{RST}", True
-                else:
-                    cur, filled = f"{cur} {GREEN}{wd}{RST}", True
-            merged_lines.append(cur)
-        if height < 30:  # small panel: everything on as few lines as possible, repos separated by "·"
-            words = [f"{BOLD}{GREEN}{t('merged').strip()}{RST}"]
-            for i, k in enumerate(keys):
-                words += ([f"{DIM}·{RST}"] if i else []) + [f"{DIM}{k}{RST}"] + [f"{GREEN}{x}{RST}" for x in spans(merged[k])]
-            merged_lines, cur = [], ""
-            for wd in words:
-                if cur and len(ANSI.sub("", cur)) + 1 + len(ANSI.sub("", wd)) > w:
-                    merged_lines.append(cur)
-                    cur = "  " + wd
-                else:
-                    cur = f"{cur} {wd}" if cur else wd
-            merged_lines.append(cur)
+        # title on its own line, then all repos in one flow from column 0 ("api 446 447 · ui 201"), every number
+        # spelled out, wrapped at whole numbers
+        words = []
+        for i, k in enumerate(sorted(merged, key=lambda k: (-len(merged[k]), k))):
+            words += ([f"{DIM}·{RST}"] if i else []) + [f"{DIM}{k}{RST}"] + [f"{GREEN}{n}{RST}" for n in sorted(merged[k])]
+        merged_lines, cur = [f"{BOLD}{GREEN}{t('merged').strip()}{RST}"], ""
+        for wd in words:
+            if cur and len(ANSI.sub("", cur)) + 1 + len(ANSI.sub("", wd)) > w:
+                merged_lines.append(cur)
+                cur = wd if ANSI.sub("", wd) != "·" else ""
+            else:
+                cur = f"{cur} {wd}" if cur else wd
+        merged_lines += [cur] if cur else []
 
     # fixed-size lanes first; the Working lane gets what is left. Over budget: queue gives way, then ready
     avail = height - len(top)
@@ -2399,7 +2382,7 @@ def merged_block(lines):
         return ""
     out = [lines[i]]
     for l in lines[i + 1:]:
-        if not l.startswith("  "):
+        if not l.strip():
             break
         out.append(l)
     return "\n".join(out)
@@ -2627,7 +2610,7 @@ def selftest():
             lines = strip(out)
             check("small panel: within height, merge word kept, overflow counted",
                   len(out) <= 15 and any(t("word", w="merge ok-api") in l for l in lines) and any(f" {t('more')}" in l for l in lines))
-            check("small panel: footer pinned", any(l.startswith(t("merged").strip()) for l in lines[-2:]))
+            check("small panel: footer pinned", any(l.startswith(t("merged").strip()) for l in lines[-3:]))
             os.environ.update(LINES="90")
             newer_checks(herd, tmp, heads, sha, iso, now, strip, check)
             ask_checks(herd, tmp, strip, check)
@@ -2826,8 +2809,8 @@ def newer_checks(herd, tmp, heads, sha, iso, now, strip, check):
     check("repo labels", repo_label("gst-gen-api") == "api" and repo_label("artenschutz-ingest") == "ingest"
           and repo_label("acme/web") == "web")
     ml = merged_block(lines)
-    check("merged today: one line per repo under the title", re.search(r"^ +app +5$", ml, re.M) is not None
-          and re.search(r"^ +lib +41$", ml, re.M) is not None)
+    check("merged today: title alone, repos flow from column 0", re.search(r"\bapp 5\b", ml) is not None
+          and "lib 41" in ml and "·" in ml and ml.split("\n")[0].strip() == t("merged").strip())
     g["active_units"] = lambda: []
 
 
