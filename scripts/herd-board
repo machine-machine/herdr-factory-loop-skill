@@ -2219,16 +2219,8 @@ def render(anchor, given):
             merged.setdefault(repo_label(k), set()).update(v)
     merged_lines = []
     if any(merged.values()):
-        # title with the count on its own line, then one indented line per repo; runs of 3+ numbers fold to "a–b"
-        def spans(ns):
-            ns, out, i = sorted(ns), [], 0
-            while i < len(ns):
-                j = i
-                while j + 1 < len(ns) and ns[j + 1] == ns[j] + 1:
-                    j += 1
-                out += [f"{ns[i]}–{ns[j]}"] if j - i >= 2 else [str(n) for n in ns[i:j + 1]]
-                i = j + 1
-            return out
+        # title with the count on its own line, then one indented line per repo; every number spelled out
+        spans = lambda ns: [str(n) for n in sorted(ns)]
         total = sum(len(v) for v in merged.values())
         merged_lines = [f"{BOLD}{GREEN}{t('merged').strip()}{RST} {DIM}{total}{RST}"]
         keys = sorted(merged, key=lambda k: (-len(merged[k]), k))
