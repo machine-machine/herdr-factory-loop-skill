@@ -15,14 +15,25 @@ Lanes, top to bottom, each drawn only when non-empty:
                     plus the orchestrator's own subagents (◆) and Workflow runs (▸ one line; ⚠ only for a still agent)
   2. Queue          ! fix_queued (always first), ◌ queued "starts as no. n" + why it waits (slot, base, memory);
                     under Working, so the running workers stay at the top
-  3. Ready to merge one row per package: ◇ accepted (+ why the review waits), … review running (round n/3),
-                    ✓ rev'd ✓ + the exact merge word (reviewed on current heads), ✓ rev'd waiting for a partner or
-                    base, ⟳ stale (PR head or main moved since review_ok), ! findings
-  4. Merged today   numbers from `merged` events plus the GitHub search (HERD_BOARD_ORG)
+  3. Chains & runs  active systemd user units merge-* (» slice it is at, since, failed count from
+                    <herd>/<unit>.log and .gescheitert), gv-runde-* and recalc-* (▸ since)
+  4. Ready to merge one row per package with a PR: ◇ accepted (+ why the review waits), … review running
+                    (round n/3), ✓ rev'd ✓ + "merge word ✓" or ⏸ "waiting for the merge word" (from <herd>/GO.md),
+                    ✓ rev'd waiting for a partner or base, ⟳ grey "main moved — chain re-probes" (routine),
+                    ✕ red merge conflict (last reprobe-<slice>.log verdict KONFLIKT), ⟳ stale (PR head moved), ! findings
+  5. Result, no PR  review_ok without a PR (measurement, draft, analysis on eval/*), grey
+  6. Merged today   by repo since midnight Europe/Berlin, from `merged` events plus the GitHub search (HERD_BOARD_ORG)
+Under the header: the current wave (largest N in the last GO.md line naming "Welle N"), counts of working / fix
+rounds queued / review, and why nothing starts when slices wait and none works (memory < N GB, slots full, ...).
+A subagent registration whose transcript has not moved for AGENT_DEAD_MIN (120 min) is removed.
 Each slice row ends dim with age and model·effort from its working event (O·hi = Opus/high). ⇄ marks a file
 overlap with another live slice (`herd-clash <herd> --json`, on PATH or next to this script; skipped when absent).
 Header: time, `you: n`, `slots n/m (k review)` from `herd-limits` (when present), free RAM, free disk, and the
 time of the last human input into the anchor session once that is > 30 min ago.
+Right under it (Satie 26.11.: questions by group, not by person): "? Dev n · Infra n · Expert team n" — Dev = the
+"offen" list of HERD_BOARD_ASK + open_questions in HERD_BOARD_REGISTER with gruppe "dev" (yellow, bold), Infra /
+Expert team (de: Fachteam) = gruppe "infra" / "fachteam" (dim); a group with 0 is left out, all 0: no line. Then
+the first ~50 chars of the first "offen" question when there is one. A missing or broken file: no value.
 A herd dir with no herd.events.jsonl but a herd.map is a v1 herd: shown the old way with a dim
 "v1 herd — herd-recover migrates it" line, so live herds keep working until `herd-recover` migrates them.
 
@@ -42,6 +53,9 @@ Environment:
                     (unset: no search; gh resolves repos from the slice's worktree)
   HERD_BOARD_REPOS  short names used in refs, e.g. "api=my-api,ui=my-ui,ma=other-owner/agent"
   HERD_BOARD_DISK   path whose free space the header shows (default: the first herd dir, else the cwd)
+  HERD_BOARD_ASK    JSON whose "offen" list is what waits on the user (default /workspace/.m2herd/beim-nutzer.json)
+  HERD_BOARD_REGISTER  decisions register with open_questions[].gruppe in dev | infra | fachteam
+                    (default /workspace/decisions-questions.json)
   NO_COLOR          plain text
 """
 import calendar, glob, json, os, re, shlex, shutil, subprocess, sys, textwrap, time, unicodedata
@@ -63,6 +77,11 @@ REPOS = dict(p.strip().split("=", 1) for p in os.environ.get("HERD_BOARD_REPOS",
 SHORT = {v.split("/")[-1]: k for k, v in REPOS.items()}
 
 LANG = "de" if os.environ.get("HERD_BOARD_LANG", "").lower().startswith("de") else "en"
+ASK_FILE = os.environ.get("HERD_BOARD_ASK") or "/workspace/.m2herd/beim-nutzer.json"
+REGISTER = os.environ.get("HERD_BOARD_REGISTER") or "/workspace/decisions-questions.json"
+GROUPS = (("dev", "g_dev"), ("gemeinsam", "g_gem"), ("infra", "g_infra"), ("fachteam", "g_fach"))  # (register gruppe, T key), in order
+ASK_SHORT = 50  # characters of the first question shown after the group counts
+ASK_SHORT_MIN = 12  # fewer characters of it fit beside all groups: Infra / Expert team move to a second line
 # Simple by default: name, state, progress, the worker's sentence. HERD_BOARD_DETAIL=1 adds model·effort tags,
 # ⇄ file overlaps, PR refs @sha7, the merge word and one line per Workflow run (operator 26.10.: too crowded).
 DETAIL = os.environ.get("HERD_BOARD_DETAIL", "").lower() in ("1", "true", "yes", "ja")
@@ -88,7 +107,32 @@ STRINGS = {
            "reviewed": "rev'd", "stale": "stale", "stale_head": "{ref} has new commits",
            "stale_main": "{repo} main moved", "stale_nomain": "{repo} main not recorded", "befund": "findings", "word": "say “{w}”",
            "v1": "v1 herd — herd-recover migrates it", "wf": "workflow: {r} running, {d} done",
-           "no_core": "herd_events.py missing next to herd-board", "draw_err": "herd-board"},
+           "no_core": "herd_events.py missing next to herd-board", "draw_err": "herd-board",
+           "lane_nopr": "Result, no PR", "nopr": "reviewed, no PR", "lane_runs": "Chains & runs",
+           "main_routine": "main moved — chain re-probes", "main_due": "main moved — re-probe due",
+           "conflict": "merge conflict — worker needed", "go_ok": "merge word ✓",
+           "go_wait": "⏸ waiting for the merge word", "wave": "Wave {n}", "n_work": "{n} working",
+           "n_fix": "{n} fix rounds queued", "n_queue": "{n} queued", "n_review": "{n} review",
+           "idle_why": "nothing starts: {why}", "mem_lt": "memory < {g} GB", "slots_full": "slots full",
+           "base_open": "bases not accepted", "chain_at": "at {s}", "chain_last": "waiting (last {s})",
+           "unit_since": "since {t}", "failed_n": "{n} failed",
+           "dur_min": "{m} min", "dur_h": "{h} h {m:02d}", "u_wave": "Merge wave {n}", "u_merge": "Merge {n}",
+           "u_vorfahrt": "Merge priority", "u_gv": "Comparison round {n}", "u_recalc": "Recalculate",
+           "u_recalc_st": "Recalculate on staging", "n_merged": "{n}/{m} merged", "now_at": "now {s}: {what}",
+           "step_test": "test run {n}/~{m} min", "step_test_n": "test run {n} min",
+           "step_slot": "waits for a test slot ({d})", "step_merge": "merging", "step_run": "running {d}",
+           "step_between": "between steps", "next": "then {s}", "starts": "next {s}",
+           "all_done": "all merged — chain ends", "wait_for": "waiting: {x}", "failed_list": "failed: {x}",
+           "r_fix": "fix round", "r_work": "working", "r_review": "review", "r_findings": "findings",
+           "r_queue": "queued", "r_accepted": "review due", "r_parked": "parked", "r_unknown": "no state",
+           "f_red": "red: {x}", "f_setup": "tests did not run", "f_merge": "merge not completed",
+           "gate": "waits for {s} to be merged", "gv_starting": "starting", "gv_done": "done, writes the report",
+           "gv_case": "case {i}/{n} {f}", "gv_report": "writes the report", "gv_since": "since {d}",
+           "gv_eta": "done ~{t}", "rc_staging": "waits for the deploy on staging ({d})", "rc_done": "{p} done",
+           "rc_run": "{p} running ({d})", "rc_run_n": "{p} running", "rc_wait": "{p} waiting",
+           "vf_holds": "holds {n} worker test runs so {s} goes first",
+           "vf_holds0": "holds {n} worker test runs so the merge goes first",
+           "g_dev": "Dev", "g_gem": "Together", "g_infra": "Infra", "g_fach": "Expert team"},
     "de": {"title": "Herd", "load": "Last", "done": "fertig", "check": "prüfen", "working": "arbeitet",
            "still": "still", "needs_answer": "braucht Antwort", "ended": "beendet ohne Bericht", "missing": "fehlt:",
            "blocked": "blockiert", "since": "seit", "signed": "rev'd",
@@ -113,7 +157,32 @@ STRINGS = {
            "stale_nomain": "{repo}-main nicht erfasst", "befund": "Befunde",
            "word": "Wort: „{w}“", "v1": "v1-Herd — herd-recover migriert",
            "wf": "Workflow: {r} laufen, {d} fertig", "no_core": "herd_events.py fehlt neben herd-board",
-           "draw_err": "herd-board"},
+           "draw_err": "herd-board",
+           "lane_nopr": "Ergebnis ohne PR", "nopr": "geprüft, kein PR", "lane_runs": "Ketten und Läufe",
+           "main_routine": "main bewegt — Kette prüft neu", "main_due": "main bewegt — Nachprüfung fällig",
+           "conflict": "Merge-Konflikt — Worker nötig", "go_ok": "Merge-Wort ✓",
+           "go_wait": "⏸ wartet auf Merge-Wort", "wave": "Welle {n}", "n_work": "{n} arbeiten",
+           "n_fix": "{n} Fixrunden warten", "n_queue": "{n} in Warteschlange", "n_review": "{n} Review",
+           "idle_why": "startet nichts: {why}", "mem_lt": "Speicher < {g} GB", "slots_full": "Slots voll",
+           "base_open": "Basen nicht abgenommen", "chain_at": "bei {s}", "chain_last": "wartet (zuletzt {s})",
+           "unit_since": "seit {t}", "failed_n": "{n} gescheitert",
+           "dur_min": "{m} min", "dur_h": "{h} h {m:02d}", "u_wave": "Merge Welle {n}", "u_merge": "Merge {n}",
+           "u_vorfahrt": "Merge-Vorfahrt", "u_gv": "Vergleich Runde {n}", "u_recalc": "Neu berechnen",
+           "u_recalc_st": "Neu berechnen Staging", "n_merged": "{n}/{m} gemergt", "now_at": "jetzt {s}: {what}",
+           "step_test": "Testlauf {n}/~{m} min", "step_test_n": "Testlauf {n} min",
+           "step_slot": "wartet auf Testplatz ({d})", "step_merge": "mergt", "step_run": "läuft {d}",
+           "step_between": "zwischen zwei Schritten", "next": "danach {s}", "starts": "als Nächstes {s}",
+           "all_done": "alle gemergt — Kette endet", "wait_for": "wartet: {x}", "failed_list": "gescheitert: {x}",
+           "r_fix": "Fixrunde", "r_work": "arbeitet", "r_review": "Prüfung", "r_findings": "Befunde",
+           "r_queue": "Warteschlange", "r_accepted": "Review steht an", "r_parked": "geparkt", "r_unknown": "ohne Zustand",
+           "f_red": "rot: {x}", "f_setup": "Tests liefen nicht", "f_merge": "Merge nicht abgeschlossen",
+           "gate": "wartet auf Merge von {s}", "gv_starting": "startet", "gv_done": "fertig, schreibt den Bericht",
+           "gv_case": "Fall {i}/{n} {f}", "gv_report": "schreibt den Bericht", "gv_since": "seit {d}",
+           "gv_eta": "fertig ~{t}", "rc_staging": "wartet auf Deploy auf Staging ({d})", "rc_done": "{p} fertig",
+           "rc_run": "{p} läuft ({d})", "rc_run_n": "{p} läuft", "rc_wait": "{p} wartet",
+           "vf_holds": "hält {n} Worker-Tests an, damit {s} vorgeht",
+           "vf_holds0": "hält {n} Worker-Tests an, damit der Merge vorgeht",
+           "g_dev": "Dev", "g_gem": "Gemeinsam", "g_infra": "Infra", "g_fach": "Fachteam"},
 }
 
 
@@ -357,6 +426,7 @@ def newest_jsonl(cwd):
 
 WF_DONE_KEEP_MIN = 10  # a workflow without running agents stays registered this long (gaps between phases)
 WF_STALE_MIN = 30      # a run with no movement for this long was stopped
+AGENT_DEAD_MIN = 120   # a subagent transcript not written for this long belongs to a dead session: unregister it
 
 
 def workflow_rows(reg, label, wdir):
@@ -435,8 +505,10 @@ def agent_rows(anchor, agents=None):
             label, jsonl = open(reg, encoding="utf-8").read().split("\n", 1)
             jsonl = jsonl.strip()
             if os.path.isdir(jsonl):
-                if DETAIL:  # simple view: a review run already shows as "Review läuft" under Ready to merge
-                    rows += workflow_rows(reg, label, jsonl)
+                # simple view: a review run already shows as "Review läuft" under Ready to merge; the call still
+                # runs, so a stopped run's registration is dropped in both views
+                wf = workflow_rows(reg, label, jsonl)
+                rows += wf if DETAIL else []
                 continue
             meta = json.load(open(jsonl[:-6] + ".meta.json")) if os.path.exists(jsonl[:-6] + ".meta.json") else {}
             meta = meta if isinstance(meta, dict) else {}
@@ -450,6 +522,14 @@ def agent_rows(anchor, agents=None):
                 os.unlink(reg)
                 continue
             rows.append((1, label, "✓", GREEN, "", t("done"), "", detail))
+        elif age > AGENT_DEAD_MIN:
+            # a subagent of an ended or interrupted session never writes "finished": its transcript just stops.
+            # Drop the registration instead of showing "still 9469m" forever (WF_STALE_MIN does this for runs)
+            try:
+                os.unlink(reg)
+            except OSError:
+                pass
+            continue
         elif age >= STILL_MIN:
             rows.append((0, label, "⚠", RED, "", f"{t('still')} {tail}", "", detail))
         else:
@@ -521,14 +601,35 @@ def main_head(slug, cwd=None):
 
 MERGED = {"at": 0, "day": "", "prs": {}}   # repo short -> sorted PR numbers merged today, cached
 MERGED_CHECK_S = 300   # the search API has a tight secondary rate limit; several boards may poll it
+DAY_TZ = "Europe/Berlin"  # "today" starts at midnight here, whatever the machine's TZ is
+
+
+def day_start():
+    """(epoch of today's midnight in DAY_TZ, ISO stamp with offset for a GitHub search, date string)."""
+    try:
+        import datetime, zoneinfo
+        now = datetime.datetime.now(zoneinfo.ZoneInfo(DAY_TZ))
+        mid = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        return mid.timestamp(), mid.isoformat(timespec="seconds"), mid.strftime("%Y-%m-%d")
+    except Exception:  # no tz database: local midnight
+        lt = time.localtime()
+        mid = time.mktime((lt.tm_year, lt.tm_mon, lt.tm_mday, 0, 0, 0, 0, 0, -1))
+        return mid, time.strftime("%Y-%m-%d", lt), time.strftime("%Y-%m-%d", lt)
+
+
+def repo_label(repo):
+    """Short repo name for the Merged today line: a HERD_BOARD_REPOS short name stays, otherwise the last part of
+    a hyphenated name (gst-gen-api -> api, artenschutz-ingest -> ingest)."""
+    name = str(repo or "").split("/")[-1]
+    return name if name in REPOS else SHORT.get(name) or name.rsplit("-", 1)[-1] or name
 
 
 def merged_today():
-    """PRs merged today under HERD_BOARD_ORG (plus HERD_BOARD_REPOS entries of other owners), by repo:
-    {"api": [176, 177, …], "ui": [72, 73]}."""
+    """PRs merged today (since midnight DAY_TZ) under HERD_BOARD_ORG (plus HERD_BOARD_REPOS entries of other
+    owners), by repo: {"api": [176, 177, …], "ui": [72, 73]}."""
     if not ORGS:
         return {}
-    day = time.strftime("%Y-%m-%d")
+    _, since, day = day_start()
     if MERGED["day"] == day and time.time() - MERGED["at"] < MERGED_CHECK_S:
         return MERGED["prs"]
     # one search per owner: mixing org: and repo: qualifiers in one query returned only one of the two sets
@@ -540,7 +641,7 @@ def merged_today():
     for q in queries:
         try:
             r = subprocess.run(["gh", "api", "-X", "GET", "search/issues", "-f",
-                                f"q={q} is:pr is:merged merged:>={day}", "-f", "per_page=100", "--jq",
+                                f"q={q} is:pr is:merged merged:>={since}", "-f", "per_page=100", "--jq",
                                 '.items[] | "\\(.repository_url | split("/") | last) \\(.number)"'],
                                capture_output=True, text=True, timeout=10)
         except Exception:
@@ -713,6 +814,643 @@ def herd_clash(herd):
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# Cheap facts from the herd dir's own files (no git, no network): GO.md, reprobe logs, merge chains
+# ---------------------------------------------------------------------------------------------------------------
+
+GO_FILE = "GO.md"       # the user's words, one line per go: "… = MERGE-Wort für Welle 14 (a, b, c) …"
+GO_TAIL = 60            # merge words are read from the last GO_TAIL lines only
+UNITS_CHECK_S = 30
+UNIT_PATTERNS = ("merge-*", "gv-runde-*", "recalc-*")   # systemd user units shown under "Chains & runs"
+NO_WORD = re.compile(r"\bkein\w*\s+(?:ausdrückliches\s+)?merge-wort", re.I)
+_FILE_CACHE = {}        # (kind, path) -> (mtime, value)
+
+
+def _by_mtime(kind, path, fn):
+    """fn(path) cached until the file's mtime changes; fn(None) when the file is missing."""
+    try:
+        mt = os.path.getmtime(path)
+    except OSError:
+        return fn(None)
+    hit = _FILE_CACHE.get((kind, path))
+    if hit and hit[0] == mt:
+        return hit[1]
+    val = fn(path)
+    _FILE_CACHE[(kind, path)] = (mt, val)
+    return val
+
+
+def go_lines(herd):
+    def load(p):
+        if not p:
+            return []
+        try:
+            return [l.rstrip("\n") for l in open(p, encoding="utf-8", errors="replace") if l.strip()]
+        except OSError:
+            return []
+    return _by_mtime("go", os.path.join(herd, GO_FILE), load)
+
+
+def has_go_file(herd):
+    return os.path.isfile(os.path.join(herd, GO_FILE))
+
+
+def merge_word_sentences(herd):
+    """Sentences of the last GO_TAIL GO.md lines that give a merge word: they name "Merge-Wort"/"MERGE-Wort" and
+    do not say "KEIN (ausdrückliches) Merge-Wort". A line is split at ". " and "; " first, so "MERGE-Wort für #428
+    (gv-vergleicher); … Kein Merge-Wort für Welle 9." still grants gv-vergleicher."""
+    out = []
+    for line in go_lines(herd)[-GO_TAIL:]:
+        if not re.search(r"merge-wort", line, re.I):
+            continue
+        for sent in re.split(r"(?<=[.;])\s+", line):
+            if re.search(r"merge-wort", sent, re.I) and not NO_WORD.search(sent):
+                out.append(sent)
+    return out
+
+
+def has_merge_word(herd, s):
+    pat = re.compile(rf"(?<![\w-]){re.escape(s)}(?![\w-])")
+    return any(pat.search(x) for x in merge_word_sentences(herd))
+
+
+def current_wave(herd):
+    """The largest N in the last GO.md line that names a "Welle N"; None without one."""
+    for line in reversed(go_lines(herd)):
+        ns = [int(n) for n in re.findall(r"\bWelle\s+(\d+)", line)]
+        if ns:
+            return max(ns)
+    return None
+
+
+def tail_text(path, nbytes=16384):
+    try:
+        with open(path, "rb") as f:
+            f.seek(max(0, os.path.getsize(path) - nbytes))
+            return f.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+
+
+def failed_in_chains(herd):
+    """Slices listed in any <herd>/merge-*.gescheitert (one slice per line)."""
+    out = set()
+    for p in glob.glob(os.path.join(herd, "merge-*.gescheitert")):
+        out.update(read_list(p))
+    return out
+
+
+def reprobe_conflict(herd, s, since=None):
+    """True when the slice's last re-probe (<herd>/reprobe-<slice>.log, appended by reprobe.sh) ended in a merge
+    conflict: its last verdict line is "KONFLIKT: <files>", or a chain lists the slice as failed and the log names
+    KONFLIKT without a later verdict. A log older than `since` (the review_ok) is history. Reads the log only."""
+    p = os.path.join(herd, f"reprobe-{s}.log")
+    try:
+        if since is not None and os.path.getmtime(p) < since - 60:
+            return False
+    except OSError:
+        return False
+    text = tail_text(p)
+    verdict = None
+    for line in text.splitlines():
+        ls = line.strip()
+        if ls.startswith("KONFLIKT"):
+            verdict = "conflict"
+        elif ls.startswith(("sauber", "NEU ROT")) or "Kopf/Zustand jetzt" in ls:  # a later run's other verdict
+            verdict = "other"
+    if verdict:
+        return verdict == "conflict"
+    return "KONFLIKT" in text and s in failed_in_chains(herd)
+
+
+def _systemctl(*args):
+    env = dict(os.environ)
+    env.setdefault("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+    r = subprocess.run(["systemctl", "--user", *args], capture_output=True, text=True, timeout=5, env=env)
+    return r.stdout if r.returncode == 0 else ""
+
+
+def active_units():
+    """[{"unit": name, "since": epoch|None, "cmd": ExecStart argv as one string}] of active systemd user units
+    matching UNIT_PATTERNS, cached UNITS_CHECK_S; [] without systemd."""
+    def ask():
+        try:
+            names = []
+            for l in _systemctl("list-units", *UNIT_PATTERNS, "--state=active", "--no-legend", "--plain").splitlines():
+                parts = l.split()
+                if parts and parts[0].endswith(".service"):
+                    names.append(parts[0])
+            if not names:
+                return []
+            since, cmd, cur = {}, {}, None
+            for l in _systemctl("show", *names, "-p", "Id,ActiveEnterTimestamp,ExecStart",
+                                "--timestamp=unix").splitlines():
+                k, _, v = l.partition("=")
+                if k == "Id":
+                    cur = v
+                elif k == "ActiveEnterTimestamp" and cur:
+                    m = re.search(r"@(\d+)", v) or re.search(r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d)", v)
+                    since[cur] = (int(m[1]) if m[0].startswith("@") else
+                                  time.mktime(time.strptime(m[1], "%Y-%m-%d %H:%M:%S"))) if m else None
+                elif k == "ExecStart" and cur:
+                    m = re.search(r"argv\[\]=(.*?) ; ignore_errors=", v)
+                    cmd[cur] = m[1] if m else ""
+            return [{"unit": n[:-len(".service")], "since": since.get(n), "cmd": cmd.get(n, "")} for n in names]
+        except Exception:
+            return []
+    return _cached(("units",), UNITS_CHECK_S, ask) or []
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Chains & runs: one plain row per service — what happens now, how far, when done, does anyone have to act
+# ---------------------------------------------------------------------------------------------------------------
+
+RUN_PROC_S = 10          # the /proc scan for reprobe.sh / herd-merge is cached this long
+DUR_SAMPLES = 5          # a test run's expected length = median of the last DUR_SAMPLES runs of the same kind
+DUR_MAX_S = 4 * 3600     # longer "runs" are log artefacts (a chain restarted the next day), not samples
+GV_LOOP = os.environ.get("HERD_BOARD_GV_LOOP", "/workspace/.m2herd/gv-loop")
+STEP_LINE = re.compile(r"^==\s+(\S+)(?:\s+(\d\d):(\d\d)Z?)?\s*$")
+END_LINE = re.compile(r"^(fertig|GESCHEITERT)\s+(\S+)(?:\s+(\d\d):(\d\d)Z?)?\s*$")
+GATE = re.compile(r"\^([\w.-]+) \+merged")   # `until herd-phase … | grep -qE "^<slice> +merged"`: waits for a merge
+
+
+def berlin(epoch, fmt="%H:%M"):
+    """A clock time in DAY_TZ (Europe/Berlin), whatever the machine's TZ is."""
+    try:
+        import datetime, zoneinfo
+        return datetime.datetime.fromtimestamp(epoch, zoneinfo.ZoneInfo(DAY_TZ)).strftime(fmt)
+    except Exception:
+        return time.strftime(fmt, time.localtime(epoch))
+
+
+def clock(epoch):
+    """HH:MM today, the date ("24.11.") on another day — one word, so a wrapped row never splits it. Europe/Berlin."""
+    if not epoch:
+        return ""
+    return berlin(epoch, "%H:%M" if berlin(epoch, "%Y%m%d") == berlin(time.time(), "%Y%m%d") else "%d.%m.")
+
+
+def dur(seconds):
+    """A duration in plain words: "12 min", "2 h 05"."""
+    m = max(0, int(round(seconds / 60)))
+    return t("dur_min", m=m) if m < 60 else t("dur_h", h=m // 60, m=m % 60)
+
+
+def utc_stamps(hms, ref):
+    """Epochs for a log's time-only UTC stamps [(h, m, s), ...] in file order: the last one is the latest such time at
+    or before `ref` (the file's mtime), each earlier one the latest at or before its successor (midnight rollover)."""
+    out = []
+    for h, m, s in reversed(hms):
+        day = time.gmtime(ref)
+        e = calendar.timegm((day.tm_year, day.tm_mon, day.tm_mday, h, m, s))
+        if e > ref + 90:
+            e -= 86400
+        out.append(e)
+        ref = e
+    return out[::-1]
+
+
+def chain_log(path):
+    """A chain log (<herd>/<unit>.log, merge-kette-11.log, …) -> {"runs": [(slice, start, end|None, verdict)],
+    "cur": slice|None, "ended": slice|None}. "== <slice> HH:MM" opens a run (a repeat while open is the inner
+    script's echo), "fertig|GESCHEITERT <slice> HH:MM" closes it. Cached until the file changes."""
+    def load(p):
+        if not p:
+            return {"runs": [], "cur": None, "ended": None}
+        lines = tail_text(p, 65536).splitlines()
+        marks = []  # (kind, slice, (h, m) or None)
+        for line in lines:
+            m = STEP_LINE.match(line)
+            if m:
+                marks.append(("start", m[1], (int(m[2]), int(m[3]), 0) if m[2] else None))
+                continue
+            m = END_LINE.match(line)
+            if m:
+                marks.append((m[1], m[2], (int(m[3]), int(m[4]), 0) if m[3] else None))
+        stamped = [x[2] for x in marks if x[2]]
+        epochs = iter(utc_stamps(stamped, os.path.getmtime(p)))
+        runs, open_, cur, ended = [], {}, None, None
+        for kind, s, hm in marks:
+            e = next(epochs) if hm else None
+            if kind == "start":
+                if s not in open_:
+                    open_[s] = e
+                cur = s
+            elif s in open_:
+                runs.append((s, open_.pop(s), e, kind))
+                if s == cur:
+                    ended, cur = s, None
+        if cur:
+            runs.append((cur, open_.get(cur), None, None))
+        return {"runs": runs, "cur": cur, "ended": ended}
+    return _by_mtime("chainlog", path, load)
+
+
+def slice_kind(herd, s):
+    """"ui" when the slice touches gst-gen-ui only (lint + tsc, a minute or two), else "suite" (the pytest suite)."""
+    repos = {l.split()[0] for l in read_list(os.path.join(herd, f"{s}.repos")) if l.split()}
+    return "ui" if repos and repos <= {"gst-gen-ui"} else "suite"
+
+
+def expected_run_s(herd, s):
+    """Median length of the last DUR_SAMPLES finished re-probe + merge runs of the slice's kind (ui / suite), from the
+    "== <slice> HH:MM" … "fertig <slice> HH:MM" stamps of the herd's chain logs; None with fewer than two samples."""
+    kind = slice_kind(herd, s)
+    seen, samples = set(), []
+    for p in glob.glob(os.path.join(herd, "merge-*.log")):
+        try:
+            if time.time() - os.path.getmtime(p) > 3 * 86400:
+                continue
+        except OSError:
+            continue
+        for sl, a, b, verdict in chain_log(p)["runs"]:
+            if verdict != "fertig" or not a or not b or not 0 < b - a <= DUR_MAX_S or sl == s:
+                continue
+            key = (sl, int(b // 120))
+            if key not in seen:
+                seen.add(key)
+                samples.append((b, b - a, sl))
+    same = [d for b, d, sl in sorted(samples, reverse=True) if slice_kind(herd, sl) == kind][:DUR_SAMPLES]
+    if len(same) < 2:
+        return None
+    same.sort()
+    return same[len(same) // 2]
+
+
+def run_procs():
+    """[(argv list, start epoch)] of every process, cached RUN_PROC_S (one /proc scan per repaint at most)."""
+    def scan():
+        out = []
+        for pid in os.listdir("/proc"):
+            if not pid.isdigit():
+                continue
+            try:
+                argv = open(f"/proc/{pid}/cmdline", "rb").read().decode(errors="replace").split("\0")
+                out.append(([a for a in argv if a], os.stat(f"/proc/{pid}").st_mtime))
+            except OSError:
+                continue
+        return out
+    return _cached(("procs",), RUN_PROC_S, scan) or []
+
+
+def chain_step(s):
+    """What the chain does with slice `s` right now: ("test", since) while reprobe.sh runs for it, ("slot", since)
+    while suite-slot.sh still waits for a test slot for that reprobe, ("merge", since) while herd-merge runs, else None."""
+    found = {}
+    for argv, start in run_procs():
+        if s not in argv[1:]:
+            continue
+        base = [os.path.basename(a) for a in argv[:2]]
+        if "herd-merge" in base:
+            kind = "merge"
+        elif base[0] == "reprobe.sh" or base[1:2] == ["reprobe.sh"]:
+            kind = "test"
+        elif any(a.endswith("reprobe.sh") for a in argv) and any(b.startswith("suite-slot") for b in base):
+            kind = "slot"
+        else:
+            continue
+        found[kind] = min(start, found.get(kind, start))
+    for kind in ("merge", "test", "slot"):
+        if kind in found:
+            return kind, found[kind]
+    return None
+
+
+def fail_reason(herd, s):
+    """Why a chain gave up on a slice, from its last re-probe log: "KONFLIKT: <file>", "rot: <test>", "stale", ..."""
+    reason = ""
+    for line in tail_text(os.path.join(herd, f"reprobe-{s}.log")).splitlines():
+        ls = line.strip()
+        if ls.startswith("KONFLIKT"):
+            files = ls.partition(":")[2].split()
+            reason = "KONFLIKT" + (": " + os.path.basename(files[0]) + (f" +{len(files) - 1}" if len(files) > 1 else "")
+                                   if files else "")
+        elif ls.startswith("NEU ROT"):
+            tests = ls.partition(":")[2].split()
+            reason = t("f_red", x=tests[0].split("::")[-1] if tests else "?")
+        elif "Kopf/Zustand jetzt" in ls:
+            reason = "stale"
+        elif ls.startswith("TESTS LIEFEN NICHT") or (ls.startswith("Setup") and "fehlgeschlagen" in ls):
+            reason = t("f_setup")
+        elif ls.startswith("sauber"):
+            reason = t("f_merge")
+    return reason
+
+
+def script_of(u, herds):
+    """(script path, its extra arguments) of a unit: the .sh in its ExecStart, else <herd>/<unit>.sh."""
+    try:
+        argv = shlex.split(u.get("cmd") or "")
+    except ValueError:
+        argv = (u.get("cmd") or "").split()
+    for i, a in enumerate(argv):
+        if a.endswith(".sh") and os.path.isfile(a):
+            return a, argv[i + 1:]
+    for h in herds:
+        p = os.path.join(h, f"{u['unit']}.sh")
+        if os.path.isfile(p):
+            return p, []
+    return None, []
+
+
+def read_text(path):
+    return _by_mtime("text", path, lambda p: open(p, encoding="utf-8", errors="replace").read() if p else "")
+
+
+def unit_label(name, script_text=""):
+    m = re.match(r"^merge-welle(.+)$", name)
+    if m:
+        return t("u_wave", n=m[1])
+    if name == "merge-vorfahrt":
+        return t("u_vorfahrt")
+    if name.startswith("merge-"):
+        return t("u_merge", n=name[len("merge-"):])
+    m = re.match(r"^gv-runde-0*(\d+)$", name)
+    if m:
+        return t("u_gv", n=m[1])
+    if name.startswith("recalc-"):
+        return t("u_recalc_st") if "staging" in script_text.lower() else t("u_recalc")
+    return name
+
+
+WAIT_WHY = {"fix_queued": "r_fix", "review_running": "r_review", "review_befund": "r_findings", "queued": "r_queue",
+            "accepted": "r_accepted", "parked": "r_parked"}
+
+
+def chain_row(u, herds, states):
+    """A merge chain: slice list from W8="…" in its script (or the slices it was started with), phases from the herd
+    state, the slice it is at from its log, the step from the processes, failures from <script>.gescheitert."""
+    name = u["unit"]
+    script, args = script_of(u, herds)
+    herd = os.path.dirname(script) if script else None
+    if herd not in herds:
+        herd = next((h for h in herds if os.path.exists(os.path.join(h, f"{name}.log"))), herd or (herds[0] if herds else ""))
+    text = read_text(script) if script else ""
+    m = re.search(r"""^\s*W\d*=["']([^"']+)["']""", text, re.M)
+    slices = m[1].split() if m else [a for a in args if not a.startswith("-")]
+    base = os.path.splitext(os.path.basename(script))[0] if script else name
+    log = next((p for p in (os.path.join(herd, f"{name}.log"), os.path.join(herd, f"{base}.log")) if os.path.exists(p)),
+               None)
+    info = chain_log(log) if log else {"cur": None, "ended": None, "runs": []}
+    failed = [x for x in read_list(os.path.join(herd, f"{base}.gescheitert"))
+              if x and (not slices or x in slices)]
+    st = states.get(herd) or {}
+    ph = lambda s: (st.get(s) or {}).get("phase")
+    cur = info["cur"]
+    parts, more = [], []
+    if slices:
+        parts.append(t("n_merged", n=sum(1 for s in slices if ph(s) == "merged"), m=len(slices)))
+    if cur:
+        step = chain_step(cur)
+        start = next((a for s, a, b, v in reversed(info["runs"]) if s == cur and b is None), None) or \
+            (step[1] if step else None)
+        if step and step[0] == "merge":
+            what = t("step_merge")
+        elif step and step[0] == "slot":
+            what = t("step_slot", d=dur(time.time() - step[1]))
+        elif step:
+            exp = _cached(("runlen", herd, cur), UNITS_CHECK_S, lambda: expected_run_s(herd, cur))
+            mins = int((time.time() - (start or step[1])) // 60)
+            what = t("step_test", n=mins, m=round(exp / 60)) if exp else t("step_test_n", n=mins)
+        else:
+            what = t("step_run", d=dur(time.time() - start)) if start else t("step_between")
+        parts.append(t("now_at", s=cur, what=what))
+    rest = [s for s in slices if ph(s) != "merged" and s not in failed and s != cur]
+    ready = [s for s in rest if ph(s) == "review_ok"]
+    if cur and ready:
+        i = slices.index(cur) if cur in slices else -1
+        order = slices[i + 1:] + slices[:i + 1]
+        parts.append(t("next", s=next(s for s in order if s in ready)))
+    elif ready:
+        parts.append(t("starts", s=ready[0]))
+    elif slices and not cur and not rest:
+        parts.append(t("all_done"))
+    elif not slices:  # a chain whose script names no slice list: the old view (slice it is at / last one)
+        parts.append(t("chain_at", s=cur) if cur else t("chain_last", s=info["ended"]) if info["ended"] else "")
+    waits = []
+    for s in rest:
+        p = ph(s)
+        if p == "review_ok":
+            continue
+        ev = st.get(s) or {}
+        key = "r_fix" if p == "working" and "fix_queued" in (ev.get("history") or []) else \
+            "r_work" if p == "working" else WAIT_WHY.get(p, "r_unknown")
+        waits.append(f"{s} ({t(key)})")
+    if waits:
+        more.append((t("wait_for", x=", ".join(waits)), YEL))
+    if failed:
+        more.append((t("failed_list", x=", ".join(f"{s} ({r})" if (r := fail_reason(herd, s)) else s for s in failed)),
+                     RED))
+    col = ORANGE if failed else CYAN
+    return (0, unit_label(name), "»", col, "", " · ".join(p for p in parts if p), "",
+            {"thin": True, "busy": bool(cur or ready), "more": more, "sort": name, "cur": cur})
+
+
+def gv_log(path):
+    """runde.log of a comparison round -> {"start", "cases", "started": {case: epoch}, "ended": {case: epoch},
+    "done": bool}. Reads only the round log (gv-loop GEMEINSAM.md: no case folder is opened)."""
+    def load(p):
+        out = {"start": None, "cases": [], "started": {}, "ended": {}, "done": False}
+        if not p:
+            return out
+        rows = []
+        for line in tail_text(p, 65536).splitlines():
+            m = re.match(r"^\[(\d\d):(\d\d):(\d\d)Z\]\s+(.*)$", line)
+            if m:
+                rows.append(((int(m[1]), int(m[2]), int(m[3])), m[4]))
+        for e, (_, msg) in zip(utc_stamps([r[0] for r in rows], os.path.getmtime(p)), rows):
+            out["start"] = out["start"] or e
+            m = re.match(r"^Runde \S+, Fälle: (.+?), parallel", msg)
+            if m:
+                out["cases"] = m[1].split()
+            m = re.match(r"^Fall (\S+?)(?: \([^)]*\))?: (Treiber startet|Vergleich beendet)", msg)
+            if m:
+                out["started" if m[2] == "Treiber startet" else "ended"][m[1]] = e
+            if re.match(r"^Runde \S+ fertig", msg):
+                out["done"] = True
+        return out
+    return _by_mtime("gvlog", path, load)
+
+
+def gv_cases_default(loop, nn):
+    """The round's cases when the log has no header yet: LERNFAELLE in runde.sh, plus PRUEFFAELLE every third round."""
+    text = read_text(os.path.join(loop, "runde.sh"))
+    get = lambda k: (re.search(rf'^{k}="([^"]*)"', text, re.M) or [None, ""])[1].split()
+    return get("LERNFAELLE") + (get("PRUEFFAELLE") if int(nn) % 3 == 0 else [])
+
+
+def gv_row(u, herds, states):
+    name = u["unit"]
+    nn = re.match(r"^gv-runde-(\d+)$", name)[1]
+    cmd = u.get("cmd") or ""
+    m = re.search(r"(\S+)/runde\.sh\b", cmd)
+    loop = m[1] if m else GV_LOOP
+    m = re.search(r"--runde\s+(\d+)", cmd)
+    nn = m[1] if m else nn
+    log = os.path.join(loop, "runden", nn, "runde.log")
+    since = u.get("since") or 0
+    try:
+        fresh = os.path.getmtime(log) >= since - 60
+    except OSError:
+        fresh = False
+    parts, more = [], []
+    if not fresh:
+        gate = GATE.search(cmd)
+        merged = gate and any((st.get(gate[1]) or {}).get("phase") == "merged" for st in states.values())
+        parts.append(t("gate", s=gate[1]) if gate and not merged else t("gv_starting"))
+    else:
+        g = gv_log(log)
+        cases = g["cases"] or gv_cases_default(loop, nn)
+        n = len(cases) or len(g["started"])
+        done = [c for c in g["started"] if c in g["ended"]]
+        running = sorted((g["started"][c], c) for c in g["started"] if c not in g["ended"])
+        if g["done"]:
+            parts.append(t("gv_done"))
+        elif running:
+            parts.append(t("gv_case", i=len(done) + 1, n=n, f=running[-1][1]))
+        elif n and len(done) >= n:
+            parts.append(t("gv_report"))
+        if g["start"]:
+            parts.append(t("gv_since", d=dur(time.time() - g["start"])))
+        lens = [g["ended"][c] - g["started"][c] for c in done]
+        if not lens:  # nothing finished yet: the previous round's cases
+            prev = os.path.join(loop, "runden", f"{int(nn) - 1:0{len(nn)}d}", "runde.log")
+            if os.path.exists(prev):
+                p = gv_log(prev)
+                lens = [p["ended"][c] - p["started"][c] for c in p["started"] if c in p["ended"]]
+        if running and lens and not g["done"]:
+            mean = sum(lens) / len(lens)
+            left = max(0, n - len(done) - len(running))
+            eta = max(running[-1][0] + mean, time.time() + 60) + mean * left
+            parts.append(t("gv_eta", t=clock(eta)))
+    return (1, unit_label(name), "▸", BLUE, "", " · ".join(parts), "",
+            {"thin": True, "busy": True, "more": more, "sort": name})
+
+
+def short_project(p):
+    """A project slug short enough for one row: leading short tokens (gs, ga, ber, drv) dropped, two words kept."""
+    if len(p) <= 22:
+        return p
+    k = p.split("_")
+    i = next((i for i, x in enumerate(k) if len(x) > 3), 0)
+    return "_".join(k[i:i + 2])
+
+
+def recalc_row(u, herds, states):
+    """A recalculation run: projects from `for p in …; do` in its script, progress from its log ("== <project> HH:MMZ"
+    when one starts, "done |" when its job finished, "warte auf Staging" while the deploy is awaited)."""
+    name = u["unit"]
+    script, _ = script_of(u, herds)
+    text = read_text(script) if script else ""
+    herd = os.path.dirname(script) if script else (herds[0] if herds else "")
+    m = re.search(r"\bfor\s+\w+\s+in\s+([^;\n$`]+?)\s*;\s*do", text)
+    projects = m[1].split() if m else []
+    log = os.path.join(herd, f"{name}.log")
+    lines = tail_text(log, 65536).splitlines()
+    marks = [(i, (int(m[1]), int(m[2]), 0)) for i, l in enumerate(lines)
+             if (m := re.match(r"^(?:==\s+\S+|main \S+)\s+(\d\d):(\d\d)Z", l))]
+    at = dict(zip((i for i, _ in marks), utc_stamps([x for _, x in marks], os.path.getmtime(log)))) if marks else {}
+    state, start, now_p, staging, failed = {}, {}, None, None, ""
+    for i, line in enumerate(lines):
+        m = re.match(r"^==\s+(\S+)", line)
+        if m:
+            now_p, state[m[1]], start[m[1]] = m[1], "run", at.get(i)
+            projects += [] if m[1] in projects else [m[1]]
+        elif re.match(r"^done\s*\|", line) and now_p:
+            state[now_p] = "done"
+        elif "warte auf Staging" in line:
+            staging = at.get(i) or time.time()
+        elif line.startswith("Staging auf"):
+            staging = None
+        elif "nichts neu berechnet" in line:
+            failed = line.strip()
+    parts, more = [], []
+    if not state:
+        gate = GATE.search(text)
+        merged = gate and any((st.get(gate[1]) or {}).get("phase") == "merged" for st in states.values())
+        if staging:
+            parts.append(t("rc_staging", d=dur(time.time() - staging)))
+        elif gate and not merged and not failed:
+            parts.append(t("gate", s=gate[1]))
+    if state or not parts:
+        for p in projects:
+            s = state.get(p)
+            parts.append(t("rc_done", p=short_project(p)) if s == "done" else
+                         t("rc_run", p=short_project(p), d=dur(time.time() - start[p])) if s == "run" and start.get(p)
+                         else t("rc_run_n", p=short_project(p)) if s == "run" else t("rc_wait", p=short_project(p)))
+    if failed:
+        more.append((failed, RED))
+    return (1, unit_label(name, text), "▸", ORANGE if failed else BLUE, "", " · ".join(parts), "",
+            {"thin": True, "busy": True, "more": more, "sort": name})
+
+
+def vorfahrt_row(u, herds, cur):
+    """merge-vorfahrt only while it holds worker test runs (pids in <herd>/merge-vorfahrt.angehalten), else None."""
+    script, _ = script_of(u, herds)
+    herd = os.path.dirname(script) if script else (herds[0] if herds else "")
+    pids = [p for p in read_list(os.path.join(herd, "merge-vorfahrt.angehalten")) if p.strip().isdigit()]
+    held = sum(1 for p in pids if os.path.exists(f"/proc/{p.strip()}"))
+    if not held:
+        return None
+    text = t("vf_holds", n=held, s=cur) if cur else t("vf_holds0", n=held)
+    return (0, unit_label(u["unit"]), "»", CYAN, "", text, "", {"thin": True, "busy": True, "sort": u["unit"] + "~"})
+
+
+def unit_rows(herds, states=None):
+    """One row per active service under "Chains & runs": merge chains (what is merged, the slice now and its step,
+    the next one, who it waits for, what failed), comparison rounds (case i/n, since, ETA), recalculations (project
+    by project), merge-vorfahrt only while it holds test runs. `states` = {herd: herd_events.state(herd)}."""
+    states = states or {}
+    rows, vorfahrt = [], []
+    for u in active_units():
+        name = u["unit"]
+        try:
+            if name == "merge-vorfahrt":
+                vorfahrt.append(u)
+            elif name.startswith("merge-"):
+                rows.append(chain_row(u, herds, states))
+            elif name.startswith("gv-runde-"):
+                rows.append(gv_row(u, herds, states))
+            elif name.startswith("recalc-"):
+                rows.append(recalc_row(u, herds, states))
+            else:
+                rows.append((1, name, "▸", BLUE, "", t("unit_since", t=clock(u.get("since"))) if u.get("since") else "",
+                             "", {"thin": True, "busy": True}))
+        except Exception as e:  # one odd log must not hide the other services
+            rows.append((1, name, "▸", ORANGE, "", f"{type(e).__name__}: {e}", "", {"thin": True, "busy": True}))
+    cur = next((r[7].get("cur") for r in rows if r[7].get("cur")), None)
+    rows += [r for r in (vorfahrt_row(u, herds, cur) for u in vorfahrt) if r]
+    return rows
+
+
+def run_lines(row, w):
+    """A Chains & runs row: heading + state (up to two continuation lines); "wartet"/"gescheitert" in their colour
+    on the same line when everything fits, otherwise each on a line of its own."""
+    _, name, icon, col, _, text, _, d = row
+    more = d.get("more") or []
+    text = f"· {text}" if text else ""  # "Merge Welle 15 · 6/8 gemergt · …": the label is a name, not a sentence
+    row = row[:5] + (text,) + row[6:]
+    if more:
+        full = " · ".join([text] + [m for m, _ in more]) if text else "· " + " · ".join(m for m, _ in more)
+        if len(icon) + 1 + len(name) + 1 + len(full) <= w:
+            segs = ([paint(text)] if text else [f"{DIM}·{RST}"]) + [paint(m, c) for m, c in more]
+            return [f"{col}{icon}{RST} {col}{name}{RST} " + f"{DIM} · {RST}".join(segs)]
+    out = head_lines(row, w, 2)
+    out = out[:1] + [re.sub(r"^  · ", "  ", l) for l in out[1:]]  # a continuation line does not start with a dot
+    for m, c in more:
+        out += [f"  {paint(l, c)}" for l in wrap(m, w - 2, 2)]
+    return out
+
+
+def min_free_gb(herd):
+    """HERD_MIN_FREE_MB (environment, then <herd>/limits.env, else 8000 like herd-limits) in GB."""
+    v = os.environ.get("HERD_MIN_FREE_MB") or _limits_env(herd).get("HERD_MIN_FREE_MB") or "8000"
+    try:
+        return round(int(v) / 1000)
+    except ValueError:
+        return 8
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # v2 herds: lanes from herd_events.state() plus computed states
 # ---------------------------------------------------------------------------------------------------------------
 
@@ -786,6 +1524,30 @@ def stale_of(ev, wts, merged_evs, package_members):
             if m and short_repo(m[1]) in covered:
                 return t("stale_main", repo=short_repo(m[1]))
     return ""
+
+
+def is_stale_main(why):
+    """True when a stale reason from stale_of() is "main moved" (not a moved PR head or a missing main sha)."""
+    pat = re.escape(STRINGS[LANG]["stale_main"]).replace(re.escape("{repo}"), ".+")
+    return bool(re.fullmatch(pat, why or ""))
+
+
+def has_pr(herd, s, ev):
+    """A slice has something to merge: a <slice>.repos AND a PR, in the event's prs field or as "#n"/a pull URL in
+    its status.json "pr". review_ok events of measurements, drafts and analyses (eval/* branches) carry none."""
+    if not os.path.exists(os.path.join(herd, f"{s}.repos")):
+        return False
+    if any(PR_REF.match(str(r)) for r in as_list(ev.get("prs"))):
+        return True
+    pr = read_status(os.path.join(herd, f"{s}.status.json")).get("pr") or ""
+    return bool(re.search(r"#\s*\d+|/pull/\d+", pr))
+
+
+def safe_repos(herd, s):
+    try:
+        return he.repos(herd, s)
+    except (OSError, ValueError):
+        return []
 
 
 def pr_refs(ev):
@@ -922,23 +1684,47 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
         c = clash_of(*members)
         d = {"clash": c if c.count(",") < 1 else str(c.count(",") + 1)}  # two or more: just the count, rows stay short
         reviewed = [m for m in members if ph[m] == "review_ok"]
+        # a result without a PR (measurement, draft, analysis on an eval/* branch) has nothing to merge: own lane
+        if reviewed and all(ph[m] in ("review_ok", "merged") for m in members) and \
+                not any(has_pr(herd, m, st[m]) for m in members):
+            branches = sorted({r["branch"] for m in members for r in safe_repos(herd, m)})
+            lanes["nopr"].append((5, name, "○", DIM, "", t("nopr") + (" · " + ", ".join(branches) if branches else ""),
+                                  tags, dict(d, thin=True)))
+            continue
         # herd-merge refuses while a stacked_on base outside the package is not merged: no merge word before that
         ext_bases = sorted({hdr(m).get("stacked_on") for m in members if hdr(m).get("stacked_on")
                             and hdr(m)["stacked_on"] not in members and phase(hdr(m)["stacked_on"]) != "merged"})
+        # the user's merge word, read from <herd>/GO.md (only when the herd keeps one)
+        go = ""
+        if has_go_file(herd):
+            go = t("go_ok") if all(has_merge_word(herd, m) for m in members if ph[m] != "merged") else t("go_wait")
+        conflict = [m for m in reviewed if reprobe_conflict(herd, m, ts_epoch(st[m].get("ts")))]
         if not waiting and not ext_bases and reviewed and all(ph[m] in ("review_ok", "merged") for m in members) \
-                and not any(stale.values()):
+                and not any(stale.values()) and not conflict:
             word = f"merge {members[0]}"
-            text = f"{t('reviewed')} ✓" + (f" · {t('word', w=word)}" if DETAIL else "") + \
+            text = f"{t('reviewed')} ✓" + (f" · {go}" if go else "") + \
+                (f" · {t('word', w=word)}" if DETAIL and go != t("go_ok") else "") + \
                 (" · " + " ".join(refs) if refs else "")
-            lanes["ready"].append((0, name, "✓", BLUE, "", text, tags, d))  # blue, like the numbers under Merged today
+            icon, col = ("⏸", YEL) if go == t("go_wait") else ("✓", BLUE)  # blue, like the numbers under Merged today
+            lanes["ready"].append((0, name, icon, col, "", text, tags, d))
             continue
         if any(ph[m] == "review_befund" for m in members):
             files = [os.path.basename(str(st[m].get("befunde_file") or "")) for m in members
                      if ph[m] == "review_befund" and st[m].get("befunde_file")]
             row = (0, name, "!", ORANGE, "", t("befund") + (": " + ", ".join(files) if files else ""), tags, d)
+        elif conflict:  # the re-probe could not merge onto main: only a worker can resolve it
+            row = (0, name, "✕", RED, "", t("conflict") + (" · " + " ".join(refs) if refs else ""), tags,
+                   dict(d, bold=True))
         elif any(stale.values()):
             why = next(v for v in stale.values() if v)
-            row = (1, name, "⟳", YEL, "", f"{t('stale')}: {why}", tags, d)
+            if is_stale_main(why):
+                # main moved under a conflict-free package: routine, the chain re-probes before it merges
+                chain = any(u["unit"].startswith("merge-") and u["unit"] != "merge-vorfahrt" for u in active_units())
+                text = t("main_routine" if chain else "main_due") + (f" · {go}" if go else "") + \
+                    (" · " + " ".join(refs) if refs else "")
+                row = (2, name, "⟳", DIM, "", text, tags, dict(d, thin=True))
+            else:
+                row = (1, name, "⟳", YEL, "", f"{t('stale')}: {why}", tags, d)
         elif any(ph[m] == "review_running" for m in members):
             # the loop restarts its own counter at 1 on every call: count the rounds from the slice's history
             # instead (findings so far + 1); a review straight after review_ok is the re-probe after a merge
@@ -962,11 +1748,11 @@ def v2_rows(herd, agents, limits, merged_evs, lanes):
 
 
 def merged_from_events(evs):
-    """{short repo: [n, ...]} of `merged` events with a local date of today."""
-    today, out = time.strftime("%Y-%m-%d"), {}
+    """{short repo: [n, ...]} of `merged` events since midnight DAY_TZ."""
+    mid, out = day_start()[0], {}
     for ev in evs:
         e = ts_epoch(ev.get("ts"))
-        if ev.get("phase") != "merged" or e is None or time.strftime("%Y-%m-%d", time.localtime(e)) != today:
+        if ev.get("phase") != "merged" or e is None or e < mid:
             continue
         for ref in as_list(ev.get("prs")):
             m = PR_REF.match(str(ref))
@@ -1289,26 +2075,123 @@ def header(w, herds, limits, reviews, quiet):
     return head
 
 
+def _load_offen(p):
+    """The "offen" list of the ask file, or None (missing, broken, not a list)."""
+    try:
+        with open(p, encoding="utf-8") as f:
+            offen = json.load(f).get("offen")
+        return offen if isinstance(offen, list) else None
+    except Exception:
+        return None
+
+
+def _load_groups(p):
+    """{gruppe: n} of the register's open_questions for every gruppe in GROUPS, or None."""
+    try:
+        with open(p, encoding="utf-8") as f:
+            qs = json.load(f).get("open_questions")
+        if not isinstance(qs, list):
+            return None
+        gs = [str(q.get("gruppe") or "").strip().lower() for q in qs if isinstance(q, dict)]
+        return {k: gs.count(k) for k, _ in GROUPS}
+    except Exception:
+        return None
+
+
+def ask_lines(w):
+    """What waits, by group (Satie 26.11.): "? Dev n · Infra n · Expert team n: <first question …>". Dev = the ask
+    file's "offen" entries (chat questions) + register open_questions with gruppe "dev", yellow/bold; Infra and
+    Expert team (de: Fachteam) dim. A group with 0 is left out, all 0: no line. The short first "offen" question
+    follows when there is one. Both files cached by mtime (the register is ~1.6 MB); a missing or broken file
+    counts 0. Too narrow: the question is shortened, then dropped, then Infra/Expert team go on a second line."""
+    offen = _by_mtime("ask", ASK_FILE, lambda p: _load_offen(p) if p else None) or []
+    groups = _by_mtime("register-groups", REGISTER, lambda p: _load_groups(p) if p else None) or {}
+    counts = [(k, t(key), (len(offen) if k == "dev" else 0) + (groups.get(k) or 0)) for k, key in GROUPS]
+    dev = f"{BOLD}{YEL}{counts[0][1]} {counts[0][2]}{RST}" if counts[0][2] > 0 else ""
+    rest = [f"{DIM}{label} {n}{RST}" for k, label, n in counts[1:] if n > 0]
+    if not dev and not rest:
+        return []
+    sep = f" {DIM}·{RST} "
+    lead = f"{BOLD}{YEL}?{RST} " if dev else f"{DIM}?{RST} "
+    head = lead + sep.join(([dev] if dev else []) + rest)
+    q = ""
+    if offen and os.environ.get("HERD_BOARD_ASK_PREVIEW"):  # Vorschau der ersten Frage nur auf Wunsch; sonst „ama“ (Satie 26.11.)
+        first = offen[0] if isinstance(offen[0], dict) else {}
+        q = " ".join(str(first.get("frage") or first.get("question") or first.get("id") or "").split())
+        q = q if len(q) <= ASK_SHORT else q[:ASK_SHORT].rstrip(" ,;:—-") + " …"
+    vis = lambda l: len(ANSI.sub("", l))
+    tail = lambda qq: f"{YEL}: {qq}{RST}" if qq.strip(" …") else ""
+
+    def fit(base, min_q):
+        """base + the question, shortened to the width; None when fewer than min_q characters of it would fit."""
+        if not q or vis(base + tail(q)) <= w:
+            return base + tail(q)
+        qq = q[:max(0, w - vis(base) - 4)].rstrip()
+        return base + tail(qq + " …") if len(qq) >= min_q else None
+
+    one = fit(head, ASK_SHORT_MIN)
+    if one is not None and vis(one) <= w:
+        return [one]
+    if dev and rest:  # too narrow: Dev (+ question) on the first line, Infra / Expert team on a dim second line
+        two = fit(lead + dev, 1)
+        return [two if two is not None and vis(two) <= w else lead + dev, sep.join(rest)]
+    return [fit(head, 1) or head]
+
+
+def wave_lines(w, wave, phases, limits, herd):
+    """The line under the header: current wave (GO.md), how many work / wait for a fix round / are in review, and
+    — when slices wait but none works — why nothing starts (memory, slots, load, unaccepted bases)."""
+    n = lambda ph: len(phases.get(ph, []))
+    work, fix, queued, review = n("working"), n("fix_queued"), n("queued"), n("review_running")
+    parts = [f"{BOLD}{t('wave', n=wave)}{RST}"] if wave is not None else []
+    parts.append(f"{CYAN if work else DIM}{t('n_work', n=work)}{RST}")
+    parts += [f"{ORANGE}{t('n_fix', n=fix)}{RST}"] if fix else []
+    parts += [f"{YEL}{t('n_queue', n=queued)}{RST}"] if queued else []
+    parts += [f"{MAG}{t('n_review', n=review)}{RST}"] if review else []
+    if (fix or queued) and not work:
+        why = ""
+        if limits and not limits.get("ok", True):
+            why = {"memory": t("mem_lt", g=min_free_gb(herd)), "load": t("w_load")}.get(limits.get("reason"),
+                                                                                       t("slots_full"))
+        elif he is not None:
+            waiting = [(h, s) for ph in ("queued", "fix_queued") for h, s in phases.get(ph, [])]
+            bases = [(he.task_header(h, s) or {}).get("stacked_on") for h, s in waiting]
+            done = {s for ph in AT_LEAST_ACCEPTED for _, s in phases.get(ph, [])}
+            if waiting and all(b and b not in done for b in bases):
+                why = t("base_open")
+        parts += [f"{RED}{t('idle_why', why=why)}{RST}"] if why else []
+    # one line; too narrow: the counts that are zero or secondary go first, the reason stays
+    sep = f" {DIM}·{RST} "
+    while len(parts) > 2 and len(ANSI.sub("", sep.join(parts))) > w:
+        parts.pop(-2 if (fix or queued) and not work else -1)
+    return [sep.join(parts)]
+
+
 def render(anchor, given):
     w = max(20, shutil.get_terminal_size((66, 40)).columns - 1)
     height = shutil.get_terminal_size((66, 40)).lines - 1
     agents = herdr_agents()
     herds = herd_dirs(anchor, given)
-    lanes = {"queue": [], "work": [], "ready": []}
+    lanes = {"queue": [], "work": [], "ready": [], "nopr": [], "runs": []}
     notes = []
     v2 = [h for h in herds if os.path.exists(os.path.join(h, "herd.events.jsonl"))]
     v1 = [h for h in herds if h not in v2 and os.path.exists(os.path.join(h, "herd.map"))]
     limits = herd_limits(v2[0], anchor) if v2 else None
-    all_evs, reviews = [], 0
+    all_evs, reviews, phases, waves = [], 0, {}, []
     if v2 and he is None:
         notes.append(f"{RED}⚠ {t('no_core')}{RST}")
     elif v2:
         per = {h: he.read(h) for h in v2}
         all_evs = [ev for evs in per.values() for ev in evs]
         merged_evs = [ev for ev in all_evs if ev.get("phase") == "merged"]
+        states = {}
         for h in v2:
-            st = v2_rows(h, agents, limits, merged_evs, lanes)
+            st = states[h] = v2_rows(h, agents, limits, merged_evs, lanes)
             reviews += sum(1 for ev in st.values() if ev["phase"] == "review_running")
+            for s, ev in st.items():
+                phases.setdefault(ev["phase"], []).append((h, s))
+            waves += [n for n in [current_wave(h)] if n is not None]
+        lanes["runs"] = unit_rows(v2, states)
     for h in v1:
         notes.append(f"{DIM}{os.path.basename(h.rstrip('/'))}: {t('v1')}{RST}")
         v1_rows(h, agents, lanes)
@@ -1316,7 +2199,8 @@ def render(anchor, given):
 
     last = last_human_input(anchor, agents) if anchor else None
     quiet = time.strftime('%H:%M', time.localtime(last)) if last and time.time() - last > 30 * 60 else ""
-    top = [header(w, herds, limits, reviews, quiet)] + notes
+    top = [header(w, herds, limits, reviews, quiet)] + ask_lines(w) + \
+        (wave_lines(w, max(waves) if waves else None, phases, limits, v2[0]) if v2 and he else []) + notes
     key = lambda r: (r[0], (r[7] or {}).get("sort", r[1]) if isinstance(r[7], dict) else r[1])
     for k in lanes:
         lanes[k].sort(key=key)
@@ -1327,27 +2211,64 @@ def render(anchor, given):
     def lane_title(k, col):
         return f"{BOLD}{col}{t('lane_' + k)}{RST}"
 
-    # merged today: events + the GitHub search, numbers in green, wrapped at whole numbers
-    merged = merged_from_events(all_evs)
-    for k, v in merged_today().items():
-        merged.setdefault(k, []).extend(v)
+    # merged today (since midnight DAY_TZ): events + the GitHub search, by repo ("api 450 451 · ui 203"), numbers
+    # in green, wrapped at whole numbers; a repo's group starts a new line rather than being split when it can
+    merged = {}
+    for src in (merged_from_events(all_evs), merged_today()):
+        for k, v in src.items():
+            merged.setdefault(repo_label(k), set()).update(v)
     merged_lines = []
-    nums = sorted({n for v in merged.values() for n in v})
-    if nums:
-        label = t("merged")
-        parts = textwrap.wrap(" ".join(map(str, nums)), max(10, w - len(label)))
-        merged_lines = [(f"{BOLD}{GREEN}{label}{RST}" if i == 0 else " " * len(label)) + f"{GREEN}{p}{RST}"
-                        for i, p in enumerate(parts)]
+    if any(merged.values()):
+        # title with the count on its own line, then one indented line per repo; runs of 3+ numbers fold to "a–b"
+        def spans(ns):
+            ns, out, i = sorted(ns), [], 0
+            while i < len(ns):
+                j = i
+                while j + 1 < len(ns) and ns[j + 1] == ns[j] + 1:
+                    j += 1
+                out += [f"{ns[i]}–{ns[j]}"] if j - i >= 2 else [str(n) for n in ns[i:j + 1]]
+                i = j + 1
+            return out
+        total = sum(len(v) for v in merged.values())
+        merged_lines = [f"{BOLD}{GREEN}{t('merged').strip()}{RST} {DIM}{total}{RST}"]
+        keys = sorted(merged, key=lambda k: (-len(merged[k]), k))
+        lw = max(len(k) for k in keys)
+        for k in keys:
+            ind = "  " + " " * (lw + 1)
+            cur = f"  {DIM}{k:<{lw}}{RST}"
+            filled = False
+            for wd in spans(merged[k]):
+                vis = len(ANSI.sub("", cur)) + 1 + len(wd)
+                if filled and vis > w:
+                    merged_lines.append(cur)
+                    cur, filled = ind + f"{GREEN}{wd}{RST}", True
+                else:
+                    cur, filled = f"{cur} {GREEN}{wd}{RST}", True
+            merged_lines.append(cur)
+        if height < 30:  # small panel: everything on as few lines as possible, repos separated by "·"
+            words = [f"{BOLD}{GREEN}{t('merged').strip()}{RST}"]
+            for i, k in enumerate(keys):
+                words += ([f"{DIM}·{RST}"] if i else []) + [f"{DIM}{k}{RST}"] + [f"{GREEN}{x}{RST}" for x in spans(merged[k])]
+            merged_lines, cur = [], ""
+            for wd in words:
+                if cur and len(ANSI.sub("", cur)) + 1 + len(ANSI.sub("", wd)) > w:
+                    merged_lines.append(cur)
+                    cur = "  " + wd
+                else:
+                    cur = f"{cur} {wd}" if cur else wd
+            merged_lines.append(cur)
 
     # fixed-size lanes first; the Working lane gets what is left. Over budget: queue gives way, then ready
     avail = height - len(top)
-    blocks = {"queue": compact(lanes["queue"]), "ready": compact(lanes["ready"])}
+    blocks = {k: compact(lanes[k]) for k in ("queue", "ready", "nopr")}
+    blocks["runs"] = [run_lines(r, w) for r in lanes["runs"]]
     work_min = 2 if lanes["work"] else 0
     size = lambda k: (1 + sum(len(b) for b in blocks[k])) if blocks[k] else 0
     foot_extra = (1 + len(merged_lines)) if merged_lines else 0
     limit = {k: size(k) for k in blocks}
-    over = sum(limit.values()) + foot_extra + work_min + (1 if blocks["ready"] else 0) - avail
-    for k in ("queue", "ready"):
+    gaps = sum(1 for k in ("runs", "ready", "nopr") if blocks[k])
+    over = sum(limit.values()) + foot_extra + work_min + gaps - avail
+    for k in ("nopr", "queue", "runs", "ready"):
         if over <= 0:
             break
         cut = min(over, max(0, limit[k] - 2))
@@ -1358,14 +2279,18 @@ def render(anchor, given):
         return [lane_title(k, col)] + fit(blocks[k], limit[k] - 1) if blocks[k] else []
 
     queue = lane("queue", YEL)  # under Working (user 29.10.2026: queue below the working workers)
+    runs = lane("runs", CYAN)   # merge chains and other long runs (systemd user units), under the queue
     body = []
-    foot = ([""] + lane("ready", GREEN) if blocks["ready"] else []) + ([""] + merged_lines if merged_lines else [])
+    foot = ([""] + lane("ready", GREEN) if blocks["ready"] else []) + \
+        ([""] + lane("nopr", DIM) if blocks["nopr"] else []) + ([""] + merged_lines if merged_lines else [])
 
     # Working lane, adaptive: the free height is shared evenly — one worker gets a full picture plus its step feed,
     # ten workers get one line each; a blank separator only when every worker has room to spare
     rows = lanes["work"]
-    free = avail - len(queue) - (1 if rows and queue else 0) - len(foot) - (1 if rows else 0)
+    free = avail - len(queue) - (1 if rows and queue else 0) - len(runs) - (1 if runs and (rows or queue) else 0) \
+        - len(foot) - (2 if rows else 0)
     if rows:
+        body.append("")  # Leerzeile unter dem Kopf, damit er sich absetzt (Satie 26.11.)
         body.append(lane_title("work", CYAN))
         sep = 1 if free // len(rows) >= 4 else 0
         shown = rows if len(rows) <= free else rows[:max(0, free - 1)]
@@ -1384,7 +2309,10 @@ def render(anchor, given):
             body.append(f"{DIM}+{len(rows) - len(shown)} {t('more')}{RST}")
     if queue:
         body += ([""] if rows else []) + queue
-    busy = any(lanes.values()) or bool(merged_lines)
+    if runs:
+        body += ([""] if rows or queue else []) + runs
+    busy = any(v for k, v in lanes.items() if k != "runs") or bool(merged_lines) or \
+        any(r[7].get("busy") for r in lanes["runs"])
     if not busy:
         body.append(f"{DIM}{t('idle')}{RST}")
     out = top + body
@@ -1472,6 +2400,19 @@ def open_panel(anchor, given):
 # Self-test (offline: herdr, gh, herd-limits and herd-clash are stubbed in-process)
 # ---------------------------------------------------------------------------------------------------------------
 
+def merged_block(lines):
+    """Merged today as rendered: the title line and the indented repo lines under it, joined by newlines."""
+    i = next((n for n, l in enumerate(lines) if l.startswith(t("merged").strip())), None)
+    if i is None:
+        return ""
+    out = [lines[i]]
+    for l in lines[i + 1:]:
+        if not l.startswith("  "):
+            break
+        out.append(l)
+    return "\n".join(out)
+
+
 def selftest():
     """Synthetic events for every lane and computed state, the v1 fallback, malformed status/event files, overflow
     and a failing repaint. Offline: no herdr, no gh, no ~/.cache writes. Exit 0 = pass."""
@@ -1546,6 +2487,10 @@ def selftest():
             for e in evs:
                 f.write(json.dumps(e) + "\n")
             f.write('{"slice": "torn", "phase": "work')          # a crash mid-write: skipped, not fatal
+        for e in evs:  # every slice with a PR has its <slice>.repos (a review_ok without both is "result, no PR")
+            if e.get("prs"):
+                repo = PR_REF.match(str(as_list(e["prs"])[0]))[1]
+                open(os.path.join(herd, f"{e['slice']}.repos"), "w").write(f"{repo} feat/{e['slice']} origin/main\n")
         for s, hdr in {"a-one": "together_with: a-two", "ok-api": "together_with: ok-ui",
                        "q-stack": "stacked_on: w-run", "ok-stk": "stacked_on: rr"}.items():
             open(os.path.join(herd, f"{s}.task.md"), "w").write(f"{hdr}\nmodel: claude-opus-5-5\n\n# task\n")
@@ -1581,7 +2526,8 @@ def selftest():
                  ("app", 30): sha("0"), ("web", 7): sha("d"), ("web", 8): sha("8"),
                  ("lib", 40): sha("1")}
         real = {k: g[k] for k in ("herdr_agents", "pr_state", "main_head", "merged_today", "find_tool",
-                                  "transcript_age", "procs_in", "LANG", "ORG", "ORGS")}
+                                  "transcript_age", "procs_in", "LANG", "ORG", "ORGS", "active_units", "CACHE",
+                                  "run_procs", "ASK_FILE", "REGISTER")}
         clash_json = json.dumps({"pairs": [{"repo": "app", "slices": ["w-run", "w-fix"], "files": ["src/x.py"]}]})
         g.update(ORG="acme", ORGS=["acme"], herdr_agents=lambda: agents,
                  pr_state=lambda repo, n, cwd=None: ("OPEN", heads.get((short_repo(repo), n))),
@@ -1590,6 +2536,10 @@ def selftest():
                  merged_today=lambda: {"app": [5]},
                  transcript_age=lambda cwd: 30 if cwd.endswith("still") else 0.5,
                  procs_in=lambda s, extra=(): [],
+                 active_units=lambda: [],                     # no systemd: no chains (stubbed again below)
+                 CACHE=os.path.join(tmp, "cache"),
+                 ASK_FILE=os.path.join(tmp, "no-ask.json"), REGISTER=os.path.join(tmp, "no-register.json"),
+                 # hermetic: the real files never reach the other checks
                  find_tool=lambda name: "/nonexistent/" + name)  # answers come from TOOL_CACHE below
         TOOL_CACHE.clear()
         TOOL_CACHE[("limits", herd)] = (now + 3600, parse_limits(
@@ -1659,15 +2609,16 @@ def selftest():
                       and t("w_base", b="rr") in row("ok-stk") and order[2] < lines.index(row("ok-stk")))
                 check(f"[{lang}] stale by PR head", row("st-head").startswith("⟳") and
                       t("stale_head", ref="app#30") in row("st-head"))
-                check(f"[{lang}] stale by a later merge", row("st-main").startswith("⟳") and
-                      t("stale_main", repo="lib") in row("st-main"))
-                check(f"[{lang}] stale by main moved", row("st-mv").startswith("⟳") and
-                      t("stale_main", repo="web") in row("st-mv"))
+                # main moved under a conflict-free package is routine: grey, "re-probe due" while no chain runs
+                check(f"[{lang}] stale by a later merge reads as routine", row("st-main").startswith("⟳") and
+                      t("main_due") in row("st-main") and t("stale") not in row("st-main"))
+                check(f"[{lang}] stale by main moved reads as routine", row("st-mv").startswith("⟳") and
+                      t("main_due") in row("st-mv"))
                 check(f"[{lang}] stale without a recorded main", row("st-nm").startswith("⟳") and
                       t("stale_nomain", repo="app") in row("st-nm"))
                 check(f"[{lang}] findings !", row("bf").startswith("!") and "bf.befunde-1234abc.md" in row("bf"))
-                check(f"[{lang}] merged today from events + search", any(l.startswith(t("merged").strip()) and
-                      " 5 " in f" {l} " and " 41" in f" {l} " for l in lines))
+                mb = merged_block(lines)
+                check(f"[{lang}] merged today from events + search", " 5" in f" {mb} " and " 41" in f" {mb} ")
                 check(f"[{lang}] parked and merged slices hidden", not row("pk") and not row("m-done"))
                 check(f"[{lang}] v1 fallback line + rows", t("v1") in text and "hbst-liste" in text and
                       f"{t('missing')} Tests, Doku" in text)
@@ -1686,6 +2637,8 @@ def selftest():
                   len(out) <= 15 and any(t("word", w="merge ok-api") in l for l in lines) and any(f" {t('more')}" in l for l in lines))
             check("small panel: footer pinned", any(l.startswith(t("merged").strip()) for l in lines[-2:]))
             os.environ.update(LINES="90")
+            newer_checks(herd, tmp, heads, sha, iso, now, strip, check)
+            ask_checks(herd, tmp, strip, check)
             for s in cases:  # reports written: the v1 footer reads every status file's "pr"
                 open(os.path.join(old, f"{s}.out.md"), "w").write("done\n")
             agents.update({f"w0:p{i}": {"agent_status": "idle", "cwd": wt_root} for i in range(len(cases))})
@@ -1720,6 +2673,223 @@ def selftest():
     g["DETAIL"] = detail_before
     print("herd-board selftest: " + (f"FAILED ({len(fails)})" if fails else "OK"))
     return 1 if fails else 0
+
+
+def newer_checks(herd, tmp, heads, sha, iso, now, strip, check):
+    """Self-test cases for the 26.11. additions: result without PR, conflict vs routine stale, merge chains, merge
+    word from GO.md, dead subagent registrations, the wave line and Merged today by repo since midnight Berlin."""
+    g = globals()
+    g["LANG"] = "de"
+    with open(he.path(herd), "a", encoding="utf-8") as f:
+        for e in ({"slice": "ev-only", "prs": None, "note": "Messung"},
+                  {"slice": "kf", "prs": ["app#50@" + sha("5")], "main": ["app@" + sha("c")]},
+                  {"slice": "ok-solo", "prs": ["app#60@" + sha("6")], "main": ["app@" + sha("c")]}):
+            for i, ph in enumerate(["queued", "working", "accepted", "review_running", "review_ok"]):
+                ev = {"ts": iso(900 - i), "slice": e["slice"], "phase": ph, "by": "orchestrator"}
+                if ph == "review_ok":
+                    ev.update({k: v for k, v in e.items() if v is not None and k != "slice"})
+                f.write(json.dumps(ev) + "\n")
+    heads.update({("app", 50): sha("5"), ("app", 60): sha("6")})
+    open(os.path.join(herd, "ev-only.repos"), "w").write("app eval/ev-only origin/main\n")
+    open(os.path.join(herd, "ev-only.status.json"), "w").write('{"pr": "kein PR (Messung)"}')
+    for s_ in ("kf", "ok-solo"):
+        open(os.path.join(herd, f"{s_}.repos"), "w").write(f"app feat/{s_} origin/main\n")
+    # kf: the last re-probe ended in a conflict; old: a conflict that a later run resolved
+    open(os.path.join(herd, "reprobe-kf.log"), "w").write(
+        "== kf\n   sauber (rot auf main und mit PR gleich: 0)\n== kf\n   KONFLIKT: src/x.py \n"
+        "kein review_ok (Exit 3) — Log: reprobe-kf.log\n")
+    open(os.path.join(herd, "reprobe-old.log"), "w").write("   KONFLIKT: a.py\n   sauber (rot auf main und mit PR gleich: 0)\n")
+    open(os.path.join(herd, "reprobe-gone.log"), "w").write("merge ok\nKONFLIKT im Kopf erwähnt\n")
+    open(os.path.join(herd, "merge-welle3.gescheitert"), "w").write("gone\n")
+    check("reprobe verdicts: last KONFLIKT, resolved later, gescheitert + KONFLIKT, log older than review_ok",
+          reprobe_conflict(herd, "kf") and not reprobe_conflict(herd, "old") and reprobe_conflict(herd, "gone")
+          and not reprobe_conflict(herd, "kf", since=time.time() + 3600) and not reprobe_conflict(herd, "none"))
+    # GO.md: a merge word for ok-solo in one sentence, a refusal for st-mv in the next; the last wave line says 4
+    open(os.path.join(herd, "GO.md"), "w").write(
+        "- 2026-11-25T11:18Z „merge“. = MERGE-Wort für app #60 (ok-solo, Kopf 6666666) nach reprobe; "
+        "START-Go für Welle 3 (Nr. 1). Kein Merge-Wort für st-mv.\n"
+        "- 2026-11-25T23:15Z „go“. = START-Go für Welle 4 (ok-api, ok-ui). KEIN Merge-Wort für Welle 4 (ok-api).\n"
+        "- 2026-11-25T23:20Z „hm“. KEIN ausdrückliches Merge-Wort für ok-ui, Welle 2.\n")
+    check("merge word heuristic", has_merge_word(herd, "ok-solo") and not has_merge_word(herd, "st-mv")
+          and not has_merge_word(herd, "ok-api") and not has_merge_word(herd, "ok") and current_wave(herd) == 2)
+    g["active_units"] = lambda: []
+    lines = strip(render("", [herd])[0])
+    row = lambda s_: next((l for l in lines if re.match(rf"^\S+ {re.escape(s_)}(\s|$)", l)), "")
+    check("no merge word yet: ⏸ waits for it, merge word ✓ where given, no chain: re-probe due",
+          row("ok-api+ok-ui").startswith("⏸") and t("go_wait") in row("ok-api+ok-ui")
+          and row("ok-solo").startswith("✓") and t("main_due") in row("st-mv"))
+    with open(os.path.join(herd, "GO.md"), "a", encoding="utf-8") as f:
+        f.write("- 2026-11-26T05:49Z Nutzer: „merge welle 4“. = START-Go und MERGE-Wort für Welle 4 (ok-api, ok-ui, "
+                "Welle 3 Rest) je Slice nach review_ok.\n")
+    gv = os.path.join(tmp, "gv")
+    gv_cmd = lambda nn: ('/bin/bash -c H=x; until herd-phase $H --state | grep -qE "^q-one +merged"; do sleep 60; done; '
+                         f"exec {gv}/runde.sh --runde {nn} --stand main")
+    g["active_units"] = lambda: [{"unit": "merge-welle3", "since": now - 600}, {"unit": "merge-vorfahrt", "since": now - 9e5},
+                                 {"unit": "gv-runde-05", "since": now - 9000, "cmd": gv_cmd("05")},
+                                 {"unit": "gv-runde-06", "since": now - 60, "cmd": gv_cmd("06")},
+                                 {"unit": "recalc-x", "since": now - 900}]
+    hm = lambda ago: time.strftime("%H:%M", time.gmtime(now - ago))
+    # the chain: slice list in its script, at kf for 12 min; earlier runs of the suite kind took 20, 25 and 30 min
+    open(os.path.join(herd, "merge-welle3.sh"), "w").write('H=x\nW8="m-done kf ok-solo w-fix rr gone"\n')
+    open(os.path.join(herd, "merge-welle3.log"), "w").write(f"== ok-api {hm(5000)}Z\nfertig ok-api {hm(4990)}Z\n"
+                                                           f"== kf {hm(720)}Z\n== kf {hm(720)}\n")
+    open(os.path.join(herd, "merge-welle2.log"), "w").write("".join(
+        f"== {s_} {hm(a)}Z\nfertig {s_} {hm(a - d * 60)}Z\n"
+        for s_, a, d in (("ok-api", 9000, 20), ("st-head", 7000, 25), ("st-nm", 5000, 30))))
+    g["run_procs"] = lambda: [(["bash", "/x/reprobe.sh", herd, "kf"], now - 600)]
+    _FILE_CACHE.clear()
+    lines = strip(render("", [herd])[0])
+    row = lambda s_: next((l for l in lines if re.match(rf"^\S+ {re.escape(s_)}(\s|$)", l)), "")
+    lane_at = lambda k: next((i for i, l in enumerate(lines) if l == t("lane_" + k)), -1)
+    check("result without PR: own grey lane, branch shown, not under Ready to merge",
+          lane_at("nopr") > lane_at("ready") > -1 and row("ev-only").startswith("○ ev-only")
+          and t("nopr") in row("ev-only") and "eval/ev-only" in row("ev-only")
+          and lines.index(row("ev-only")) > lane_at("nopr"))
+    check("merge conflict: red ✕, worker needed", row("kf").startswith("✕ kf") and t("conflict") in row("kf"))
+    check("routine stale with a chain running: chain re-probes", t("main_routine") in row("st-mv"))
+    check("merge word ✓ / ⏸ per package", row("ok-solo").startswith("✓") and t("go_ok") in row("ok-solo")
+          and row("ok-api+ok-ui").startswith("✓") and t("go_ok") in row("ok-api+ok-ui"))
+    with open(os.path.join(herd, "GO.md"), "a", encoding="utf-8") as f:
+        f.write("- 2026-11-26T06:00Z Korrektur: Welle 5 (ok-solo) läuft neu. KEIN Merge-Wort für Welle 5.\n")
+    # gv round 05: case a done after 46.5 min, b running for 10 min, c to come; round 06 still waits for q-one
+    os.makedirs(os.path.join(gv, "runden", "05"))
+    hms = lambda ago: time.strftime("%H:%M:%S", time.gmtime(now - ago))
+    open(os.path.join(gv, "runden", "05", "runde.log"), "w").write(
+        f"[{hms(7800)}Z] Runde 05, Fälle: a b c, parallel 1, Speicher frei 1 MB\n"
+        f"[{hms(7790)}Z] Fall a (lernen): Treiber startet\n[{hms(5000)}Z] Fall a: Vergleich beendet mit Code 0\n"
+        f"[{hms(600)}Z] Fall b (lernen): Treiber startet\n")
+    # recalc-x: the first project is done, the second has run for 3 min
+    open(os.path.join(herd, "recalc-x.sh"), "w").write(
+        'for p in demo_kronos_merzdorf gs_ga_ber_drv_ruhrstrasse_bauteil_d_2_etagen_afb; do\n'
+        '  gst-staging-prep "$p" neu-berechnen; done\n')
+    open(os.path.join(herd, "recalc-x.log"), "w").write(
+        f"main abc {hm(900)}Z, warte auf Staging\nStaging auf abc {hm(800)}Z\n== demo_kronos_merzdorf {hm(700)}Z\n"
+        f"running | enrich | …\ndone | done | Fertig: 13 Zeilen\n"
+        f"== gs_ga_ber_drv_ruhrstrasse_bauteil_d_2_etagen_afb {hm(180)}Z\nrunning | populate | …\n")
+    lines = strip(render("", [herd])[0])
+
+    def block(label):
+        """A Chains & runs row with its continuation lines, joined."""
+        i = next((i for i, l in enumerate(lines) if re.match(rf"^[»▸] {re.escape(label)}( |$)", l)), None)
+        if i is None:
+            return ""
+        out = [lines[i]]
+        for l in lines[i + 1:]:
+            if not l.startswith("  "):
+                break
+            out.append(l.strip())
+        return " ".join(out)
+    ch = block(t("u_wave", n=3))
+    check("chain row: n/m merged, slice now + test run n/~median min, next review_ok, waiting with reason, failed "
+          "with reason",
+          ch.startswith("» " + t("u_wave", n=3) + " · ") and t("n_merged", n=1, m=6) in ch
+          and re.search(r"jetzt kf:? Testlauf 1[23]/~25 min", ch) is not None and t("next", s="ok-solo") in ch
+          and t("wait_for", x=f"w-fix ({t('r_fix')}), rr ({t('r_review')})") in ch
+          and t("failed_list", x="gone (KONFLIKT)") in ch and lane_at("runs") > -1)
+    check("merge-vorfahrt hidden while it holds nothing", not block(t("u_vorfahrt")))
+    gvr = block(t("u_gv", n=5))
+    check("gv round: case i/n, since, ETA from the mean case length",
+          gvr.startswith("▸ " + t("u_gv", n=5)) and t("gv_case", i=2, n=3, f="b") in gvr
+          and t("gv_since", d="2 h 10") in gvr and "fertig ~" in gvr)
+    check("gv round before its log: waits for the gate slice", t("gate", s="q-one") in block(t("u_gv", n=6)))
+    rc = block(t("u_recalc_st"))
+    check("recalc: project done / running with minutes, long slug shortened",
+          t("rc_done", p="demo_kronos_merzdorf") in rc and re.search(r"ruhrstrasse_bauteil läuft \([34] min\)", rc))
+    open(os.path.join(herd, "merge-vorfahrt.angehalten"), "w").write(f"{os.getpid()}\n999999999\n")
+    g["run_procs"] = lambda: [(["/usr/bin/python3", "/x/herd-merge", ".", "kf", "--go", "w"], now - 30)]
+    lines = strip(render("", [herd])[0])
+    check("merge step: herd-merge running -> mergt", t("now_at", s="kf", what=t("step_merge")) in block(t("u_wave", n=3)))
+    check("merge-vorfahrt shown while it holds live test runs, names the chain's slice",
+          t("vf_holds", n=1, s="kf") in block(t("u_vorfahrt")))
+    g["run_procs"] = lambda: [(["bash", "/x/suite-slot.sh", "bash", "/x/reprobe.sh", herd, "kf"], now - 120)]
+    lines = strip(render("", [herd])[0])
+    check("slot step: reprobe waits for a test slot", t("step_slot", d="2 min") in block(t("u_wave", n=3)))
+    check("durations in plain words", dur(720) == "12 min" and dur(7800) == "2 h 10" and dur(3900) == "1 h 05")
+    g["run_procs"] = lambda: []
+    check("wave line: largest N of the last wave line + counts", t("wave", n=5) in lines[1]
+          and t("n_work", n=0).split()[1] in lines[1])
+    wl = lambda lim, ph: ANSI.sub("", wave_lines(200, 5, ph, lim, herd)[0])
+    q = {"queued": [(herd, "q-one")]}
+    check("idle reason: memory threshold, slots full; none while a worker runs",
+          t("mem_lt", g=min_free_gb(herd)) in wl({"ok": False, "reason": "memory", "used": 1, "max": 6}, q)
+          and t("slots_full") in wl({"ok": False, "reason": "slot", "used": 6, "max": 6}, q)
+          and t("idle_why", why="").strip(": ") not in wl(None, q)
+          and t("idle_why", why="").strip(": ") not in wl({"ok": False, "reason": "slot"}, dict(q, working=[(herd, "w")])))
+    # dead subagent registrations go, live ones stay
+    reg = os.path.join(g["CACHE"], "x_y.agents")
+    os.makedirs(reg, exist_ok=True)
+    for name, age_min in (("dead", 200), ("live", 1)):
+        tr = os.path.join(tmp, f"agent-{name}.jsonl")
+        open(tr, "w").write("{}\n")
+        os.utime(tr, (now - age_min * 60, now - age_min * 60))
+        open(os.path.join(reg, f"agent-{name}.jsonl"), "w").write(f"{name} agent\n{tr}\n")
+    labels = [r[1] for r in agent_rows("x:y")]
+    check("dead subagent (> AGENT_DEAD_MIN) unregistered, live one shown",
+          labels == ["live agent"] and not os.path.exists(os.path.join(reg, "agent-dead.jsonl")))
+    # merged today: since midnight Europe/Berlin, grouped by repo
+    mid = day_start()[0]
+    evs = [{"phase": "merged", "ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(mid + d)), "prs": [f"gst-gen-api#{n}"]}
+           for d, n in ((-120, 1), (120, 2))]
+    check("merged today counts from midnight Berlin", list(merged_from_events(evs).values()) == [[2]])
+    check("repo labels", repo_label("gst-gen-api") == "api" and repo_label("artenschutz-ingest") == "ingest"
+          and repo_label("acme/web") == "web")
+    ml = merged_block(lines)
+    check("merged today: one line per repo under the title", re.search(r"^ +app +5$", ml, re.M) is not None
+          and re.search(r"^ +lib +41$", ml, re.M) is not None)
+    g["active_units"] = lambda: []
+
+
+def ask_checks(herd, tmp, strip, check):
+    """Self-test for the "waits, by group" line (Satie 26.11.): Dev = chat questions + register gruppe dev, Infra and
+    Expert team / Fachteam from the register, zero groups left out, short first question, no person names, a
+    narrow panel, nothing waiting, broken files."""
+    os.environ["HERD_BOARD_ASK_PREVIEW"] = "1"  # die Prüfungen decken die Vorschau mit ab; im Betrieb ist sie aus
+    g = globals()
+    ask, reg = os.path.join(tmp, "beim-nutzer.json"), os.path.join(tmp, "register.json")
+    g.update(ASK_FILE=ask, REGISTER=reg)
+    long_q = "3× L = 0 in Merzdorf (Großes Mausohr, Bechsteinfledermaus, Braunes Langohr) zurücksetzen?"
+    json.dump({"offen": [{"id": "a", "seit": "2026-11-26", "frage": long_q},
+                         {"id": "b", "seit": "2026-11-26", "frage": "Leiste auf Deutsch?"}]}, open(ask, "w"))
+    json.dump({"open_questions": [{"id": "q-1", "gruppe": "dev", "owner": "Satie"},
+                                  {"id": "q-2", "gruppe": " Dev ", "owner": "Mariusz"},
+                                  {"id": "q-3", "gruppe": "infra", "owner": "Mariusz (Satie 05.11.)"},
+                                  {"id": "q-4", "gruppe": "fachteam", "owner": "Yvonne"},
+                                  {"id": "q-5", "gruppe": "fachteam"}, {"id": "q-6", "owner": "Mariusz"},
+                                  "junk"]}, open(reg, "w"))
+    names = lambda ls: any(n in l for l in ls for n in ("Mariusz", "Satie", "Yvonne"))
+    try:
+        for lang in ("de", "en"):
+            g["LANG"] = lang
+            lines = strip(render("", [herd])[0])
+            want = f"? Dev 4 · Infra 1 · {t('g_fach')} 2: 3× L = 0 in Merzdorf"
+            check(f"[{lang}] group line right under the header: Dev 4 (2 chat + 2 register), Infra 1, "
+                  f"{t('g_fach')} 2, short first question …, no person names",
+                  len(lines) > 1 and lines[1].startswith(want) and lines[1].endswith(" …") and long_q not in lines[1]
+                  and not names(lines[1:3]))
+        g["LANG"] = "de"
+        raw = ask_lines(200)[0]
+        check("only the Dev part is yellow, Infra/Fachteam dim",
+              f"{BOLD}{YEL}Dev 4{RST}" in raw and f"{DIM}Infra 1{RST}" in raw and f"{DIM}Fachteam 2{RST}" in raw)
+        out = ask_lines(40)
+        check("narrow: Infra/Fachteam on their own dim line, both within width",
+              len(out) == 2 and all(len(ANSI.sub("", l)) <= 40 for l in out)
+              and ANSI.sub("", out[0]).startswith("? Dev 4") and ANSI.sub("", out[1]) == "Infra 1 · Fachteam 2")
+        json.dump({"offen": [{"id": "a", "frage": "Kurz?"}]}, open(ask, "w"))
+        check("one chat question: short question whole",
+              ANSI.sub("", ask_lines(200)[0]) == "? Dev 3 · Infra 1 · Fachteam 2: Kurz?")
+        json.dump({"offen": []}, open(ask, "w"))
+        json.dump({"open_questions": [{"id": "q-3", "gruppe": "infra"}, {"id": "q-6", "owner": "Mariusz"}]},
+                  open(reg, "w"))
+        out = ask_lines(100)
+        check("no chat question, only Infra: groups with 0 left out, no question, all dim",
+              [ANSI.sub("", l) for l in out] == ["? Infra 1"] and YEL not in "".join(out))
+        json.dump({"open_questions": [{"id": "q-6", "owner": "Mariusz"}]}, open(reg, "w"))
+        check("nothing waiting in any group: no line", ask_lines(100) == [])
+        open(ask, "w").write("{broken")
+        open(reg, "w").write("[]")
+        check("broken / foreign files: no line, no crash", ask_lines(100) == [])
+    finally:
+        g["LANG"] = "de"
 
 
 render_impl = render
