@@ -78,7 +78,11 @@ ln -s "$T/fake/systemctl" "$T/notools/systemctl"; ln -s "$T/fake/herdr" "$T/noto
 export HOME="$T/home" NO_COLOR=1 COLUMNS=110 LINES=60 HERD_BOARD_LANG=de HERD_BOARD_ORG=acme \
   HERD_BOARD_REPOS="api=acme-api" \
   HERD_BOARD_ASK="$T/none.json" HERD_BOARD_REGISTER="$T/none.json" HERD_BOARD_GV_LOOP="$T/no-gv"
-BASEPATH="$(dirname "$PY"):/usr/bin:/bin"
+# bash and coreutils for the fakes' shebangs and bodies from wherever the host keeps them (/usr/bin, or the Nix store)
+BASEPATH="$(dirname "$PY"):$(dirname "$(command -v bash)"):$(dirname "$(command -v cat)"):/usr/bin:/bin"
+for t in herd-clash herd-limits; do  # the "tool absent" checks need these off BASEPATH
+  if PATH="$BASEPATH" command -v "$t" >/dev/null; then echo "BASEPATH leaks host $t: $(PATH="$BASEPATH" command -v "$t")" >&2; exit 1; fi
+done
 board() { HERD_BOARD_DETAIL=1 PATH="$T/fake:$BASEPATH" "$T/board/herd-board" "$@"; }  # detailed rows; --selftest covers the simple view
 phase() { PATH="$T/fake:$BASEPATH" "$T/board/herd-phase" "$@" >/dev/null; }
 

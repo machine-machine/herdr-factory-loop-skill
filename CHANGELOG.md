@@ -19,6 +19,9 @@ adheres to [Semantic Versioning](https://semver.org/).
 - herd-board: Merged today — title with the count in brackets, then every PR number on its own
   (no `a–b` ranges), grouped by repo; small panels on one line. Dead agents are dropped.
 
+### Fixed
+- tests/board: the board test finds bash and coreutils where the host keeps them, so it passes on NixOS too (was 20/32).
+
 ## [3.0.0-alpha.2] - 2026-11-27
 
 The full track becomes runnable for domain work: triage sends an intent with a domain word to it,
