@@ -11,6 +11,18 @@ adheres to [Semantic Versioning](https://semver.org/).
   `.m2herd/rules/domain-words.txt` (whole word, `word*` prefix, umlaut/ß folded, `#` comments)
   routes to the **full** track; the `triaged` event carries `domain_words` on a hit. The file is
   read as UTF-8 with an optional BOM; an unreadable or non-UTF-8 file fails triage naming the file.
+- **evolve attempt record** — proposals carry `model`, `agent`, `predicted: <kind>@<where>`,
+  `outcome: pending|fixed|missed`, `outcome_run` and `applied_at`; `evolve analyze` folds applied
+  proposals to `fixed`/`missed` when the analyzed run dispatched their slice after the apply and
+  ran it to `done`/`failed` (first analyzed qualifying run decides, never rewritten); lesson lines
+  gain a `[model=… agent=…]` tag; `evolve proposals` prints
+  an `outcome` column (`-` for legacy proposals, which are never folded). `LESSONS.md` stays
+  accepted-only. Contract v2.1 §5, SKILL.md §17. Shape after SIM (arXiv 2611.18856).
+- **re-dispatch archives the previous attempt** — `m2herd-up` dispatch into an existing
+  `runs/<run>/slices/<slice>/` moves `status.json`, `failures.json`, `report.md`, `prompt.md` to
+  `attempts/<dispatched_at>/`, so the slice dir (and the outcome fold) describes only the current
+  attempt; `failures.json` passthrough signatures keep `at`, and the fold ignores entries dated
+  at or before the grading dispatch. Contract §1.
 
 ## [3.0.0-alpha] - 2026-11-03
 

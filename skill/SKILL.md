@@ -1257,14 +1257,15 @@ human-written compounding index; `.m2herd/runs/` is per-repo machine telemetry.)
 
 ```bash
 m2herd evolve analyze  [--run <id|latest|current>]  # classify boring failure signatures (failed state, missing/empty report, missing status.json, failures.json passthrough) → signatures/<run-id>.json + one skeleton proposal per signature
-m2herd evolve proposals                             # list: id, kind, risk, status
+m2herd evolve proposals                             # list: id, kind, risk, status, outcome
 m2herd evolve show <id>                             # print the proposal file
 m2herd evolve apply <id> [--ack-repo]               # conservative apply ladder, below
 m2herd evolve reject <id>                           # frontmatter status → rejected
 ```
 
 Proposals live at `.m2herd/evolver/proposals/<id>.md` (id `<YYYY-MM-DD>-<run-id>-<slug>`,
-ordinal suffix on collision) with frontmatter `id/run/kind/target/risk/status/lesson` and
+ordinal suffix on collision) with frontmatter `id/run/kind/target/risk/status/lesson` plus the
+**attempt record** `model/agent/predicted/outcome/outcome_run/applied_at` and
 sections Observed failure / Proposed change / Rollback / Acceptance check. The **apply
 ladder** is deliberately conservative: kind `memory`/`policy` append the lesson line to
 `LESSONS.md` (append-once by proposal-id); kind `template` additionally requires the target
@@ -1277,6 +1278,18 @@ the `<!-- === M2HERD:LIVE === -->` marker. `m2herd resume` prints the last 5 as
 one sentence to every worker's pointer message when live lessons exist: *"Also read <path to
 LESSONS.md> (accepted factory lessons) before starting."* The task file itself is never
 mutated. Workers start every run pre-warned by everything the factory has already learned.
+
+**Lessons are attempts, and the next run grades them.** Every proposal records `predicted:
+<kind>@<where>` (the signature it claims will not recur) and the `model`/`agent` that produced
+the evidence; the lesson line carries that tag (`[model=… agent=…]`), and `apply` stamps
+`applied_at`. When `evolve analyze` sees a run that dispatched the slice after that stamp and
+ran it to `done`/`failed`, it folds each *applied* proposal to `outcome: fixed` (signature
+absent) or `missed` (it recurred) and stamps `outcome_run`; the first such run that is analyzed
+decides and a decided outcome is never rewritten. Runs that skip the slice, leave it in flight,
+or dispatched it before the apply leave it `pending`. `evolve proposals` shows the column, so
+the orchestrator sees which lessons held and which did not — including under a different
+model — without `LESSONS.md` ever carrying failures (CONTRACT-m2herd.md v2.1 §5; the shape
+follows SIM, arXiv 2611.18856).
 
 ### 18. eval/loop — objective optimization
 

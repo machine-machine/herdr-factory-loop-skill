@@ -269,7 +269,7 @@ m2herd gist    [--dir P] [--push]         # one-paragraph gist; --push pipes to 
 m2herd next    [--dir P]                  # mechanical priority walk; exactly one "NEXT: " line
 m2herd config  list|get|set [--dir P] …   # .m2herd/settings.json with defaults + validation (bad enum → exit 2)
 m2herd evolve  analyze [--dir P] [--run <id|latest|current>]   # signatures + skeleton proposals from a run
-m2herd evolve  proposals [--dir P]        # list: id, kind, risk, status
+m2herd evolve  proposals [--dir P]        # list: id, kind, risk, status, outcome
 m2herd evolve  show <id> [--dir P]        # print a proposal
 m2herd evolve  apply <id> [--dir P] [--ack-repo]   # apply ladder (repo kind never auto-edits)
 m2herd evolve  reject <id> [--dir P]      # proposal status → rejected
