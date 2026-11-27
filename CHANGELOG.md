@@ -14,6 +14,11 @@ adheres to [Semantic Versioning](https://semver.org/).
   gain a `[model=… agent=…]` tag; `evolve proposals` prints
   an `outcome` column (`-` for legacy proposals, which are never folded). `LESSONS.md` stays
   accepted-only. Contract v2.1 §5, SKILL.md §17. Shape after SIM (arXiv 2611.18856).
+- **re-dispatch archives the previous attempt** — `m2herd-up` dispatch into an existing
+  `runs/<run>/slices/<slice>/` moves `status.json`, `failures.json`, `report.md`, `prompt.md` to
+  `attempts/<dispatched_at>/`, so the slice dir (and the outcome fold) describes only the current
+  attempt; `failures.json` passthrough signatures keep `at`, and the fold ignores entries dated
+  at or before the grading dispatch. Contract §1.
 
 ## [3.0.0-alpha] - 2026-11-03
 

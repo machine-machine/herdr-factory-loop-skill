@@ -269,6 +269,7 @@ recommendation, never an auto-edit. Templates for both trees ship under
     report.md                           # verbatim copy of .m2herd/dispatch/<slice>.out.md at collect time
     status.json                         # see schema below
     failures.json                       # OPTIONAL, orchestrator- or worker-authored; array, may be absent
+    attempts/<dispatched_at>/           # previous attempts of this slice (re-dispatch moves the four files above here)
 ```
 
 - run-id format: `r-<UTC %Y%m%dT%H%M%SZ>`, e.g. `r-20260705T120000Z`.
@@ -278,6 +279,11 @@ recommendation, never an auto-edit. Templates for both trees ship under
   rotation subcommand in the MVP.
 - `run.json.goal` is copied from `.m2herd/overview.json .goal`; `base` is the dispatch `--base`.
 - `slices[]` in `run.json` is appended (dedup) on each dispatch. jq whole-file rewrites only.
+- Re-dispatch of a slice inside the same run (`down --slice S`, dispatch again) MUST first move
+  the existing `status.json`, `failures.json`, `report.md` and `prompt.md` to
+  `attempts/<previous dispatched_at>/` (suffix `-<pid>` on collision, `unknown-<ts>` when the old
+  status has no `dispatched_at`), so `slices/<slice>/` always describes the current attempt
+  (§5 grades lessons on it). `attempts/` is history only: nothing reads it.
 
 `status.json` schema:
 ```json
@@ -301,8 +307,9 @@ else left `0`.
 `failures.json` entry schema (deliberately boring):
 ```json
 [{"kind":"test_failure","severity":"high|medium|low","where":"slice:<slice>",
-  "evidence":"<one line>","suspected_cause":"<one line>"}]
+  "evidence":"<one line>","suspected_cause":"<one line>","at":"<ISO-8601 UTC, OPTIONAL>"}]
 ```
+`m2herd-up.sh` stamps `at` on the entries it writes; worker-authored entries may omit it.
 
 ### §2. Evolver state (`.m2herd/evolver/`, owned by `m2herd.sh evolve`)
 
@@ -316,7 +323,8 @@ else left `0`.
 
 - proposal-id format: `<YYYY-MM-DD>-<run-id>-<slug>` (slug = kebab, from the signature kind + slice).
 - signature object: `{"kind","severity","where","evidence","confidence":"high|medium|low","source":"mechanical|failures.json","model","agent"}`
-  (`model`/`agent` copied from the slice's `status.json`, `null` when absent — never fabricated; §5).
+  (`model`/`agent` copied from the slice's `status.json`, `null` when absent — never fabricated; §5);
+  `failures.json`-sourced signatures also carry `at` (the entry's, `null` when the entry has none).
 - `LESSONS.md` uses the standard m2herd marker convention (`<!-- === M2HERD:LIVE === -->`);
   accepted lessons are appended below the marker as
   `- [<UTC ts>] (<proposal-id>) [model=<m> agent=<a>] <lesson text>` (`-` when unknown; §5).
@@ -417,12 +425,17 @@ never mutates live text. Mechanical, no LLM, idempotent, `.m2herd/`-only.
   in-flight slice proves nothing), and `applied_at` strictly before that slice's `status.json
   .dispatched_at` (lessons are read per dispatch, so a worker dispatched after the lesson
   existed is the one that could have read it — best-effort: the pointer is composed a few
-  seconds before `dispatched_at` is stamped; a re-dispatch inside the same run qualifies;
-  equal timestamps do not). If R's signatures contain the same `kind` + `where`, set `outcome: missed`, else
-  `outcome: fixed`; set `outcome_run: R`. Anything that does not qualify stays `pending`.
+  seconds before `dispatched_at` is stamped; a re-dispatch inside the same run qualifies
+  because §1 moves the earlier attempt to `attempts/`; equal timestamps do not). If R's
+  signatures contain the same `kind` + `where`, set `outcome: missed`, else `outcome: fixed`;
+  set `outcome_run: R`. A `failures.json`-sourced signature whose `at` is at or before the
+  slice's `dispatched_at` is an earlier attempt's evidence and does not count (an entry
+  without `at` counts: it cannot be dated). Anything that does not qualify stays `pending`.
   The first qualifying run that is *analyzed* decides and a decided outcome is never
   rewritten, so with several qualifying runs the verdict follows analysis order. The check
-  and both writes run under one lock on the proposal file. `predicted` splits on its last
+  and both writes run under one lock on the proposal file; `outcome_run` is written before
+  `outcome`, so a crash between the two leaves a re-gradable `pending`, never a verdict
+  without a run. `predicted` splits on its last
   `@` (`kind` may contain `@`; `where` is always `slice:<slice>`). Proposals without an
   `outcome:` key (pre-amendment) are never folded and show `-` in listings; no migration.
 - **Lesson line** `- [<ts>] (<id>) [model=<m> agent=<a>] <lesson>`: `apply` copies the tag

@@ -713,10 +713,23 @@ trace_dispatch_write() { # trace_dispatch_write <slice> <runner:pane|headless> <
   local slice="$1" runner="$2" model="$3" branch="$4" wt="$5" session="${6:-}"
   local dir="$REPO/.m2herd/runs/$RUN_ID/slices/$slice" task="$REPO/.m2herd/dispatch/$slice.task.md"
   if [ "$DRY_RUN" -eq 1 ]; then
-    plan "mkdir -p $dir; cp $task -> $dir/prompt.md; write $dir/status.json (state=spawned runner=$runner${model:+ model=$model}${session:+ session=$session})"
+    plan "mkdir -p $dir; archive a previous attempt -> $dir/attempts/<dispatched_at>/; cp $task -> $dir/prompt.md; write $dir/status.json (state=spawned runner=$runner${model:+ model=$model}${session:+ session=$session})"
     return 0
   fi
   mkdir -p "$dir" || { trace_warn "mkdir $dir failed"; return 1; }
+  # Re-dispatch into an existing slice dir (down --slice S, then dispatch again): move the
+  # previous attempt aside so the dir describes ONLY the current attempt — the evolver's
+  # outcome fold grades a lesson on this dir's failures/report (CONTRACT §1, §5).
+  if [ -f "$dir/status.json" ]; then
+    local prev f; prev="$(jq -r '.dispatched_at // empty' "$dir/status.json" 2>/dev/null || true)"
+    prev="${prev:-unknown-$(utc_now)}"
+    [ -d "$dir/attempts/$prev" ] && prev="$prev-$$"
+    mkdir -p "$dir/attempts/$prev" || trace_warn "mkdir $dir/attempts/$prev failed"
+    for f in status.json failures.json report.md prompt.md; do
+      [ -e "$dir/$f" ] || continue
+      mv "$dir/$f" "$dir/attempts/$prev/$f" 2>/dev/null || trace_warn "archive $dir/$f -> attempts/$prev/ failed"
+    done
+  fi
   cp "$task" "$dir/prompt.md" 2>/dev/null || trace_warn "copy $task -> $dir/prompt.md failed"
   jq -n --arg slice "$slice" --arg agent "$AGENT" --arg runner "$runner" --arg model "$model" \
         --arg branch "$branch" --arg wt "$wt" --arg ts "$(utc_now)" --arg sess "$session" \
@@ -2633,6 +2646,27 @@ selftest() {
   done
   [ "$comm" = sleep ] || { echo "selftest FAIL: recorded pid $pid belongs to '$comm', not sleep" >&2; exit 1; }
   kill "$pid" 2>/dev/null || true
+
+  # trace_dispatch_write: a re-dispatch archives the previous attempt (status/failures/report/prompt)
+  # under attempts/<old dispatched_at>/ so the slice dir describes only the current attempt (CONTRACT §1/§5)
+  local saved_repo="$REPO" saved_run="$RUN_ID" saved_agent="$AGENT" sdir
+  REPO="$td/repo"; RUN_ID="r-20990101T000000Z"; AGENT="codex"
+  mkdir -p "$REPO/.m2herd/dispatch"; printf 'task\n' > "$REPO/.m2herd/dispatch/s1.task.md"
+  sdir="$REPO/.m2herd/runs/$RUN_ID/slices/s1"
+  trace_dispatch_write s1 pane "" wip/x "$td/wt" || { echo 'selftest FAIL: trace_dispatch_write (first dispatch)' >&2; exit 1; }
+  [ -f "$sdir/status.json" ] && [ ! -d "$sdir/attempts" ] || { echo 'selftest FAIL: first dispatch must not create attempts/' >&2; exit 1; }
+  jq '.dispatched_at="2099-01-01T00:00:00Z"' "$sdir/status.json" > "$sdir/.s" && mv "$sdir/.s" "$sdir/status.json"
+  printf '[{"kind":"verify_failed","where":"slice:s1","at":"2099-01-01T00:05:00Z"}]' > "$sdir/failures.json"
+  printf 'old report\n' > "$sdir/report.md"
+  trace_dispatch_write s1 pane "" wip/x "$td/wt" || { echo 'selftest FAIL: trace_dispatch_write (re-dispatch)' >&2; exit 1; }
+  [ ! -e "$sdir/failures.json" ] && [ ! -e "$sdir/report.md" ] || { echo 'selftest FAIL: re-dispatch left the previous attempt in the slice dir' >&2; exit 1; }
+  [ -f "$sdir/attempts/2099-01-01T00:00:00Z/failures.json" ] && [ -f "$sdir/attempts/2099-01-01T00:00:00Z/status.json" ] \
+    && [ -f "$sdir/attempts/2099-01-01T00:00:00Z/report.md" ] && [ -f "$sdir/attempts/2099-01-01T00:00:00Z/prompt.md" ] \
+    || { echo 'selftest FAIL: previous attempt not archived under attempts/<dispatched_at>/' >&2; exit 1; }
+  jq -e '.state=="spawned" and .dispatched_at!="2099-01-01T00:00:00Z"' "$sdir/status.json" >/dev/null \
+    || { echo 'selftest FAIL: re-dispatch status.json is not a fresh attempt' >&2; exit 1; }
+  [ -f "$sdir/prompt.md" ] || { echo 'selftest FAIL: re-dispatch did not write prompt.md' >&2; exit 1; }
+  REPO="$saved_repo"; RUN_ID="$saved_run"; AGENT="$saved_agent"
   echo 'm2herd-up selftest: PASS'
 }
 

@@ -1256,7 +1256,7 @@ human-written compounding index; `.m2herd/runs/` is per-repo machine telemetry.)
 
 ```bash
 m2herd evolve analyze  [--run <id|latest|current>]  # classify boring failure signatures (failed state, missing/empty report, missing status.json, failures.json passthrough) → signatures/<run-id>.json + one skeleton proposal per signature
-m2herd evolve proposals                             # list: id, kind, risk, status, outcome (pending|fixed|missed, - for legacy)
+m2herd evolve proposals                             # list: id, kind, risk, status, outcome
 m2herd evolve show <id>                             # print the proposal file
 m2herd evolve apply <id> [--ack-repo]               # conservative apply ladder, below
 m2herd evolve reject <id>                           # frontmatter status → rejected

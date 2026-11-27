@@ -45,7 +45,9 @@ slice after the lesson's `applied_at` (that worker could read it) and ran it to
 `done`/`failed`. The predicted `<kind>@<where>` recurs → `outcome: missed`, absent →
 `outcome: fixed`, stamped with `outcome_run: R`. The first qualifying run that is analyzed
 decides; a decided outcome is never rewritten; a run that skipped the slice, left it
-in flight, or predates the apply leaves `pending`.
+in flight, or predates the apply leaves `pending`. A re-dispatch of the slice inside the
+same run qualifies: `m2herd-up` moves the earlier attempt to `attempts/<dispatched_at>/`
+first, and a `failures.json` entry dated at or before the grading dispatch is ignored.
 Proposals without an `outcome:` key are never folded (`-` in `evolve proposals`).
 `LESSONS.md` never carries outcomes — read them with `m2herd.sh evolve proposals`.
 

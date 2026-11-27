@@ -1587,9 +1587,15 @@ fold_one_locked() {
   dispatched_at="$(jq -r '.dispatched_at // empty' "$status_f" 2>/dev/null || true)"
   # ISO-8601 UTC sorts lexically; equal timestamps do not qualify (strictly before)
   { [ -n "$dispatched_at" ] && [ "$applied_at" \< "$dispatched_at" ]; } || return 0
-  if jq -e --arg k "$kind" --arg w "$where" 'any(.[]?; .kind==$k and .where==$w)' "$sig_file" >/dev/null 2>&1
-  then set_frontmatter_locked "$f" outcome missed && set_frontmatter_locked "$f" outcome_run "$run_id" && echo missed
-  else set_frontmatter_locked "$f" outcome fixed && set_frontmatter_locked "$f" outcome_run "$run_id" && echo fixed; fi
+  # A failures.json entry stamped at/before this dispatch belongs to an EARLIER attempt in the same
+  # slice dir (pre-archive trace dirs; m2herd-up now moves them to attempts/). An entry without
+  # `at` cannot be dated and counts as recurrence. Mechanical signatures describe the dir as it is now.
+  # outcome_run is written before outcome: a crash in between leaves `pending`, which the next
+  # analyze re-grades and overwrites; the reverse order would leave a decided outcome with no run.
+  if jq -e --arg k "$kind" --arg w "$where" --arg d "$dispatched_at" \
+       'any(.[]?; .kind==$k and .where==$w and ((.at // "") == "" or .at > $d))' "$sig_file" >/dev/null 2>&1
+  then set_frontmatter_locked "$f" outcome_run "$run_id" && set_frontmatter_locked "$f" outcome missed && echo missed
+  else set_frontmatter_locked "$f" outcome_run "$run_id" && set_frontmatter_locked "$f" outcome fixed && echo fixed; fi
 }
 
 # ---------- metrics.json: what the declared topology actually cost -------------
@@ -1725,7 +1731,7 @@ evolve_analyze() {
     fi
     if [ -s "$fail_f" ]; then
       sigs="$(jq --slurpfile extra "$fail_f" --arg m "$model" --arg a "$agent" \
-        '. + ([$extra[0][]? | {kind, severity, where, evidence, confidence:"high", source:"failures.json",
+        '. + ([$extra[0][]? | {kind, severity, where, evidence, at, confidence:"high", source:"failures.json",
                model:(if $m=="" then null else $m end), agent:(if $a=="" then null else $a end)}])' <<<"$sigs")"
     fi
   done <<<"$slices"
@@ -2378,7 +2384,7 @@ selftest() {
   [ "$("$self" config get workers.agent --dir "$td")" = "claude" ] || fail "config get: invalid settings.json should return defaults"
   step config set workers.agent codex --dir "$td"
   [ "$("$self" config get workers.agent --dir "$td")" = "codex" ] || fail "config set/get workers.agent round-trip"
-  "$self" config list --dir "$td" | grep -q '^\* workers.agent=codex$' || fail "config list did not mark non-default workers.agent"
+  grep -q '^\* workers.agent=codex$' <<<"$("$self" config list --dir "$td")" || fail "config list did not mark non-default workers.agent"
   rc=0; "$self" config set workers.agent bogus --dir "$td" >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 2 ] || fail "config set invalid enum exited $rc (want 2)"
   step config set workers.max 5 --dir "$td"
@@ -2414,16 +2420,16 @@ selftest() {
   # next STEER case: live steering outranks coach-intent (done_when is still empty here)
   printf 'PAUSE everything please\n' >> "$td/.m2herd/inbox/STEER.md"
   # "triage" when m2herd-steer is on PATH (an installed machine), "drain" without it (CI)
-  "$self" next --dir "$td" | grep -qE '^NEXT: (drain|triage) steering' || fail "next(steer): want drain/triage-steering"
+  grep -qE '^NEXT: (drain|triage) steering' <<<"$("$self" next --dir "$td")" || fail "next(steer): want drain/triage-steering"
   keep_head "$td/.m2herd/inbox/STEER.md" > "$td/.m2herd/inbox/STEER.md.new" \
     && mv "$td/.m2herd/inbox/STEER.md.new" "$td/.m2herd/inbox/STEER.md"
 
   # next case 2: done_when empty → coach the intent
-  "$self" next --dir "$td" | grep -q '^NEXT: coach the intent' || fail "next(2): want coach-the-intent"
+  grep -q '^NEXT: coach the intent' <<<"$("$self" next --dir "$td")" || fail "next(2): want coach-the-intent"
   jq '.done_when="demo context refiled and synced"' "$ov" > "$ov.tmp" && mv "$ov.tmp" "$ov"
   # next case 3: loose content below the NOTES.md marker → refile
   step note --dir "$td" "loose note awaiting refile"
-  "$self" next --dir "$td" | grep -q '^NEXT: refile notes' || fail "next(3): want refile-notes"
+  grep -q '^NEXT: refile notes' <<<"$("$self" next --dir "$td")" || fail "next(3): want refile-notes"
   step refile --dir "$td" --area demo
 
   # drift: mutate the tree → --check exits 3; plain sync repairs; --check then exits 0
@@ -2433,7 +2439,7 @@ selftest() {
   rc=0; "$self" sync --check --dir "$td" >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 3 ] || fail "sync --check exited $rc on drifted tree (want 3)"
   # next case 1: drift outranks everything
-  "$self" next --dir "$td" | grep -q '^NEXT: context drift' || fail "next(1): want context-drift"
+  grep -q '^NEXT: context drift' <<<"$("$self" next --dir "$td")" || fail "next(1): want context-drift"
   step sync --dir "$td"
   rc=0; "$self" sync --check --dir "$td" >/dev/null 2>&1 || rc=$?
   [ "$rc" -eq 0 ] || fail "sync --check exited $rc after repair (want 0)"
@@ -2449,37 +2455,37 @@ selftest() {
   step sync --dir "$td"
   jq -e '.areas[] | select(.name=="extra") | .status=="archived"' "$ov" >/dev/null \
     || fail "sync lost the archived status"
-  "$self" status --dir "$td" | grep -q '^archived: extra' || fail "status missing archived one-line footer"
-  "$self" resume --dir "$td" | grep -q 'archived: extra'  || fail "resume missing archived one-line footer"
+  grep -q '^archived: extra' <<<"$("$self" status --dir "$td")" || fail "status missing archived one-line footer"
+  grep -q 'archived: extra' <<<"$("$self" resume --dir "$td")"  || fail "resume missing archived one-line footer"
 
   # gist: goal + ACTIVE areas only; --push degrades to print without $M2HERD_GIST_CMD
-  "$self" gist --dir "$td" | grep -q "selftest goal" || fail "gist missing the goal"
-  if "$self" gist --dir "$td" | grep -q -- '- extra:'; then fail "gist lists an archived area"; fi
-  "$self" gist --dir "$td" | grep -q -- '- demo:' || fail "gist missing the active area line"
+  grep -q "selftest goal" <<<"$("$self" gist --dir "$td")" || fail "gist missing the goal"
+  if grep -q -- '- extra:' <<<"$("$self" gist --dir "$td")"; then fail "gist lists an archived area"; fi
+  grep -q -- '- demo:' <<<"$("$self" gist --dir "$td")" || fail "gist missing the active area line"
   M2HERD_GIST_CMD='cat > /dev/null' "$self" gist --dir "$td" --push >/dev/null \
     || fail "gist --push via \$M2HERD_GIST_CMD"
-  "$self" gist --dir "$td" --push | grep -q 'M2HERD_GIST_CMD not set' \
+  grep -q 'M2HERD_GIST_CMD not set' <<<"$("$self" gist --dir "$td" --push)" \
     || fail "gist --push without \$M2HERD_GIST_CMD should print with a note"
 
   # next case 5: open_questions outrank the steady state
   jq '.open_questions=["which DB backs the demo area?"]' "$ov" > "$ov.tmp" && mv "$ov.tmp" "$ov"
-  "$self" next --dir "$td" | grep -q '^NEXT: resolve open question: which DB' || fail "next(5): want open-question"
+  grep -q '^NEXT: resolve open question: which DB' <<<"$("$self" next --dir "$td")" || fail "next(5): want open-question"
   jq '.open_questions=[]' "$ov" > "$ov.tmp" && mv "$ov.tmp" "$ov"
   # next case 5b: a failed worker outranks open questions and the steady state
   jq '.workers=[{slice:"sliceX", state:"failed", pane_id:"-", branch:"wip/m2herd-sliceX"}]' "$ov" > "$ov.tmp" && mv "$ov.tmp" "$ov"
-  "$self" next --dir "$td" | grep -q '^NEXT: worker sliceX failed — read dispatch/sliceX.out.md' \
+  grep -q '^NEXT: worker sliceX failed — read dispatch/sliceX.out.md' <<<"$("$self" next --dir "$td")" \
     || fail "next(5b): want failed-worker line"
   jq '.workers=[]' "$ov" > "$ov.tmp" && mv "$ov.tmp" "$ov"
   # next case 6: nothing pending → compare and dispatch/finish; exactly one NEXT line
-  "$self" next --dir "$td" | grep -q '^NEXT: compare RESUME.md against goal/done_when' || fail "next(6): want compare/dispatch"
+  grep -q '^NEXT: compare RESUME.md against goal/done_when' <<<"$("$self" next --dir "$td")" || fail "next(6): want compare/dispatch"
   [ "$("$self" next --dir "$td" | wc -l | tr -d ' ')" = "1" ] || fail "next printed more than one line"
 
   # next budget rung: fresh bridge file at 80% outranks everything below drift
   printf '{"used_pct": 80, "budget": 384000}\n' > "$td/bridge/claude-ctx-selftest.json"
-  "$self" next --dir "$td" | grep -q '^NEXT: context at 80% — offload: m2herd refile --area ' \
+  grep -q '^NEXT: context at 80% — offload: m2herd refile --area ' <<<"$("$self" next --dir "$td")" \
     || fail "next(budget): want context-offload line at 80%"
   rm -f "$td/bridge/claude-ctx-selftest.json"
-  "$self" next --dir "$td" | grep -q '^NEXT: compare RESUME.md' || fail "next(budget): rung did not clear with the bridge file"
+  grep -q '^NEXT: compare RESUME.md' <<<"$("$self" next --dir "$td")" || fail "next(budget): rung did not clear with the bridge file"
 
   # pane_obs: the distinction the reap bug turned on. A pane that is still in
   # the ROOM but no longer runs an agent is NOT gone — it is exactly the
@@ -2563,7 +2569,7 @@ selftest() {
   if printf '%s\n' "$doc_out" | grep -q 'FAIL'; then fail "doctor reported FAIL on a healthy fixture"; fi
 
   # evolve: graceful no-op before any run trace exists
-  "$self" evolve analyze --dir "$td" | grep -qi 'no run traces' || fail "evolve analyze: missing graceful no-runs message"
+  grep -qi 'no run traces' <<<"$("$self" evolve analyze --dir "$td")" || fail "evolve analyze: missing graceful no-runs message"
 
   # evolve: fabricate .m2herd/runs/CURRENT + one run with one failed slice + failures.json
   local run_id run_dir sig_file prop_count prop_count2 pid_memory pid_other lesson_count
@@ -2594,11 +2600,11 @@ selftest() {
   prop_count2="$(ls "$td/.m2herd/evolver/proposals"/*.md 2>/dev/null | wc -l | tr -d ' ')"
   [ "$prop_count2" = "$prop_count" ] || fail "evolve analyze re-run duplicated proposals ($prop_count -> $prop_count2)"
 
-  "$self" evolve proposals --dir "$td" | grep -q "$run_id" || fail "evolve proposals: missing run-derived ids"
+  grep -q "$run_id" <<<"$("$self" evolve proposals --dir "$td")" || fail "evolve proposals: missing run-derived ids"
 
   pid_memory="$(basename "$(ls "$td/.m2herd/evolver/proposals"/*.md | head -1)" .md)"
   pid_other="$(basename "$(ls "$td/.m2herd/evolver/proposals"/*.md | sed -n '2p')" .md)"
-  "$self" evolve show "$pid_memory" --dir "$td" | grep -q '^kind: memory' || fail "evolve show: missing expected frontmatter"
+  grep -q '^kind: memory' <<<"$("$self" evolve show "$pid_memory" --dir "$td")" || fail "evolve show: missing expected frontmatter"
 
   # validation: traversal proposal ids are rejected before any path is resolved
   rc=0; "$self" evolve show '../../evolver/LESSONS' --dir "$td" >/dev/null 2>&1 || rc=$?
@@ -2633,6 +2639,8 @@ selftest() {
   # outcome fold — helper fabricates a later run with one slice in a given state
   local run2="r-20991231T000001Z" run3="r-20991231T000002Z" run4="r-20991231T000003Z" pid3 legacy_pid
   local run5="r-20991231T000004Z" run6="r-20991231T000005Z" run7="r-20991231T000006Z" run8="r-20991231T000007Z" pid5
+  local run9="r-20991231T000008Z" run10="r-20991231T000009Z" run11="r-20991231T000010Z" run12="r-20991231T000011Z"
+  local run13="r-20991231T000012Z" run14="r-20991231T000013Z" pid9 pid11 pid13
   fab_run() { # fab_run <run-id> <slice> <state> [dispatched_at]  — default dispatched_at is far in the
     local d="$td/.m2herd/runs/$1"; mkdir -p "$d/slices/$2"   #   future, so an applied lesson qualifies for grading
     jq -n --arg id "$1" --arg ts "$(ts)" --arg s "$2" '{run_id:$id, created_at:$ts, goal:"g", base:"main", slices:[$s]}' > "$d/run.json"
@@ -2657,7 +2665,7 @@ selftest() {
   # (b) run3's own proposal, applied, is folded to fixed by run4 where the slice is clean
   pid3="$(basename "$(ls "$td/.m2herd/evolver/proposals"/*"$run3"*.md | head -1)" .md)"
   grep -q '^model: gpt-5$' "$td/.m2herd/evolver/proposals/$pid3.md" || fail "evolve analyze: proposal lacks model from status.json"
-  grep -q '^outcome: pending$' "$td/.m2herd/evolver/proposals/$pid3.md" || fail "fold: a run must not fold its own proposals"
+  grep -q '^outcome: pending$' "$td/.m2herd/evolver/proposals/$pid3.md" || fail "fold: an unapplied proposal must not be graded"
   step evolve apply "$pid3" --dir "$td"
   grep -qF "($pid3) [model=gpt-5 agent=codex] " "$td/.m2herd/evolver/LESSONS.md" || fail "evolve apply: lesson tag missing model/agent values"
   grep -q '^applied_at: 20[0-9][0-9]-' "$td/.m2herd/evolver/proposals/$pid3.md" || fail "evolve apply: applied_at not stamped"
@@ -2705,8 +2713,43 @@ selftest() {
   grep -q "^outcome_run: $run8$" "$td/.m2herd/evolver/proposals/$pid5.md" || fail "fold: qualifying later run did not grade the lesson"
   grep -q '^outcome: fixed$' "$td/.m2herd/evolver/proposals/$pid5.md" || fail "fold: clean later run must mark fixed"
   grep -q '^outcome: pending$' "$td/.m2herd/evolver/proposals/$pid_blank.md" || fail "fold: blank applied_at must never be graded"
-  "$self" evolve proposals --dir "$td" | grep -q "^$pid3 .* applied *fixed$" || fail "evolve proposals: outcome column missing 'fixed'"
-  "$self" evolve proposals --dir "$td" | grep -q "^$legacy_pid .* applied *-$" || fail "evolve proposals: legacy proposal must show '-' outcome"
+  # (h) stale evidence: a failures.json entry dated at/before the grading dispatch belongs to an
+  #     earlier attempt in the same slice dir and must NOT count as recurrence → fixed
+  fab_run "$run9" "demo-slice" "failed"
+  step evolve analyze --run "$run9" --dir "$td"
+  pid9="$(basename "$(ls "$td/.m2herd/evolver/proposals"/*"$run9"*.md | head -1)" .md)"
+  step evolve apply "$pid9" --dir "$td"
+  fab_run "$run10" "demo-slice" "done"
+  printf '[{"kind":"slice_failed","severity":"high","where":"slice:demo-slice","evidence":"attempt 1","at":"2098-12-31T23:59:59Z"}]' \
+    > "$td/.m2herd/runs/$run10/slices/demo-slice/failures.json"
+  step evolve analyze --run "$run10" --dir "$td"
+  grep -q '^outcome: fixed$' "$td/.m2herd/evolver/proposals/$pid9.md" || fail "fold: failures.json entry dated before the dispatch must not count as recurrence"
+  grep -q '^at: ' "$td/.m2herd/evolver/signatures/$run10.json" && fail "signatures: at must be a JSON field, not frontmatter"
+  jq -e 'any(.[]; .source=="failures.json" and .at=="2098-12-31T23:59:59Z")' "$td/.m2herd/evolver/signatures/$run10.json" >/dev/null \
+    || fail "evolve analyze: failures.json passthrough must keep the at timestamp"
+  # (h2) a failures.json entry dated AFTER the dispatch is this attempt's evidence → missed
+  fab_run "$run11" "demo-slice" "failed"
+  step evolve analyze --run "$run11" --dir "$td"
+  pid11="$(basename "$(ls "$td/.m2herd/evolver/proposals"/*"$run11"*.md | head -1)" .md)"
+  step evolve apply "$pid11" --dir "$td"
+  fab_run "$run12" "demo-slice" "done"
+  printf '[{"kind":"slice_failed","severity":"high","where":"slice:demo-slice","evidence":"attempt 2","at":"2099-01-01T00:00:01Z"}]' \
+    > "$td/.m2herd/runs/$run12/slices/demo-slice/failures.json"
+  step evolve analyze --run "$run12" --dir "$td"
+  grep -q '^outcome: missed$' "$td/.m2herd/evolver/proposals/$pid11.md" || fail "fold: failures.json entry dated after the dispatch must count as recurrence"
+  # (h3) an entry without `at` (worker-authored, schema field optional) cannot be dated → counts
+  fab_run "$run13" "demo-slice" "failed"
+  step evolve analyze --run "$run13" --dir "$td"
+  pid13="$(basename "$(ls "$td/.m2herd/evolver/proposals"/*"$run13"*.md | head -1)" .md)"
+  step evolve apply "$pid13" --dir "$td"
+  fab_run "$run14" "demo-slice" "done"
+  printf '[{"kind":"slice_failed","severity":"high","where":"slice:demo-slice","evidence":"undated"}]' \
+    > "$td/.m2herd/runs/$run14/slices/demo-slice/failures.json"
+  step evolve analyze --run "$run14" --dir "$td"
+  grep -q '^outcome: missed$' "$td/.m2herd/evolver/proposals/$pid13.md" || fail "fold: undated failures.json entry must count as recurrence"
+  grep -q "^outcome_run: $run14$" "$td/.m2herd/evolver/proposals/$pid13.md" || fail "fold: outcome_run missing on undated-entry verdict"
+  grep -q "^$pid3 .* applied *fixed$" <<<"$("$self" evolve proposals --dir "$td")" || fail "evolve proposals: outcome column missing 'fixed'"
+  grep -q "^$legacy_pid .* applied *-$" <<<"$("$self" evolve proposals --dir "$td")" || fail "evolve proposals: legacy proposal must show '-' outcome"
   unset -f fab_run
 
   local resume_out; resume_out="$("$self" resume --dir "$td")"
@@ -2740,7 +2783,7 @@ selftest() {
   )
   step eval draft --dir "$td" --slice loopdemo --cmd 'case "$(cat score.txt 2>/dev/null)" in good) jq -n "{score:0.9,passed:1,failed:0,hard_failed:false}" ;; bad) jq -n "{score:0.2,passed:0,failed:1,hard_failed:false}" ;; *) jq -n "{score:0.0,passed:0,failed:1,hard_failed:false}" ;; esac'
   step eval approve --dir "$td" --slice loopdemo
-  "$self" eval status --dir "$td" --slice loopdemo | grep -q '^approved:' || fail "eval status missing approved eval"
+  grep -q '^approved:' <<<"$("$self" eval status --dir "$td" --slice loopdemo)" || fail "eval status missing approved eval"
   step loop run --dir "$td" --slice loopdemo --rounds 2 --attempt-cmd 'if [ "$M2HERD_LOOP_ROUND" = "1" ]; then printf "bad\n" > score.txt; else printf "good\n" > score.txt; fi'
   local loop_run_id loop_json
   loop_run_id="$(ls -1d "$td/.m2herd/loops"/l-* 2>/dev/null | sed 's#.*/##' | tail -1)"
@@ -2749,7 +2792,7 @@ selftest() {
   jq -e '(.state=="scored") and (.best_round==2) and (.best_score==0.9)
          and (.rounds|length==2) and ([.rounds[] | select(.round==1) | .score][0] == 0.2)' \
     "$loop_json" >/dev/null || { cat "$loop_json" >&2; fail "loop run scoring assert"; }
-  "$self" loop status --dir "$td" --run "$loop_run_id" | grep -q '^best: 2 score=0.9' \
+  grep -q '^best: 2 score=0.9' <<<"$("$self" loop status --dir "$td" --run "$loop_run_id")" \
     || fail "loop status missing best-round summary"
   step loop promote --dir "$td" --run "$loop_run_id"
   [ "$(cat "$td/score.txt")" = "good" ] || fail "loop promote did not apply the best patch"
@@ -2790,7 +2833,7 @@ selftest() {
 
   # a declared cycle is LEGAL (every edge carries max_traversals) — note, not error
   printf '%s\n' '{"schema_version":1,"nodes":[{"id":"a","kind":"slice"},{"id":"b","kind":"slice"}],"edges":[{"from":"a","to":"b","type":"depends_on","max_traversals":2},{"from":"b","to":"a","type":"depends_on","max_traversals":1}]}' > "$gf"
-  "$self" graph lint --dir "$td" | grep -q '^note: declared cycle' || fail "graph lint: declared cycle should be a note"
+  grep -q '^note: declared cycle' <<<"$("$self" graph lint --dir "$td")" || fail "graph lint: declared cycle should be a note"
   "$self" graph lint --dir "$td" >/dev/null || fail "graph lint: declared cycle should exit 0"
   # overlapping owns WITH a depends_on path between the nodes is legal (serialized)
   printf '%s\n' '{"schema_version":1,"nodes":[{"id":"a","kind":"slice","owns":["x.sh"]},{"id":"b","kind":"slice","owns":["x.sh"]}],"edges":[{"from":"b","to":"a","type":"depends_on"}]}' > "$gf"
@@ -2810,9 +2853,9 @@ selftest() {
            {"from": "tuiwork",  "to": "docs",   "type": "depends_on"}]}
 GRAPHEOF
   "$self" graph lint --dir "$td" >/dev/null || fail "graph lint: valid two-tier graph should exit 0"
-  "$self" graph lint --dir "$td" | grep -qF 'edge: dispatch depends on engine (engine must finish first)' \
+  grep -qF 'edge: dispatch depends on engine (engine must finish first)' <<<"$("$self" graph lint --dir "$td")" \
     || fail "graph lint: missing the depends_on sentence form"
-  "$self" graph lint --dir "$td" | grep -q '^note: node gate1 is kind gate' \
+  grep -q '^note: node gate1 is kind gate' <<<"$("$self" graph lint --dir "$td")" \
     || fail "graph lint: gate node should be noted as never dispatched"
   jq '.workers=[{slice:"engine",state:"done",pane_id:"-",branch:"wip/m2herd-engine"},
                 {slice:"tuiwork",state:"working",pane_id:"-",branch:"wip/m2herd-tuiwork"}]' \
@@ -2822,10 +2865,10 @@ GRAPHEOF
   gout="$("$self" graph next --dir "$td")"
   [ "$gout" = "dispatch
 docs" ] || fail "graph next(two-tier) printed '$gout' (want 'dispatch\\ndocs')"
-  "$self" graph show --dir "$td" | grep -q '^level 0$' || fail "graph show: missing topological levels"
-  "$self" graph show --dir "$td" | grep -q 'engine .*done' || fail "graph show: missing live state from workers[]"
-  "$self" graph show --dir "$td" | grep -q 'gate1 .*\[not dispatchable: gate\]' || fail "graph show: gate not marked"
-  "$self" graph show --dir "$td" | grep -q 'depends on -> engine' || fail "graph show: missing dependency line"
+  grep -q '^level 0$' <<<"$("$self" graph show --dir "$td")" || fail "graph show: missing topological levels"
+  grep -q 'engine .*done' <<<"$("$self" graph show --dir "$td")" || fail "graph show: missing live state from workers[]"
+  grep -q 'gate1 .*\[not dispatchable: gate\]' <<<"$("$self" graph show --dir "$td")" || fail "graph show: gate not marked"
+  grep -q 'depends on -> engine' <<<"$("$self" graph show --dir "$td")" || fail "graph show: missing dependency line"
   # graph show is a pure renderer (same doctrine as dashboard)
   before="$(find "$td/.m2herd" -type f -exec cksum {} + | sort)"
   "$self" graph show --dir "$td" >/dev/null || fail "graph show exited non-zero"
@@ -2834,7 +2877,7 @@ docs" ] || fail "graph next(two-tier) printed '$gout' (want 'dispatch\\ndocs')"
   [ "$before" = "$after" ] || fail "graph show/next WROTE to .m2herd/ (both are read-only)"
   # absent graph.json: lint is a no-op note (§1), show/next are exit-2 errors naming the file
   mv "$gf" "$gf.away"
-  "$self" graph lint --dir "$td" | grep -q '^note: no .m2herd/graph.json' || fail "graph lint(absent): want a note"
+  grep -q '^note: no .m2herd/graph.json' <<<"$("$self" graph lint --dir "$td")" || fail "graph lint(absent): want a note"
   grc=0; "$self" graph show --dir "$td" >/dev/null 2>&1 || grc=$?
   [ "$grc" -eq 2 ] || fail "graph show(absent graph.json) exited $grc (want 2)"
   grc=0; gout="$("$self" graph next --dir "$td" 2>&1 >/dev/null)" || grc=$?
