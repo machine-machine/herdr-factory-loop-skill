@@ -150,6 +150,9 @@ See [`skill/SKILL.md`](./skill/SKILL.md) for the full reference and
   identity, TELOS and personal memory. Installed per human, never per repo; answers *who and why*.
   m2herd stays the repo fabric and answers *where the work stands*. They must not share a hook
   slot without checking the conflict table.
+- **Hostile fetching — Scrapling** (fleet skill `scrapling-fleet`, nix-m2o): TLS impersonation and a
+  real browser for pages that block `curl`. Use when a page 403s, 429s or needs JS; extract to a
+  file, never into the context.
 
 [`CONTRACT-m2herd.md`](./CONTRACT-m2herd.md) is the historical build contract the m2herd herd
 was built against (v2.0 era + amendments) — where it disagrees with `skill/SKILL.md` ≥ 2.6.0,

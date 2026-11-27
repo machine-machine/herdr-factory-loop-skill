@@ -6,6 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.0-alpha.6] - 2026-11-27
+
+### Added
+- **Fetching row in the stack map** — hostile pages (403/429/JS) go through the `scrapling-fleet`
+  skill in nix-m2o: TLS impersonation, real browser, extract to a file. `curl` stays the default
+  for JSON and plain pages.
+
 ## [3.0.0-alpha.5] - 2026-11-27
 
 LifeOS is a fleet default, documented where an agent will find it: the personal layer answers
