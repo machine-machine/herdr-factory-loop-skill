@@ -2858,7 +2858,7 @@ def ask_checks(herd, tmp, strip, check):
                   open(reg, "w"))
         out = ask_lines(100)
         check("no chat question, only Infra: groups with 0 left out, no question, all dim",
-              [ANSI.sub("", l) for l in out] == ["? Infra 1"] and YEL not in "".join(out))
+              [ANSI.sub("", l) for l in out] == ["? Infra 1"] and (not YEL or YEL not in "".join(out)))  # NO_COLOR: YEL is ""
         json.dump({"open_questions": [{"id": "q-6", "owner": "Mariusz"}]}, open(reg, "w"))
         check("nothing waiting in any group: no line", ask_lines(100) == [])
         open(ask, "w").write("{broken")

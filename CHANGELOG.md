@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- herd-board: **parked questions by group** — a line under the header counts what waits:
+  the ask file's `offen` entries (`HERD_BOARD_ASK`, chat questions) plus the register's
+  `open_questions[].gruppe` (`HERD_BOARD_REGISTER`) as Dev / Together / Infra / Expert team, never
+  by person; `HERD_BOARD_ASK_PREVIEW=1` adds the first question. SKILL.md §16.7 "Parked questions".
+- herd-board: German board (`HERD_BOARD_LANG=de`), background chains (systemd units) in plain
+  words with step, duration and failure reason, gv-loop rounds (`HERD_BOARD_GV_LOOP`), result
+  without PR, merge word ✓/⏸, wave header.
+
+### Changed
+- herd-board: Merged today — title with the count in brackets, then every PR number on its own
+  (no `a–b` ranges), grouped by repo; small panels on one line. Dead agents are dropped.
+
 ## [3.0.0-alpha.2] - 2026-11-27
 
 The full track becomes runnable for domain work: triage sends an intent with a domain word to it,
