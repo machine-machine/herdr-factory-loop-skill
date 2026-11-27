@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **Test first on every track (G3).** New behaviour starts with a new test, or an existing test
+  extended with the expected behaviour, that is red on the base sha before any code; the slice is
+  built in loops until it is green. `WORKER.md` principle 3 is no longer "where a test can express
+  the criterion"; the worker records the red and the green run. Quick runs no longer skip G3
+  (`docs/factory-v3.md` §1, SKILL.md §11).
+
+### Added
+- **G6 staging.** A merge rolls out to staging first, the project's staging check runs against the
+  deployed staging after every deploy, and production follows only on the human's verbatim word in
+  the current turn (`docs/factory-v3.md` §1, SKILL.md §11.4, `ORCHESTRATOR.md` §8). Events `staged`
+  and `prod_go` are reserved; the gate is a rule, not yet enforced by `m2herd gate`.
+- `tests/docs/test_rules_templates.py` checks both rules in the worker, orchestrator, task example,
+  factory spec and skill.
+
 ## [3.0.0-alpha.2] - 2026-11-27
 
 The full track becomes runnable for domain work: triage sends an intent with a domain word to it,

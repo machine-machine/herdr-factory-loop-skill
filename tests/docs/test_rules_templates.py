@@ -124,6 +124,37 @@ def check_full_track():
     check("REPORT counts questions at G1 vs after start", "found at g1" in report.lower() and "after start" in report.lower())
 
 
+def check_test_first_and_staging():
+    """Owner rule: new behaviour starts with a failing test and loops until green, on every track; a merge
+    rolls out to staging first, a staging check runs after every staging deploy, production only on the
+    human's verbatim word."""
+    worker = _read("templates", "herd", "rules", "WORKER.md")
+    p3 = re.search(r"\n3\. \*\*(.+?)\n4\. ", worker, re.S)
+    p3 = p3.group(1) if p3 else ""
+    check("WORKER principle 3 is test first, not 'where a test can express it'",
+          "test first" in p3.lower() and "where a test can express" not in p3, p3)
+    check("WORKER principle 3 asks for the red run on the base sha", "base sha" in p3 and "red" in p3.lower(), p3)
+    check("WORKER principle 3 loops until green", "until" in p3 and "green" in p3, p3)
+    v3 = _read("docs", "factory-v3.md")
+    check("factory-v3: quick runs keep G3 test first", "Quick runs skip the spec chain, G1 and G2" in v3
+          and "Quick runs skip the spec chain, G1, G2 and G3" not in v3)
+    check("factory-v3 gate table has G6 staging", "\n| G6 staging |" in v3)
+    check("factory-v3 pipeline ends in staging then production on the word",
+          "G6 staging" in v3.split("## 2.")[0] and "production" in v3.split("## 2.")[0])
+    skill = _read("skill", "SKILL.md")
+    s11 = _section(skill, "11. The factory pipeline — triage, spec, gates, herd", "### ")
+    check("SKILL §11 quick track runs G3", "| quick | typos, config, a contained bug with a failing test | one slice, no spec: G3 + G4 + G5 + G6 |" in s11)
+    check("SKILL §11 has the G6 bullet", "- **G6 staging.**" in s11)
+    check("SKILL §11 G3 is test first on every track", "every track" in _section(s11, "11.4 Cut and G2–G5 — the herd takes over", "#### ")
+          or "every track" in s11)
+    orch = _read("templates", "herd", "rules", "ORCHESTRATOR.md")
+    after = _section(orch, "8. After the merge", "### ")
+    check("ORCHESTRATOR after-merge: staging check, production only on the word",
+          "staging" in after and "production" in after.lower() and "verbatim" in after, after[:400])
+    task = _read("templates", "herd", "task.md.example")
+    check("task example: tests first", "fail on the base sha" in task)
+
+
 def main():
     files = ["WORKER.md", "REVIEWER.md", "FIXER.md", "MODELS.md", "ORCHESTRATOR.md", "HERD-CUT.md", "STEER.md", "GOLDFISH.md",
              "G1-LENSES.md"]
@@ -233,6 +264,7 @@ def main():
         check(f"{rel} carries no project ids", not hits, ", ".join(hits))
 
     check_full_track()
+    check_test_first_and_staging()
 
     print(f"test_rules_templates: {ok} passed, {fail} failed")
     return 0 if fail == 0 else 1

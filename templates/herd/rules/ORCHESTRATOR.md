@@ -168,6 +168,11 @@ When the board shows a slice as *reported*:
 
 ### 8. After the merge
 
+- **Staging first (G6).** The merge goes to staging; wait until staging runs the merged sha and the
+  project's staging check is green there. Red → back to the slice that owns the fix. Production only
+  when the human's words in the current turn say so, quoted verbatim in the run; never as a side
+  effect of a merge or push.
+
 - Ticket update in plain words from the report's **For the ticket** paragraph, in {{language}}; no
   jargon, no hashes. Data loads and after-merge steps from the report.
 - Low findings of the loop are on `<herd>/NACH-MERGE.md`: decide each (ticket, later slice, or

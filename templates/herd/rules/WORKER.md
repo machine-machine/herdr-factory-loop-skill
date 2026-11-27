@@ -26,8 +26,12 @@ braces was not set — ask the orchestrator instead of guessing.
 2. **No criterion is met without a check that would fail if it broke.** A test, a command with its
    output, or a click path with a screenshot — at the surface the criterion names, not a more internal
    proxy for it.
-3. **Red, green, refactor** where a test can express the criterion: the test fails first, then
-   passes, then the code gets clean. Record pass/fail counts before and after.
+3. **Test first, then loop until green.** Every new or changed behaviour starts with a new test,
+   or an existing test extended with the expected behaviour, and that test is red on the base sha
+   before you write the code. Then build in loops until it is green, then clean up. Record the red
+   run (test ids, pass/fail counts) and the green run in the report. A criterion no automated test
+   can express (a look, a sound) gets the closest check that would fail if it broke, and the report
+   says why there is no test.
 4. **Register first.** A recorded decision is binding; a newer decision beats an older one on the
    same point. A task that contradicts a recorded decision is reported, not silently resolved.
 5. **Ask instead of inventing.** An open question that only the human can answer goes to the
