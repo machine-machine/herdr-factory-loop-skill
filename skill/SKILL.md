@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 3.0.0-alpha.2
+version: 3.0.0-alpha.3
 description: 'Orchestrate parallel AI coding agents with herdr, the terminal workspace manager (workspaces/tabs/panes) on this machine: spawn agents (claude/codex/cursor/etc.), dispatch work, watch lifecycle (idle/working/blocked), unblock approvals, fan out and converge herds; manage agent integrations. Triggers: herdr, "the fleet", orchestrate agents, spawn an agent, "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or driving agents in herdr panes. Also triggers: chat-channel intents (Mattermost/Discord/Slack) needing parallel workers, report back on the same channel; the factory pipeline (triage, quick/standard/full track, gates G0–G5, EGM goldfish/blind review, spec-kit, /speckit.*, onboard the factory); meta-orchestration (meta-orchestrator, fleet-loop/fleet-control, multi-mission /goal portfolios); m2herd — the Claude main-orchestrator context fabric (.m2herd dir; the folder holds the context, the orchestrator holds pointers; refile/notes/areas, fleet-memory gists, RESUME.md).'
 ---
 
@@ -1241,6 +1241,36 @@ prints every move (herd dirs → `herden/`, old dispatch → `archives/dispatch/
 path. `--apply` refuses while such readers exist (`--force-readers` overrides), keeps live herds
 in place, writes `archives/<date>/INDEX.md` and deletes nothing but `__pycache__`.
 
+#### 16.8 Prompt forge — followup vs intent
+
+The orchestrator is the intent coach, and coaching starts before dispatch: a raw sentence is a
+role adjective, an instance of a symptom and no way to grade the result. `m2herd prompt` turns it
+into a method, an invariant, a stretch target and an external verifier (five rules, sourced from
+Anthropic's own prompting practice, in `docs/prompt-forge.md`).
+
+The load-bearing distinction is **followup information vs prompt with an intent**. A fact
+(`die datei liegt in src/perf.ts`, a version, a measurement) is CONTEXT — filed verbatim under
+`## Context`, never reworded, never promoted to a task. An instruction is an INTENT — filed
+under `## Intents`, decomposed under the four interview questions, given a verifier. A
+**constraint** (`darf nicht über 4 MB`) is a boundary, a **correction** (`nein, stattdessen …`)
+strikes the intent it replaces. Confusing the two burns a worker on work that already exists, or
+buries a task in a context blob with no acceptance criteria.
+
+```bash
+m2herd prompt new "mach die app schneller"      # file + four-question interview
+m2herd prompt add "<text>" [--as context|intent|constraint|correction]
+m2herd prompt classify "<text>"                 # kind<TAB>basis, deterministic
+m2herd prompt audit                             # exit 1 until the prompt is gradeable
+```
+
+`audit` is the external check applied to the optimiser itself — the same rule it demands of
+prompts. It fails on a missing verifier, role adjectives without a method, "so schnell wie
+möglich" without a number, and an empty `## Done when`. Every routing decision lands in
+`.m2herd/prompt/ledger.jsonl`, so a misroute is auditable rather than invisible; `--as` is the
+override. The `m2herd-prompt-intent.sh` UserPromptSubmit hook classifies each turn while a
+prompt is under construction and states the branch, so the agent does not decide by mood — it is
+silent outside `.m2herd/` repos, on slash commands and on chatter under four words.
+
 ### 17. evolve — the factory learns
 
 The continual-harness loop: every dispatch/collect leaves a **trace bundle**, and
@@ -1412,6 +1442,7 @@ herdr pane release-agent <pane_id> --source custom:mytool --agent mytool   # rel
 | Dispatch nudge (hooks) | `./scripts/install.sh` wires `hooks/herdr-dispatch-nudge.sh` into Claude's `UserPromptSubmit` + Hermes's `pre_llm_call` — a per-turn reminder to consider herding, never an auto-spawn (§14) |
 | m2herd context fabric | `m2herd boot\|note\|refile\|resume\|sync --check\|archive\|gist --push\|next\|dashboard` over the repo's `.m2herd/`; `m2herd-up up\|dispatch\|collect\|down` for the 1-orchestrator + 1-machineroom workspace (machineroom pane runs `m2herd dashboard --watch`) — folder holds the context, orchestrator holds pointers, `next` is the machine's own next move, the dashboard is read-only (§16) |
 | m2herd settings | `m2herd config list\|get\|set` over `.m2herd/settings.json` (defaults + validation); `,` in `m2herd-tui` opens the settings editor — config file only, never state (§16.6) |
+| Prompt forge | `m2herd prompt new\|add\|classify\|audit` — raw sentence → four-question interview; a followup fact goes to `## Context` verbatim, an intent to `## Intents` with a verifier, a correction strikes the intent it replaces; `audit` exits 1 until gradeable (§16.8, `docs/prompt-forge.md`) |
 | Tear down / retry a worker | `m2herd-up down --slice S [--force]` (pane + worktree + merged branch, idempotent), then re-dispatch; `--all` sweeps every worker (§16.3) |
 | Herd view | `herd-spawn <herd-dir> <slice> <worktree>` puts the worker TUI in tab `herd`; `herd-board` in the right third of the orchestrator tab shows workers + subagents + ready-to-merge PRs; the PreToolUse hook adds every Agent/Task subagent to it (§16.7) |
 | Factory learns | `m2herd evolve analyze` → `proposals` → `show <id>` → `apply <id> [--ack-repo]`\|`reject <id>`; accepted lessons land in `.m2herd/evolver/LESSONS.md` and auto-annotate every dispatch pointer (§17) |

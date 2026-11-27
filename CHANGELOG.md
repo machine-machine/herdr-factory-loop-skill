@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.0-alpha.3] - 2026-11-27
+
+The factory learns to sharpen the prompt before it dispatches one. `m2herd prompt` is a
+mechanical optimiser for the orchestrator's intent coaching: it separates **followup information**
+(a fact, filed verbatim as CONTEXT) from **a prompt with an intent** (filed as an INTENT and
+decomposed), states which of the two a turn is, and refuses a prompt that cannot be graded
+(SKILL.md §16.8, `docs/prompt-forge.md`).
+
+### Added
+- **`m2herd prompt new|add|classify|show|audit`** — `new "<raw>"` scaffolds `.m2herd/prompt/prompt.md`
+  with the four-question interview; `add` routes a delta by deterministic classification
+  (`context` verbatim, `intent`, `constraint`, `correction` striking the intent it replaces),
+  `--as` overrides; every decision lands in `prompt/ledger.jsonl`; `classify` prints `kind<TAB>basis`.
+- **`prompt audit`** — the external check applied to the optimiser itself: exit 1 on a missing
+  verifier command, role adjectives without a method, "so schnell wie möglich" without a number,
+  or an empty `## Done when`. Mirrors the rule that an agent never grades its own work.
+- **`hooks/m2herd-prompt-intent.sh`** — UserPromptSubmit hook; classifies each turn while a prompt
+  is under construction and names the branch. Silent outside `.m2herd/` repos, on slash commands
+  and on chatter under four words; registered by the installer next to the steer gate.
+- **`tests/prompt/test_prompt.py`** — 15 cases over routing, the supersede path, the ledger, the
+  audit and the hook.
+
 ## [3.0.0-alpha.2] - 2026-11-27
 
 The full track becomes runnable for domain work: triage sends an intent with a domain word to it,
