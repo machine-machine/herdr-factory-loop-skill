@@ -48,8 +48,8 @@ packages, clashes, phases and a register excerpt), at herd start and after every
 - G1 on the standard track: run EGM review on `spec.md` + `plan.md` + `contracts/` in fresh subagents,
   findings to `specs/<feature>/reviews/g1-<n>.md`, work them through with EGM resolve, then
   `m2herd gate record <run> design_review --evidence <file> --open <n>`.
-- G1 on the full track runs the lenses listed in `docs/factory-v3.md` §4 (rule text per lens in
-  `G1-LENSES.md`, next to this file). Per round `<n>`:
+- G1 on the full track runs the EGM review above **and**, in the same round, the lenses listed in
+  `docs/factory-v3.md` §4 (rule text per lens in `G1-LENSES.md`, next to this file). Per round `<n>`:
   1. **Pin the base.** For every repo the plan names, fetch, then record the commit of its default
      branch at round start (`git -C <repo> fetch origin` and `git -C <repo> rev-parse
      origin/<default>`). It goes into g1-<n>.md and, at the cut, into every `<slice>.repos` — the

@@ -74,9 +74,10 @@ list always give the same answer. First matching row wins (`scripts/m2herd-gate`
 |---|---|---|---|
 | 1 | a risk word: auth, login, password, OAuth, SSO, permission, credential, secret, token, payment, billing, invoice, checkout, migration, schema change, infrastructure, Terraform, deploy, client/customer data, PII, GDPR, encryption | full | yes |
 | 2 | a new-system word: new system, new service, greenfield, client-facing, customer-facing, public API | full | yes |
-| 3 | `--files` spans two or more areas (an area = first path component; first two under `src/`, `lib/`, `app(s)/`, `packages/`, `services/`, `internal/`, `cmd/`, `pkg/`) | standard | yes |
-| 4 | a quick word (typo, wording, rename, comment, README, changelog, bump, config, flag, lint, format, one-line, failing test) and one area | quick | yes, or no when `--files` is missing |
-| 5 | nothing fired | standard | no — the human picks |
+| 3 | a domain word in the intent — a word on the project's list `.m2herd/rules/domain-words.txt` | full | yes |
+| 4 | `--files` spans two or more areas (an area = first path component; first two under `src/`, `lib/`, `app(s)/`, `packages/`, `services/`, `internal/`, `cmd/`, `pkg/`) | standard | yes |
+| 5 | a quick word (typo, wording, rename, comment, README, changelog, bump, config, flag, lint, format, one-line, failing test) and one area | quick | yes, or no when `--files` is missing |
+| 6 | nothing fired | standard | no — the human picks |
 
 Tier: **high** on any row-1 word; **low** when the words say docs/tests/tooling/CI or every file is
 under `docs/`, `tests/`, `spec/`, CI dirs or is a `.md`; else **medium**. `--tier` only raises.
@@ -84,6 +85,8 @@ under `docs/`, `tests/`, `spec/`, CI dirs or is a `.md`; else **medium**. `--tie
 refused without `--force --note`. `--source chat` marks channel text as untrusted (SEC-4): a
 high-tier chat run records `needs_approval` and `gate status` sends it to the STEER inbox first
 (advisory in the alpha: no gate refuses the run yet; 3.0.0 adds the approval event).
+
+Domain words (row 3) match the intent only, never `--files` paths: case-insensitive, whole words with a hyphen as a word break, `word*` for any ending, ä/ö/ü/ß equal to ae/oe/ue/ss; `#` starts a comment, the skill ships no list, a missing file means no domain row, and the `triaged` event records the hits as `domain_words`.
 
 ## 4. G1 — the design review
 

@@ -6,18 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [3.0.0-alpha.2] - 2026-11-04
+## [3.0.0-alpha.2] - 2026-11-27
 
 The full track becomes runnable for domain work: triage sends an intent with a domain word to it,
 and its G1 runs four zero-context lenses with pinned base shas and copied source texts (SKILL.md
-§11.1 / §11.3, `docs/factory-v3.md` §4). Documents and one triage rule; no new command.
+§11.1 / §11.3, `docs/factory-v3.md` §4). The evolver gains the attempt record: an accepted lesson
+predicts what stops recurring and the next dispatch grades it (`CONTRACT-m2herd.md` §5). Documents,
+one triage rule and the evolver fold; no new command.
 
 ### Added
 - **A domain word sends work to the full track** (G0): `m2herd triage` reads the project's list
   `<dir>/.m2herd/rules/domain-words.txt` — case-insensitive whole words, `word*` for any ending,
   ü/ö/ä/ß matching ue/oe/ae/ss, paths never matched — and picks **full** when the intent contains
-  one; the reason names the word. The skill ships no list. Full is the normal track for domain
-  work.
+  one; the reason names the word and the `triaged` event carries `domain_words`. The list is read
+  as UTF-8 with an optional BOM; an unreadable or non-UTF-8 file fails triage naming the file. The
+  skill ships no list. Full is the normal track for domain work.
 - **G1 lens rules** — `templates/herd/rules/G1-LENSES.md`: domain, architecture, scope (product +
   zoom-out) and comprehension, each with its question, reading list, never-read list, checks and
   agent type; findings in the `REVIEWER.md` format plus the lens name. Domain reads the cited
@@ -42,6 +45,18 @@ and its G1 runs four zero-context lenses with pinned base shas and copied source
 - `tests/docs/test_rules_templates.py` covers the new rules file and the factory templates:
   project-neutral, no placeholders, each lens names only the paths of its own reading list, the
   brief stays under 60 lines, the report has its cause column.
+- **evolve attempt record** — proposals carry `model`, `agent`, `predicted: <kind>@<where>`,
+  `outcome: pending|fixed|missed`, `outcome_run` and `applied_at`; `evolve analyze` folds applied
+  proposals to `fixed`/`missed` when the analyzed run dispatched their slice after the apply and
+  ran it to `done`/`failed` (first analyzed qualifying run decides, never rewritten); lesson lines
+  gain a `[model=… agent=…]` tag; `evolve proposals` prints
+  an `outcome` column (`-` for legacy proposals, which are never folded). `LESSONS.md` stays
+  accepted-only. Contract v2.1 §5, SKILL.md §17. Shape after SIM (arXiv 2611.18856).
+- **re-dispatch archives the previous attempt** — `m2herd-up` dispatch into an existing
+  `runs/<run>/slices/<slice>/` moves `status.json`, `failures.json`, `report.md`, `prompt.md` to
+  `attempts/<dispatched_at>/`, so the slice dir (and the outcome fold) describes only the current
+  attempt; `failures.json` passthrough signatures keep `at`, and the fold ignores entries dated
+  at or before the grading dispatch. Contract §1.
 
 ### Changed
 - **One home for the lens list**: `docs/factory-v3.md` §4. SKILL.md §11, `ORCHESTRATOR.md` and

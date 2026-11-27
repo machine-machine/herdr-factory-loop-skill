@@ -269,6 +269,7 @@ recommendation, never an auto-edit. Templates for both trees ship under
     report.md                           # verbatim copy of .m2herd/dispatch/<slice>.out.md at collect time
     status.json                         # see schema below
     failures.json                       # OPTIONAL, orchestrator- or worker-authored; array, may be absent
+    attempts/<dispatched_at>/           # previous attempts of this slice (re-dispatch moves the four files above here)
 ```
 
 - run-id format: `r-<UTC %Y%m%dT%H%M%SZ>`, e.g. `r-20260705T120000Z`.
@@ -278,6 +279,11 @@ recommendation, never an auto-edit. Templates for both trees ship under
   rotation subcommand in the MVP.
 - `run.json.goal` is copied from `.m2herd/overview.json .goal`; `base` is the dispatch `--base`.
 - `slices[]` in `run.json` is appended (dedup) on each dispatch. jq whole-file rewrites only.
+- Re-dispatch of a slice inside the same run (`down --slice S`, dispatch again) MUST first move
+  the existing `status.json`, `failures.json`, `report.md` and `prompt.md` to
+  `attempts/<previous dispatched_at>/` (suffix `-<pid>` on collision, `unknown-<ts>` when the old
+  status has no `dispatched_at`), so `slices/<slice>/` always describes the current attempt
+  (§5 grades lessons on it). `attempts/` is history only: nothing reads it.
 
 `status.json` schema:
 ```json
@@ -301,8 +307,9 @@ else left `0`.
 `failures.json` entry schema (deliberately boring):
 ```json
 [{"kind":"test_failure","severity":"high|medium|low","where":"slice:<slice>",
-  "evidence":"<one line>","suspected_cause":"<one line>"}]
+  "evidence":"<one line>","suspected_cause":"<one line>","at":"<ISO-8601 UTC, OPTIONAL>"}]
 ```
+`m2herd-up.sh` stamps `at` on the entries it writes; worker-authored entries may omit it.
 
 ### §2. Evolver state (`.m2herd/evolver/`, owned by `m2herd.sh evolve`)
 
@@ -315,9 +322,12 @@ else left `0`.
 ```
 
 - proposal-id format: `<YYYY-MM-DD>-<run-id>-<slug>` (slug = kebab, from the signature kind + slice).
-- signature object: `{"kind","severity","where","evidence","confidence":"high|medium|low","source":"mechanical|failures.json"}`.
+- signature object: `{"kind","severity","where","evidence","confidence":"high|medium|low","source":"mechanical|failures.json","model","agent"}`
+  (`model`/`agent` copied from the slice's `status.json`, `null` when absent — never fabricated; §5);
+  `failures.json`-sourced signatures also carry `at` (the entry's, `null` when the entry has none).
 - `LESSONS.md` uses the standard m2herd marker convention (`<!-- === M2HERD:LIVE === -->`);
-  accepted lessons are appended below the marker as `- [<UTC ts>] (<proposal-id>) <lesson text>`.
+  accepted lessons are appended below the marker as
+  `- [<UTC ts>] (<proposal-id>) [model=<m> agent=<a>] <lesson text>` (`-` when unknown; §5).
 - All evolve commands `mkdir -p` what they need — NO dependency on template seeds existing.
 
 Proposal file format:
@@ -330,6 +340,12 @@ target: <path the change applies to, repo-relative or .m2herd-relative>
 risk: low | medium | high
 status: proposed | applied | rejected
 lesson: <one-line lesson appended to LESSONS.md on apply; may be empty for kind=repo>
+model: <status.json .model of the slice, empty when unknown>
+agent: <status.json .agent of the slice, empty when unknown>
+predicted: <kind>@<where>   # the originating signature this attempt claims will not recur
+outcome: pending | fixed | missed
+outcome_run: <run-id that decided the outcome, empty while pending>
+applied_at: <UTC ts stamped by apply, empty until then>
 ---
 
 ## Observed failure
@@ -349,7 +365,7 @@ lesson: <one-line lesson appended to LESSONS.md on apply; may be empty for kind=
 
 ```
 m2herd evolve analyze  [--dir P] [--run <id|latest|current>]   # default: current, falling back to latest
-m2herd evolve proposals [--dir P]                              # list: id, kind, risk, status
+m2herd evolve proposals [--dir P]                              # list: id, kind, risk, status, outcome
 m2herd evolve show <id> [--dir P]                              # print the proposal file
 m2herd evolve apply <id> [--dir P]                             # see apply ladder below
 m2herd evolve reject <id> [--dir P]                            # frontmatter status -> rejected (no file moves)
@@ -390,6 +406,45 @@ m2herd evolve reject <id> [--dir P]                            # frontmatter sta
 Template seeds for both trees (`evolver/README.md`, `evolver/LESSONS.md`, `runs/README.md`)
 live under `templates/m2herd/`. `skill/SKILL.md` documentation for the `evolve` commands
 lands separately once those commands are released.
+
+### §5. Attempt record — outcome fold (amendment 2026-11-27, after SIM, arXiv 2611.18856)
+
+**Doctrine.** A lesson is an *attempt*, not a fact: it names what it predicts will stop
+recurring, who produced the evidence, and — once a later run has tested it — whether it
+held. The record lives in the proposal files; `LESSONS.md` stays accepted-only and `analyze`
+never mutates live text. Mechanical, no LLM, idempotent, `.m2herd/`-only.
+
+- **Signature fields** `model`, `agent`: from the slice's `status.json`, `null` when absent.
+- **Proposal frontmatter** gains `model`, `agent`, `predicted: <kind>@<where>`,
+  `outcome: pending|fixed|missed`, `outcome_run`, `applied_at`. `analyze` writes `predicted`
+  from the originating signature and `outcome: pending`; `apply` stamps `applied_at`; only
+  the fold below ever changes `outcome`.
+- **Fold rule** — `evolve analyze` on run R, after writing R's signatures, for every proposal
+  with `status: applied` and `outcome: pending` that R can grade: `where` slice listed in R's
+  `run.json .slices[]`, that slice's `status.json .state` in R is `done` or `failed` (an
+  in-flight slice proves nothing), and `applied_at` strictly before that slice's `status.json
+  .dispatched_at` (lessons are read per dispatch, so a worker dispatched after the lesson
+  existed is the one that could have read it — best-effort: the pointer is composed a few
+  seconds before `dispatched_at` is stamped; a re-dispatch inside the same run qualifies
+  because §1 moves the earlier attempt to `attempts/`; equal timestamps do not). If R's
+  signatures contain the same `kind` + `where`, set `outcome: missed`, else `outcome: fixed`;
+  set `outcome_run: R`. A `failures.json`-sourced signature whose `at` is at or before the
+  slice's `dispatched_at` is an earlier attempt's evidence and does not count (an entry
+  without `at` counts: it cannot be dated). Anything that does not qualify stays `pending`.
+  The first qualifying run that is *analyzed* decides and a decided outcome is never
+  rewritten, so with several qualifying runs the verdict follows analysis order. The check
+  and both writes run under one lock on the proposal file; `outcome_run` is written before
+  `outcome`, so a crash between the two leaves a re-gradable `pending`, never a verdict
+  without a run. `predicted` splits on its last
+  `@` (`kind` may contain `@`; `where` is always `slice:<slice>`). Proposals without an
+  `outcome:` key (pre-amendment) are never folded and show `-` in listings; no migration.
+- **Lesson line** `- [<ts>] (<id>) [model=<m> agent=<a>] <lesson>`: `apply` copies the tag
+  from the proposal; dedup stays keyed on `(<id>)`; `resume` and the dispatch pointer suffix
+  are unchanged (they test only for content below the marker).
+- **`evolve proposals`** prints an `outcome` column after `status`.
+- **Frontmatter edits** use a generic `set_frontmatter <file> <key> <value>` (same lock and
+  fence discipline as `set_status`; the key must already exist in the fence, a missing key is a
+  no-op — which is how legacy proposals stay untouched).
 
 ## Amendment v2.2 — settings layer, teardown, state honesty (recorded post-hoc, 2026-07-07)
 

@@ -93,6 +93,7 @@ and does all of it fit the code as it is at the base sha?
 **Reads**
 - `specs/<feature>/spec.md` — requirements and acceptance criteria.
 - `specs/<feature>/plan.md` — readers table, contract section, reserved resources, slices.
+- `specs/<feature>/contracts/` — the spec-kit contracts; the plan's contract section must agree with them.
 - the repositories at the base sha (repo path and sha per repo appended at spawn), only through
   `git -C <repo> show <sha>:<path>`, `git -C <repo> grep <pattern> <sha> -- <path>` and
   `git -C <repo> ls-tree -r --name-only <sha>`.
