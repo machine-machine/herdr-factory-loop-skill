@@ -8,7 +8,9 @@ Applied automatically: m2herd-up dispatch/collect worker prompts get one extra p
                        sentence at this file's path when it has content below the marker.
 
 Everything ABOVE the marker is template boilerplate; everything BELOW is live, accepted lessons.
-Line format: - [<UTC ts>] (<proposal-id>) <lesson text>
+Line format: - [<UTC ts>] (<proposal-id>) [model=<m> agent=<a>] <lesson text>
+             (model/agent: what produced the evidence, "-" when unknown; outcomes live in
+             the proposal files — see `m2herd.sh evolve proposals`)
 -->
 
 <!-- === M2HERD:LIVE === -->
