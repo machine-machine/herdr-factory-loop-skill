@@ -7,6 +7,10 @@ adheres to [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **triage: domain words** — an intent naming a word from the project's
+  `.m2herd/rules/domain-words.txt` (whole word, `word*` prefix, umlaut/ß folded, `#` comments)
+  routes to the **full** track; the `triaged` event carries `domain_words` on a hit. The file is
+  read as UTF-8 with an optional BOM; an unreadable or non-UTF-8 file fails triage naming the file.
 - **evolve attempt record** — proposals carry `model`, `agent`, `predicted: <kind>@<where>`,
   `outcome: pending|fixed|missed`, `outcome_run` and `applied_at`; `evolve analyze` folds applied
   proposals to `fixed`/`missed` when the analyzed run dispatched their slice after the apply and

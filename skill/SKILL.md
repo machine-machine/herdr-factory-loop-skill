@@ -409,9 +409,10 @@ m2herd gate status                                        # every run: where it 
 ```
 
 Rules, not judgement: risk words (auth, payment, migration, infrastructure, client data, …) → **full**
-and tier **high**; new-system words → **full**; two or more file areas → **standard**; a quick word
-(typo, config, rename, failing test, …) in one area → **quick**; nothing fired → standard, marked
-UNSURE — then the **human** picks, not you. Table: `docs/factory-v3.md` §3.
+and tier **high**; new-system words → **full**; a project domain word
+(`.m2herd/rules/domain-words.txt`) → **full**; two or more file areas → **standard**; a quick
+word (typo, config, rename, failing test, …) in one area → **quick**; nothing fired → standard,
+marked UNSURE — then the **human** picks, not you. Table: `docs/factory-v3.md` §3.
 
 | Track | For | Gates |
 |---|---|---|
