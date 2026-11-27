@@ -146,6 +146,10 @@ See [`skill/SKILL.md`](./skill/SKILL.md) for the full reference and
     each self-driving its own herd.
 - **§18 eval/loop**: the Karpathy-style objective loop — use when a slice has a
   machine-checkable score and the builder must optimize against a judge it cannot edit.
+- **Personal layer — LifeOS** (fleet default, [`docs/lifeos.md`](./docs/lifeos.md)): the operator's
+  identity, TELOS and personal memory. Installed per human, never per repo; answers *who and why*.
+  m2herd stays the repo fabric and answers *where the work stands*. They must not share a hook
+  slot without checking the conflict table.
 
 [`CONTRACT-m2herd.md`](./CONTRACT-m2herd.md) is the historical build contract the m2herd herd
 was built against (v2.0 era + amendments) — where it disagrees with `skill/SKILL.md` ≥ 2.6.0,

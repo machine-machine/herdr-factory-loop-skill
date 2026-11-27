@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.0-alpha.5] - 2026-11-27
+
+LifeOS is a fleet default, documented where an agent will find it: the personal layer answers
+*who and why*, m2herd keeps answering *where the work stands*.
+
+### Added
+- **`docs/lifeos.md`** — the stack split, the pinned install, and the collision table
+  (`statusLine` one-only, additive `SessionStart`/`PreCompact` re-verified after setup, Pulse
+  :31337 one per machine, settings diffed). Fleet skill + prerequisites live in nix-m2o
+  (`skills/lifeos-fleet`, `bun`, `unzip`).
+- **README stack map** — a row for the personal layer so it is not mistaken for the repo fabric.
+
 ## [3.0.0-alpha.4] - 2026-11-27
 
 The repo becomes a Claude Code marketplace. `m2herd prompt` ships as an installable plugin
