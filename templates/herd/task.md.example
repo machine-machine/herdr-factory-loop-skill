@@ -46,7 +46,9 @@ gets) — not an internal proxy for it. Include the failure path.
    **When** the user clicks "Export CSV"
    **Then** the button is disabled with the hint "nothing to export"; no empty file is offered
    **Check:** UI test `export-empty`
-3. **AC3 — Tests** — the export suite grows by at least the cases above and stays green.
+3. **AC3 — Tests first** — the tests for AC1 and AC2 are written (or extended) before the code and
+   fail on the base sha; the run that shows them red is in the report; then the export suite grows by
+   at least the cases above and is green.
 
 ## Boundaries
 

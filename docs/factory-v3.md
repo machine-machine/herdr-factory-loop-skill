@@ -12,7 +12,8 @@ One column of stages, six gates. A gate records a verdict before work moves on; 
 advances and loops back to the stage that owns the fix.
 
     G0 triage ─► spec chain (spec-kit) ─► G1 design review ─► tasks ─► cut ─► G2 cut check
-       ─► G3 frozen evals ─► herd (herd flow v2) ─► G4 slice done ─► G5 merge on the human's go
+       ─► G3 tests first ─► herd (herd flow v2) ─► G4 slice done ─► G5 merge on the human's go
+       ─► G6 staging: deploy, staging check ─► production only on the human's verbatim word
        ─► drift check after merge (P1)
 
 | Gate | Verdict | Who decides | Writes | Since |
@@ -20,11 +21,13 @@ advances and loops back to the stage that owns the fix.
 | G0 triage | track quick/standard/full + risk tier | rules; the human when UNSURE | `triaged` | 3.0.0-alpha |
 | G1 design | EGM findings on spec + plan resolved | the human (`m2herd gate approve <run> G1`) | `design_review`, `design_ok` | 3.0.0-alpha |
 | G2 cut check | `HERD-CUT.md` PASS / CONCERNS / FAIL | FAIL blocks; CONCERNS need the human's ack | `HERD-CUT.out.md` (existing) | 2.10.0 |
-| G3 evals | one frozen eval per AC, red on the base sha | the human (`m2herd eval approve`) | `evals_frozen` | 3.0.0 |
+| G3 tests first | one new or extended test per AC, red on the base sha, before any code — on every track; frozen as an eval once `m2herd eval` lands | the human (`m2herd eval approve`); until then the worker's recorded red run, checked by the review loop | `evals_frozen` | rule 3.0.0-alpha.3; evals 3.0.0 |
 | G4 slice done | approved evals green at the accepted sha **and** `review_ok` | the review loop | `eval_pass`/`eval_fail`, `review_ok` | review 2.10.0; evals 3.0.0 |
 | G5 merge | integration probe passed, `/speckit.analyze` no CRITICAL | the human's verbatim go (`herd-merge`) | `merged` (existing) | 2.10.0 |
+| G6 staging | the merge is deployed to staging and the project's staging check is green there; production only after that, on the human's verbatim word in the current turn | the staging check; the human for production | reserved: `staged`, `prod_go` | rule 3.0.0-alpha.3 |
 
-Quick runs skip the spec chain, G1, G2 and G3: one slice, gates G4 + G5 only.
+Quick runs skip the spec chain, G1 and G2: one slice, gates G3 + G4 + G5 + G6. Test first (G3)
+and staging first (G6) hold on every track.
 
 ## 2. Gate events
 

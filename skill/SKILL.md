@@ -396,8 +396,9 @@ the builder's story finds nothing that survives the skeptics. Build contract:
 kept working, not where new work starts.
 
 ```
-G0 triage ─► spec chain ─► G1 design review ─► tasks ─► cut ─► G2 cut check ─► G3 frozen evals
-   ─► herd (§16.7) ─► G4 slice done ─► G5 merge on the human's go ─► compound (§10, §17)
+G0 triage ─► spec chain ─► G1 design review ─► tasks ─► cut ─► G2 cut check ─► G3 tests first
+   ─► herd (§16.7) ─► G4 slice done ─► G5 merge on the human's go ─► G6 staging + staging check
+   ─► production only on the human's verbatim word ─► compound (§10, §17)
 ```
 
 #### 11.1 G0 — triage: pick the track
@@ -417,7 +418,7 @@ rename, failing test, …) in one area → **quick**; nothing fired → standard
 
 | Track | For | Gates |
 |---|---|---|
-| quick | typos, config, a contained bug with a failing test | one slice, no spec: G4 + G5 |
+| quick | typos, config, a contained bug with a failing test | one slice, no spec: G3 + G4 + G5 + G6 |
 | standard | anything touching more than one file area (the default) | spec chain, G1, compiled slices, G2–G5 |
 | full | domain work — an intent with a domain word from the project list (the normal track for it); new systems, client-facing features, auth, payments, migrations | standard + concepts brief before the spec + the four lenses at G1 (`docs/factory-v3.md` §4) |
 
@@ -479,15 +480,23 @@ provisional decision; a team-only blocker is one ticket in the project's questio
   the orchestrator writes these files by hand from `templates/herd/task.md.example`. No more
   hand-rolled bash dispatch: queue with `herd-phase … queued`, start with `herd-watch` (§16.7).
 - **G2 cut check.** `HERD-CUT.md` on the herd: FAIL blocks, CONCERNS need the human's ack.
-- **G3 evals** (3.0.0). A test writer — never the slice's worker — drafts one eval per AC with
-  `m2herd eval draft`; it must fail on the base sha; the human freezes it with `m2herd eval approve`
-  (§18). Until then, ACs are checked by the review loop.
+- **G3 tests first — on every track, quick included.** New behaviour starts with a new test or an
+  existing test extended with the expected behaviour; it must be red on the base sha before any code,
+  and the slice is built in loops until it is green (`WORKER.md` principle 3). The worker records
+  the red and the green run; the review loop rejects a slice whose test never failed. From 3.0.0 a
+  test writer — never the slice's worker — drafts one eval per AC with `m2herd eval draft` and the
+  human freezes it with `m2herd eval approve` (§18).
 - **G4 slice done.** `review_ok` from the review loop (other-model reviewer + two skeptics +
   integration probe). Opt-in now, default in 3.0.0: the **blind pass** — loop arg `blind: true`
   starts a goldfish reviewer that sees only the ACs, the requirement text, the diff and the repo,
   never the worker's report (`templates/herd/rules/GOLDFISH.md`).
 - **G5 merge.** Integration probe passed, `/speckit.analyze` has no CRITICAL, and `herd-merge` gets
   the human's verbatim go.
+- **G6 staging.** A merge rolls out to staging first; the project's staging check (a suite that
+  runs against the deployed staging after every deploy) must be green there. Production follows
+  only on the human's verbatim word in the current turn — never as a side effect of a merge or a
+  push, and an earlier "go" does not carry over. A feature visible from outside brings its staging
+  test with it.
 
 Rules that stay: workers never edit `tasks.md` (the orchestrator ticks it on the integration
 branch); the spec is the contract — scope creep is reverted; a failed gate loops back to the stage
