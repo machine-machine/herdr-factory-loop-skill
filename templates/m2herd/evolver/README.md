@@ -24,6 +24,12 @@ target: <path the change applies to, repo-relative or .m2herd-relative>
 risk: low | medium | high
 status: proposed | applied | rejected
 lesson: <one-line lesson appended to LESSONS.md on apply; may be empty for kind=repo>
+model: <status.json .model of the slice, empty when unknown>
+agent: <status.json .agent of the slice, empty when unknown>
+predicted: <kind>@<where>   # the originating signature this attempt claims will not recur
+outcome: pending | fixed | missed
+outcome_run: <run-id that decided the outcome, empty while pending>
+applied_at: <UTC ts stamped by apply, empty until then>
 ---
 
 ## Observed failure
@@ -31,6 +37,17 @@ lesson: <one-line lesson appended to LESSONS.md on apply; may be empty for kind=
 ## Rollback
 ## Acceptance check
 ```
+
+## The outcome fold (the attempt record)
+
+`evolve analyze` on a run R grades **applied** proposals that R can test: R dispatched the
+slice after the lesson's `applied_at` (that worker could read it) and ran it to
+`done`/`failed`. The predicted `<kind>@<where>` recurs → `outcome: missed`, absent →
+`outcome: fixed`, stamped with `outcome_run: R`. The first qualifying run that is analyzed
+decides; a decided outcome is never rewritten; a run that skipped the slice, left it
+in flight, or predates the apply leaves `pending`.
+Proposals without an `outcome:` key are never folded (`-` in `evolve proposals`).
+`LESSONS.md` never carries outcomes — read them with `m2herd.sh evolve proposals`.
 
 ## The apply ladder (conservative, by `kind`)
 

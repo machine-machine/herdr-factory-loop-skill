@@ -32,7 +32,9 @@
 #                                             # mechanical: read .m2herd/runs/<run-id>/, write signatures + skeleton
 #                                             #   proposals under .m2herd/evolver/, plus runs/<run-id>/metrics.json
 #                                             #   (durations, idle gaps, critical path); no LLM, no network; idempotent
-#   m2herd.sh evolve proposals [--dir P]      # list proposals: id, kind, risk, status
+#                                             #   folds APPLIED proposals to outcome fixed|missed when this run dispatched
+#                                             #   their slice after the lesson was applied and ran it to done|failed
+#   m2herd.sh evolve proposals [--dir P]      # list proposals: id, kind, risk, status, outcome
 #   m2herd.sh evolve show <id> [--dir P]      # print a proposal file
 #   m2herd.sh evolve apply <id> [--dir P] [--ack-repo]
 #                                             # memory/policy: append lesson to LESSONS.md, mark applied
@@ -316,6 +318,17 @@ set_status_locked() {
   if awk -v st="$st" 'BEGIN{c=0}
     { if ($0=="---"){c++; print; next}
       if (c==1 && $0 ~ /^status:/){print "status: " st} else {print} }' "$f" > "$tmp"
+  then mv "$tmp" "$f"; else rm -f "$tmp"; return 1; fi
+}
+# rewrite one `<key>:` line inside a proposal's frontmatter fence, body untouched;
+# the key must already exist in the fence (a missing key is a silent no-op — legacy proposals)
+set_frontmatter() { with_lock "$1.lock" set_frontmatter_locked "$1" "$2" "$3"; }
+set_frontmatter_locked() {
+  local f="$1" key="$2" val="$3" tmp
+  tmp="$(mktemp "$(dirname "$f")/.fm.XXXXXX")"
+  if awk -v k="$key" -v v="$val" 'BEGIN{c=0}
+    { if ($0=="---"){c++; print; next}
+      if (c==1 && index($0, k ":")==1){print k ": " v} else {print} }' "$f" > "$tmp"
   then mv "$tmp" "$f"; else rm -f "$tmp"; return 1; fi
 }
 
@@ -1476,18 +1489,20 @@ Accepted lessons from the m2herd factory evolver. Do not hand-edit above the mar
 $MARKER
 EOF
 }
-# append "- [ts] (<proposal-id>) <lesson>" to LESSONS.md, once per proposal-id;
+# append "- [ts] (<proposal-id>) [model=<m> agent=<a>] <lesson>" to LESSONS.md, once per
+# proposal-id; the tag names what produced the evidence so a lesson learned under one
+# model is reassessed, not blindly reused, under another ("-" when unknown).
 # the dedup-check + append is a read-modify-write → serialized per the locking convention
-append_lesson_once() {
-  local pid="$1" lesson="$2" lf
+append_lesson_once() { # append_lesson_once <pid> <lesson> [model] [agent]
+  local pid="$1" lesson="$2" model="${3:-}" agent="${4:-}" lf
   [ -n "$lesson" ] || return 0
   ensure_lessons_file
   lf="$EVO_DIR/LESSONS.md"
-  with_lock "$lf.lock" append_lesson_locked "$pid" "$lesson" "$lf"
+  with_lock "$lf.lock" append_lesson_locked "$pid" "$lesson" "$lf" "$model" "$agent"
 }
 append_lesson_locked() {
   live_tail "$3" | grep -qF "($1)" && return 0
-  printf -- '- [%s] (%s) %s\n' "$(ts)" "$1" "$2" >> "$3"
+  printf -- '- [%s] (%s) [model=%s agent=%s] %s\n' "$(ts)" "$1" "${4:--}" "${5:--}" "$2" >> "$3"
 }
 
 # kebab slug from a signature kind + its "slice:<name>" where field
@@ -1496,7 +1511,10 @@ slug_of() {
     | tr '[:upper:]_' '[:lower:]-' | tr -c 'a-z0-9-' '-' | tr -s '-' | sed -e 's/^-//' -e 's/-$//'
 }
 
-# write_proposal <id> <run> <kind> <target> <risk> <status> <lesson> <evidence>
+# write_proposal <id> <run> <kind> <target> <risk> <status> <lesson> <evidence> <model> <agent> <predicted>
+# predicted = "<kind>@<where>" of the originating signature: the attempt's claim that this
+# signature will not recur. applied_at is stamped by `apply`; outcome/outcome_run are filled
+# by fold_outcomes — never here.
 write_proposal() {
   cat > "$EVO_DIR/proposals/$1.md" <<EOF
 ---
@@ -1507,6 +1525,12 @@ target: $4
 risk: $5
 status: $6
 lesson: $7
+model: $9
+agent: ${10}
+predicted: ${11}
+outcome: pending
+outcome_run:
+applied_at:
 ---
 
 ## Observed failure
@@ -1519,8 +1543,53 @@ Append this lesson to LESSONS.md so future dispatches carry it forward.
 Remove the corresponding lesson line from .m2herd/evolver/LESSONS.md and reject this proposal.
 
 ## Acceptance check
-Next run of this slice/signature does not recur.
+Folded by the next \`evolve analyze\` whose run dispatched this slice after this lesson was
+applied and ran it to done|failed: outcome fixed when the predicted signature is absent,
+missed when it recurs.
 EOF
+}
+
+# fold_outcomes <run-id> <signatures-file> <run.json>
+# The attempt record (after SIM, arXiv 2611.18856): an APPLIED proposal predicts that its
+# signature (kind@where) will not recur. A run can grade it only if it DISPATCHED the slice
+# after the lesson was applied (that worker got the lessons pointer — lessons are read per
+# dispatch, so the clock is the slice's status.json dispatched_at, not the run's created_at)
+# and ran it to done|failed (an in-flight slice proves nothing). Recurs → missed, absent →
+# fixed; the first qualifying run that is analyzed decides and a decided outcome is never
+# rewritten. Legacy proposals without an `outcome:` key are never folded. Mechanical;
+# idempotent; one lock per proposal.
+fold_outcomes() {
+  local run_id="$1" sig_file="$2" run_json="$3" f verdict fixed=0 missed=0
+  for f in "$EVO_DIR"/proposals/*.md; do
+    [ -f "$f" ] || continue
+    verdict="$(with_lock "$f.lock" fold_one_locked "$f" "$run_id" "$sig_file" "$run_json")" || continue
+    case "$verdict" in fixed) fixed=$((fixed + 1)) ;; missed) missed=$((missed + 1)) ;; esac
+  done
+  log "outcomes: $fixed fixed, $missed missed (applied lessons graded by this run)"
+}
+# fold_one_locked <proposal> <run-id> <sig-file> <run.json>
+# runs under the proposal's lock: check + both writes are one critical section.
+# prints fixed|missed when it decided, nothing when the proposal does not qualify.
+fold_one_locked() {
+  local f="$1" run_id="$2" sig_file="$3" run_json="$4"
+  local applied_at predicted kind where slice status_f state dispatched_at
+  [ "$(frontmatter_get "$f" status)" = "applied" ] || return 0
+  [ "$(frontmatter_get "$f" outcome)" = "pending" ] || return 0     # legacy (no key) and decided: skip
+  applied_at="$(frontmatter_get "$f" applied_at)"; [ -n "$applied_at" ] || return 0
+  predicted="$(frontmatter_get "$f" predicted)"
+  case "$predicted" in *@slice:*) : ;; *) return 0 ;; esac
+  kind="${predicted%@*}"; where="${predicted##*@}"; slice="${where#slice:}"   # last '@': kinds may contain '@'
+  # slices[] membership is also what keeps a worker-authored `where` from steering the path below
+  jq -e --arg s "$slice" 'any(.slices[]?; . == $s)' "$run_json" >/dev/null 2>&1 || return 0
+  status_f="$(dirname "$run_json")/slices/$slice/status.json"
+  state="$(jq -r '.state // empty' "$status_f" 2>/dev/null || true)"
+  case "$state" in done|failed) : ;; *) return 0 ;; esac
+  dispatched_at="$(jq -r '.dispatched_at // empty' "$status_f" 2>/dev/null || true)"
+  # ISO-8601 UTC sorts lexically; equal timestamps do not qualify (strictly before)
+  { [ -n "$dispatched_at" ] && [ "$applied_at" \< "$dispatched_at" ]; } || return 0
+  if jq -e --arg k "$kind" --arg w "$where" 'any(.[]?; .kind==$k and .where==$w)' "$sig_file" >/dev/null 2>&1
+  then set_frontmatter_locked "$f" outcome missed && set_frontmatter_locked "$f" outcome_run "$run_id" && echo missed
+  else set_frontmatter_locked "$f" outcome fixed && set_frontmatter_locked "$f" outcome_run "$run_id" && echo fixed; fi
 }
 
 # ---------- metrics.json: what the declared topology actually cost -------------
@@ -1629,7 +1698,7 @@ evolve_analyze() {
   fi
   local run_dir="$RUNS_DIR/$run_id" run_json="$RUNS_DIR/$run_id/run.json"
   local sig_file="$EVO_DIR/signatures/$run_id.json"
-  local sigs="[]" slices slice sdir status_f report_f fail_f
+  local sigs="[]" slices slice sdir status_f report_f fail_f model agent
 
   slices="$(jq -r '.slices[]? // empty' "$run_json" 2>/dev/null || true)"
   while IFS= read -r slice; do
@@ -1638,20 +1707,26 @@ evolve_analyze() {
     status_f="$sdir/status.json"; report_f="$sdir/report.md"; fail_f="$sdir/failures.json"
     if [ ! -d "$sdir" ] || [ ! -f "$status_f" ]; then
       sigs="$(jq --arg w "slice:$slice" --arg e "status.json missing for dispatched slice $slice" \
-        '. + [{kind:"missing_status", severity:"medium", where:$w, evidence:$e, confidence:"medium", source:"mechanical"}]' <<<"$sigs")"
+        '. + [{kind:"missing_status", severity:"medium", where:$w, evidence:$e, confidence:"medium", source:"mechanical", model:null, agent:null}]' <<<"$sigs")"
       continue
     fi
+    # model/agent: copied from status.json, null when absent — never fabricated
+    model="$(jq -r '.model // empty' "$status_f" 2>/dev/null || true)"
+    agent="$(jq -r '.agent // empty' "$status_f" 2>/dev/null || true)"
     if jq -e '.state=="failed"' "$status_f" >/dev/null 2>&1; then
-      sigs="$(jq --arg w "slice:$slice" --arg e "status.json state=failed for slice $slice" \
-        '. + [{kind:"slice_failed", severity:"high", where:$w, evidence:$e, confidence:"high", source:"mechanical"}]' <<<"$sigs")"
+      sigs="$(jq --arg w "slice:$slice" --arg e "status.json state=failed for slice $slice" --arg m "$model" --arg a "$agent" \
+        '. + [{kind:"slice_failed", severity:"high", where:$w, evidence:$e, confidence:"high", source:"mechanical",
+               model:(if $m=="" then null else $m end), agent:(if $a=="" then null else $a end)}]' <<<"$sigs")"
     fi
     if [ ! -s "$report_f" ]; then
-      sigs="$(jq --arg w "slice:$slice" --arg e "report.md missing or empty for slice $slice" \
-        '. + [{kind:"missing_report", severity:"medium", where:$w, evidence:$e, confidence:"medium", source:"mechanical"}]' <<<"$sigs")"
+      sigs="$(jq --arg w "slice:$slice" --arg e "report.md missing or empty for slice $slice" --arg m "$model" --arg a "$agent" \
+        '. + [{kind:"missing_report", severity:"medium", where:$w, evidence:$e, confidence:"medium", source:"mechanical",
+               model:(if $m=="" then null else $m end), agent:(if $a=="" then null else $a end)}]' <<<"$sigs")"
     fi
     if [ -s "$fail_f" ]; then
-      sigs="$(jq --slurpfile extra "$fail_f" \
-        '. + ([$extra[0][]? | {kind, severity, where, evidence, confidence:"high", source:"failures.json"}])' <<<"$sigs")"
+      sigs="$(jq --slurpfile extra "$fail_f" --arg m "$model" --arg a "$agent" \
+        '. + ([$extra[0][]? | {kind, severity, where, evidence, confidence:"high", source:"failures.json",
+               model:(if $m=="" then null else $m end), agent:(if $a=="" then null else $a end)}])' <<<"$sigs")"
     fi
   done <<<"$slices"
 
@@ -1660,13 +1735,15 @@ evolve_analyze() {
   local n; n="$(jq 'length' <<<"$sigs")"
   log "wrote signatures → .m2herd/evolver/signatures/$run_id.json ($n signature(s))"
 
-  local today created=0 i kind where evidence slice_name slug pid lesson seen_pids="" dup
+  local today created=0 i kind where evidence slice_name slug pid lesson seen_pids="" dup sig_model sig_agent
   today="$(date -u +%Y-%m-%d)"
   if [ "$n" -gt 0 ]; then
     for i in $(seq 0 $((n - 1))); do
       kind="$(jq -r ".[$i].kind" <<<"$sigs")"
       where="$(jq -r ".[$i].where" <<<"$sigs")"
       evidence="$(jq -r ".[$i].evidence" <<<"$sigs")"
+      sig_model="$(jq -r ".[$i].model // empty" <<<"$sigs")"
+      sig_agent="$(jq -r ".[$i].agent // empty" <<<"$sigs")"
       slice_name="${where#slice:}"
       slug="$(slug_of "$kind" "$slice_name")"
       pid="${today}-${run_id}-${slug}"
@@ -1679,29 +1756,32 @@ evolve_analyze() {
       if [ ! -f "$EVO_DIR/proposals/$pid.md" ]; then
         evidence="$(printf '%s' "$evidence" | tr '\n' ' ')"
         lesson="signature $kind at $where: $evidence"
-        write_proposal "$pid" "$run_id" "memory" ".m2herd/evolver/LESSONS.md" "low" "proposed" "$lesson" "$evidence"
+        write_proposal "$pid" "$run_id" "memory" ".m2herd/evolver/LESSONS.md" "low" "proposed" "$lesson" "$evidence" \
+          "$sig_model" "$sig_agent" "$kind@$where"
         created=$((created + 1))
       fi
     done
   fi
   log "proposals: $created new (re-run is idempotent — keyed on proposal-id)"
+  fold_outcomes "$run_id" "$sig_file" "$run_json"
   # the AUDIT obligation: a graph that cannot be measured cannot be justified
   write_run_metrics "$run_id" "$run_dir" "$run_json"
 }
 
 evolve_proposals() {
   resolve_dir; need_init; evolve_dirs
-  local files f id kind risk status out
+  local files f id kind risk status outcome out
   files="$(ls -1 "$EVO_DIR"/proposals/*.md 2>/dev/null | sort || true)"
   if [ -z "$files" ]; then log "no proposals yet — run: m2herd evolve analyze"; return 0; fi
   # accumulate then print once (a single write) so a downstream `grep -q`/`head`
   # closing the pipe early can't SIGPIPE us mid-loop
-  out="$(printf '%-46s %-16s %-6s %s' "id" "kind" "risk" "status")"
+  out="$(printf '%-46s %-16s %-6s %-9s %s' "id" "kind" "risk" "status" "outcome")"
   while IFS= read -r f; do
     id="$(frontmatter_get "$f" id)"; kind="$(frontmatter_get "$f" kind)"
     risk="$(frontmatter_get "$f" risk)"; status="$(frontmatter_get "$f" status)"
+    outcome="$(frontmatter_get "$f" outcome)"; [ -n "$outcome" ] || outcome="-"   # "-": legacy, no attempt record
     out="$out
-$(printf '%-46s %-16s %-6s %s' "$id" "$kind" "$risk" "$status")"
+$(printf '%-46s %-16s %-6s %-9s %s' "$id" "$kind" "$risk" "$status" "$outcome")"
   done <<< "$files"
   printf '%s\n' "$out"
 }
@@ -1723,14 +1803,15 @@ evolve_apply() {
   validate_token "proposal id" "$TEXT"
   local f="$EVO_DIR/proposals/$TEXT.md"
   [ -f "$f" ] || { echo "no such proposal: $TEXT" >&2; exit 1; }
-  local kind target status lesson
+  local kind target status lesson model agent
   kind="$(frontmatter_get "$f" kind)"; target="$(frontmatter_get "$f" target)"
   status="$(frontmatter_get "$f" status)"; lesson="$(frontmatter_get "$f" lesson)"
+  model="$(frontmatter_get "$f" model)"; agent="$(frontmatter_get "$f" agent)"
   if [ "$status" = "applied" ]; then log "already applied: $TEXT"; return 0; fi
   case "$kind" in
     memory|policy)
-      append_lesson_once "$TEXT" "$lesson"
-      set_status "$f" "applied"
+      append_lesson_once "$TEXT" "$lesson" "$model" "$agent"
+      set_status "$f" "applied"; set_frontmatter "$f" applied_at "$(ts)"
       log "applied $TEXT → lesson recorded in .m2herd/evolver/LESSONS.md"
       ;;
     template)
@@ -1738,13 +1819,13 @@ evolve_apply() {
         .m2herd/*) : ;;
         *) echo "evolve apply: template target must be under .m2herd/ (got: $target) — refusing" >&2; exit 1 ;;
       esac
-      append_lesson_once "$TEXT" "$lesson"
-      set_status "$f" "applied"
+      append_lesson_once "$TEXT" "$lesson" "$model" "$agent"
+      set_status "$f" "applied"; set_frontmatter "$f" applied_at "$(ts)"
       log "applied $TEXT (template target: $target)"
       ;;
     repo)
       if [ "$ACK_REPO" -eq 1 ]; then
-        set_status "$f" "applied"
+        set_status "$f" "applied"; set_frontmatter "$f" applied_at "$(ts)"
         log "applied $TEXT (--ack-repo) — repo target was NOT edited: $target"
       else
         log "repo-kind proposal — NOT auto-editing $target"
@@ -2538,6 +2619,95 @@ selftest() {
 
   step evolve reject "$pid_other" --dir "$td"
   grep -q '^status: rejected' "$td/.m2herd/evolver/proposals/$pid_other.md" || fail "evolve reject: status not flipped to rejected"
+
+  # attempt record: proposals carry model/agent/predicted, lessons carry the model tag
+  grep -q '^predicted: slice_failed@slice:demo-slice$' "$td/.m2herd/evolver/proposals/$pid_memory.md" \
+    || fail "evolve analyze: proposal lacks predicted: <kind>@<where>"
+  grep -q '^outcome: pending$' "$td/.m2herd/evolver/proposals/$pid_memory.md" || fail "evolve analyze: new proposal not outcome: pending"
+  grep -q '^agent: claude$' "$td/.m2herd/evolver/proposals/$pid_memory.md" || fail "evolve analyze: proposal lacks agent from status.json"
+  grep -qF "($pid_memory) [model=- agent=claude] " "$td/.m2herd/evolver/LESSONS.md" || fail "evolve apply: lesson line lacks [model= agent=] tag"
+  jq -e '.[0].agent=="claude" and .[0].model==null' "$sig_file" >/dev/null || fail "evolve analyze: signature lacks model/agent (null when empty)"
+  jq -e '.[1].source=="failures.json" and .[1].agent=="claude" and .[1].model==null' "$sig_file" >/dev/null \
+    || fail "evolve analyze: failures.json pass-through lacks model/agent"
+
+  # outcome fold — helper fabricates a later run with one slice in a given state
+  local run2="r-20991231T000001Z" run3="r-20991231T000002Z" run4="r-20991231T000003Z" pid3 legacy_pid
+  local run5="r-20991231T000004Z" run6="r-20991231T000005Z" run7="r-20991231T000006Z" run8="r-20991231T000007Z" pid5
+  fab_run() { # fab_run <run-id> <slice> <state> [dispatched_at]  — default dispatched_at is far in the
+    local d="$td/.m2herd/runs/$1"; mkdir -p "$d/slices/$2"   #   future, so an applied lesson qualifies for grading
+    jq -n --arg id "$1" --arg ts "$(ts)" --arg s "$2" '{run_id:$id, created_at:$ts, goal:"g", base:"main", slices:[$s]}' > "$d/run.json"
+    printf 'worker report\n' > "$d/slices/$2/report.md"
+    jq -n --arg s "$2" --arg st "$3" --arg da "${4:-2099-01-01T00:00:00Z}" '{slice:$s, state:$st, agent:"codex", runner:"pane",
+      model:"gpt-5", branch:"", worktree:"", dispatched_at:$da, collected_at:"", tokens:0, cost_usd:0}' > "$d/slices/$2/status.json"
+  }
+  # (c) a later run that did NOT list the slice in slices[] leaves the applied proposal pending —
+  #     even with a stray done status.json for it in the run dir (membership, not the dir, decides)
+  fab_run "$run2" "other-slice" "done"
+  mkdir -p "$td/.m2herd/runs/$run2/slices/demo-slice"
+  jq -n '{slice:"demo-slice", state:"done", dispatched_at:"2099-01-01T00:00:00Z"}' > "$td/.m2herd/runs/$run2/slices/demo-slice/status.json"
+  step evolve analyze --run "$run2" --dir "$td"
+  grep -q '^outcome: pending$' "$td/.m2herd/evolver/proposals/$pid_memory.md" || fail "fold: run without the slice must leave outcome pending"
+  # (a) the slice fails again → missed, stamped with the deciding run
+  fab_run "$run3" "demo-slice" "failed"
+  step evolve analyze --run "$run3" --dir "$td"
+  grep -q '^outcome: missed$' "$td/.m2herd/evolver/proposals/$pid_memory.md" || fail "fold: recurring signature must mark outcome missed"
+  grep -q "^outcome_run: $run3$" "$td/.m2herd/evolver/proposals/$pid_memory.md" || fail "fold: outcome_run not stamped with the deciding run"
+  grep -q '^status: rejected$' "$td/.m2herd/evolver/proposals/$pid_other.md" || fail "fold: must not touch non-applied proposals"
+  grep -q '^outcome: pending$' "$td/.m2herd/evolver/proposals/$pid_other.md" || fail "fold: rejected proposal must stay pending"
+  # (b) run3's own proposal, applied, is folded to fixed by run4 where the slice is clean
+  pid3="$(basename "$(ls "$td/.m2herd/evolver/proposals"/*"$run3"*.md | head -1)" .md)"
+  grep -q '^model: gpt-5$' "$td/.m2herd/evolver/proposals/$pid3.md" || fail "evolve analyze: proposal lacks model from status.json"
+  grep -q '^outcome: pending$' "$td/.m2herd/evolver/proposals/$pid3.md" || fail "fold: a run must not fold its own proposals"
+  step evolve apply "$pid3" --dir "$td"
+  grep -qF "($pid3) [model=gpt-5 agent=codex] " "$td/.m2herd/evolver/LESSONS.md" || fail "evolve apply: lesson tag missing model/agent values"
+  grep -q '^applied_at: 20[0-9][0-9]-' "$td/.m2herd/evolver/proposals/$pid3.md" || fail "evolve apply: applied_at not stamped"
+  # (e) a legacy proposal (pre-attempt-record frontmatter) is listed, applies, and is never folded
+  legacy_pid="2026-01-01-r-20260101T000000Z-legacy-demo-slice"
+  printf -- '---\nid: %s\nrun: r-20260101T000000Z\nkind: memory\ntarget: .m2herd/evolver/LESSONS.md\nrisk: low\nstatus: proposed\nlesson: legacy lesson\n---\n\n## Observed failure\nold\n' \
+    "$legacy_pid" > "$td/.m2herd/evolver/proposals/$legacy_pid.md"
+  step evolve apply "$legacy_pid" --dir "$td"
+  grep -qF "($legacy_pid) [model=- agent=-] legacy lesson" "$td/.m2herd/evolver/LESSONS.md" || fail "evolve apply: legacy proposal lesson line wrong"
+  grep -q '^applied_at:' "$td/.m2herd/evolver/proposals/$legacy_pid.md" && fail "evolve apply: legacy proposal must not gain an applied_at key"
+  fab_run "$run4" "demo-slice" "done"
+  step evolve analyze --run "$run4" --dir "$td"
+  grep -q '^outcome: fixed$' "$td/.m2herd/evolver/proposals/$pid3.md" || fail "fold: absent signature must mark outcome fixed"
+  grep -q "^outcome_run: $run4$" "$td/.m2herd/evolver/proposals/$pid3.md" || fail "fold: fixed outcome_run not stamped"
+  grep -q "^outcome_run: $run3$" "$td/.m2herd/evolver/proposals/$pid_memory.md" || fail "fold: a decided outcome was rewritten by a later run"
+  grep -q '^outcome:' "$td/.m2herd/evolver/proposals/$legacy_pid.md" && fail "fold: legacy proposal must not gain an outcome key"
+  # (d) re-analyzing run3 — where pid3's signature recurs and run3 now qualifies — must NOT flip the decided fixed
+  step evolve analyze --run "$run3" --dir "$td"
+  grep -q '^outcome: fixed$' "$td/.m2herd/evolver/proposals/$pid3.md" || fail "fold: a decided outcome was rewritten (fixed → missed)"
+  grep -q "^outcome_run: $run4$" "$td/.m2herd/evolver/proposals/$pid3.md" || fail "fold: re-run altered a decided outcome_run"
+  # (f) an in-flight slice (state spawned) in the grading run proves nothing → pending
+  fab_run "$run5" "demo-slice" "failed"
+  step evolve analyze --run "$run5" --dir "$td"
+  pid5="$(basename "$(ls "$td/.m2herd/evolver/proposals"/*"$run5"*.md | head -1)" .md)"
+  step evolve apply "$pid5" --dir "$td"
+  fab_run "$run6" "demo-slice" "spawned"
+  step evolve analyze --run "$run6" --dir "$td"
+  grep -q '^outcome: pending$' "$td/.m2herd/evolver/proposals/$pid5.md" || fail "fold: in-flight slice must leave outcome pending"
+  # (g) a slice DISPATCHED before the lesson was applied cannot grade it, even when done
+  fab_run "$run7" "demo-slice" "done" "2000-01-01T00:00:00Z"
+  step evolve analyze --run "$run7" --dir "$td"
+  grep -q '^outcome: pending$' "$td/.m2herd/evolver/proposals/$pid5.md" || fail "fold: slice dispatched before applied_at must not grade the lesson"
+  # (g2) equal timestamps do not qualify (1 s granularity: apply + dispatch in the same second is ambiguous)
+  local run7b="r-20991231T000006Zb" pid5_applied_at
+  pid5_applied_at="$(frontmatter_get "$td/.m2herd/evolver/proposals/$pid5.md" applied_at)"
+  fab_run "$run7b" "demo-slice" "done" "$pid5_applied_at"
+  step evolve analyze --run "$run7b" --dir "$td"
+  grep -q '^outcome: pending$' "$td/.m2herd/evolver/proposals/$pid5.md" || fail "fold: dispatched_at equal to applied_at must not grade the lesson"
+  # (g3) an applied proposal with a blank applied_at is never graded
+  local pid_blank="2026-01-02-r-20260102T000000Z-blank-demo-slice"
+  printf -- '---\nid: %s\nrun: r-20260102T000000Z\nkind: memory\ntarget: .m2herd/evolver/LESSONS.md\nrisk: low\nstatus: applied\nlesson: blank\nmodel: \nagent: \npredicted: slice_failed@slice:demo-slice\noutcome: pending\noutcome_run:\napplied_at:\n---\n\n## Observed failure\nx\n' \
+    "$pid_blank" > "$td/.m2herd/evolver/proposals/$pid_blank.md"
+  fab_run "$run8" "demo-slice" "done"
+  step evolve analyze --run "$run8" --dir "$td"
+  grep -q "^outcome_run: $run8$" "$td/.m2herd/evolver/proposals/$pid5.md" || fail "fold: qualifying later run did not grade the lesson"
+  grep -q '^outcome: fixed$' "$td/.m2herd/evolver/proposals/$pid5.md" || fail "fold: clean later run must mark fixed"
+  grep -q '^outcome: pending$' "$td/.m2herd/evolver/proposals/$pid_blank.md" || fail "fold: blank applied_at must never be graded"
+  "$self" evolve proposals --dir "$td" | grep -q "^$pid3 .* applied *fixed$" || fail "evolve proposals: outcome column missing 'fixed'"
+  "$self" evolve proposals --dir "$td" | grep -q "^$legacy_pid .* applied *-$" || fail "evolve proposals: legacy proposal must show '-' outcome"
+  unset -f fab_run
 
   local resume_out; resume_out="$("$self" resume --dir "$td")"
   printf '%s\n' "$resume_out" | grep -q 'Recent factory lessons:' || fail "resume: missing 'Recent factory lessons:' section"
