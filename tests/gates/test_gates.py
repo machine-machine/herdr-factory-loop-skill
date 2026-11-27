@@ -198,6 +198,19 @@ class DomainWords(unittest.TestCase):
                 f.write("# Artenschutz\n\nRegelset*   # Fachquellen\n   \n  NRW\n#Windenergie\n")
             self.assertEqual(gate.load_domain_words(base), ["Regelset*", "NRW"])
 
+    def test_list_file_bom_and_bad_encoding(self):
+        with tempfile.TemporaryDirectory() as base:
+            os.makedirs(os.path.join(base, ".m2herd", "rules"))
+            p = os.path.join(base, ".m2herd", "rules", "domain-words.txt")
+            with open(p, "wb") as f:
+                f.write("\ufeffRegelset*\nNRW\n".encode("utf-8"))                # editor BOM
+            self.assertEqual(gate.load_domain_words(base), ["Regelset*", "NRW"])
+            with open(p, "wb") as f:
+                f.write("Gef\xe4hrdung\n".encode("latin-1"))                       # not UTF-8
+            with self.assertRaises(ValueError) as cm:
+                gate.load_domain_words(base)
+            self.assertIn("domain-words.txt", str(cm.exception))
+
     def test_paths_are_not_matched(self):
         for files in (["regelset/rules.py"], ["src/regelset/a.py", "src/regelset/b.py"]):
             d = self.check("fix typo in the loader", files, "quick", "medium")

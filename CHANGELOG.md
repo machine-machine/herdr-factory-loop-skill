@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **triage: domain words** — an intent naming a word from the project's
+  `.m2herd/rules/domain-words.txt` (whole word, `word*` prefix, umlaut/ß folded, `#` comments)
+  routes to the **full** track; the `triaged` event carries `domain_words` on a hit. The file is
+  read as UTF-8 with an optional BOM; an unreadable or non-UTF-8 file fails triage naming the file.
+
 ## [3.0.0-alpha] - 2026-11-03
 
 The factory pipeline: the four side-by-side orchestration paths become one stage-gated path from

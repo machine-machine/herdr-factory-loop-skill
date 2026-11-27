@@ -83,12 +83,16 @@ def domain_hits(words, text):
 
 
 def load_domain_words(base):
-    """The project's list; a missing file is an empty list."""
+    """The project's list; a missing file is an empty list. utf-8-sig: a BOM from an ordinary
+    editor must not glue itself to the first word; any other read/decode problem names the file."""
+    path = os.path.join(base, DOMAIN_WORDS_FILE)
     try:
-        with open(os.path.join(base, DOMAIN_WORDS_FILE), encoding="utf-8") as f:
+        with open(path, encoding="utf-8-sig") as f:
             lines = f.read().splitlines()
     except FileNotFoundError:
         return []
+    except (OSError, UnicodeDecodeError) as e:
+        raise ValueError(f"cannot read {path}: {e} — save it as UTF-8") from e
     return [w for w in (ln.split("#", 1)[0].strip() for ln in lines) if w]
 
 
