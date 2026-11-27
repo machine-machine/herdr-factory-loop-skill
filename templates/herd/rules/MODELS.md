@@ -36,6 +36,7 @@ Each table row above runs under one rules file; `herd-context <role> <herd> [<sl
 | `REVIEWER.md` | `reviewer` | Main reviewer; skeptics (its "As a skeptic" section — the loop points skeptics at the reviewer context) |
 | `FIXER.md` | `fixer` | Fix after review, only with `fixBy: "fixer"` |
 | `GOLDFISH.md` | — (the review loop's `blind` arg; EGM skills for G1) | Goldfish |
+| `G1-LENSES.md` | — (one subagent per lens, started by the orchestrator at G1 on the full track) | Goldfish |
 
 Data digging and mechanical bulk run as one-off agents of the orchestrator without a rules file of
 their own; their prompt names what they may touch.
