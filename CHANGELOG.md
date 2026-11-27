@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.0-alpha.4] - 2026-11-27
+
+The repo becomes a Claude Code marketplace. `m2herd prompt` ships as an installable plugin
+instead of prose to copy, and the animated-documentary method from Felix Riesenberger's second
+walkthrough ships beside it as a staged pipeline with a cost gate.
+
+### Added
+- **`.claude-plugin/marketplace.json`** — `machine-machine-skills`; install with
+  `/plugin marketplace add machine-machine/herdr-factory-loop-skill`.
+- **`plugins/prompt-forge`** — skill + `/prompt-forge:forge` command + `prompt-auditor` agent
+  (sonnet, read-only). Facts stay verbatim, intents get decomposed, the agent stops grading
+  itself. All manifests pass `claude plugin validate`; skill and agent verified live with
+  `--plugin-dir`.
+- **`plugins/docu-forge`** — brief → sourced research → script (hook inside 15 s) → locked
+  character sheet → scene plan → **gate + human approval** → assets → cut → packaging.
+  `scripts/docu-gate.sh` (python under a shim, because CSV quoting needs a real parser) fails a
+  scene without narration or visual, an unknown character, an uncited fact, an unlisted source,
+  a hook over 15 s and a runtime more than 15 % off the brief — verified with a good plan
+  (pass) and a deliberately broken one (7 findings, fail).
+
 ## [3.0.0-alpha.3] - 2026-11-27
 
 The factory learns to sharpen the prompt before it dispatches one. `m2herd prompt` is a

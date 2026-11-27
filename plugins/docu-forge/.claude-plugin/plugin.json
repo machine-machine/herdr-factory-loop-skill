@@ -1,0 +1,11 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "docu-forge",
+  "version": "1.0.0",
+  "description": "Make an animated short documentary from one sentence: sourced research, a script that hooks in 15 seconds, a locked character sheet, a scene plan approved before any generation spend, then assets, cut and packaging.",
+  "author": { "name": "Machine Machine", "url": "https://github.com/machine-machine" },
+  "homepage": "https://github.com/machine-machine/herdr-factory-loop-skill",
+  "license": "MIT",
+  "keywords": ["video", "documentary", "animation", "youtube", "production-pipeline"],
+  "skills": ["./"]
+}

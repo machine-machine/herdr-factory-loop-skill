@@ -216,6 +216,11 @@ herdr-factory-loop-skill/
 ├── LICENSE                  ← MIT
 ├── CONTRIBUTING.md          ← how to propose changes
 ├── Makefile                 ← TUI build targets: tui (host), tui-release (cross), lint, test
+├── .claude-plugin/
+│   └── marketplace.json     ← this repo as a Claude Code marketplace: plugins/prompt-forge, plugins/docu-forge
+├── plugins/
+│   ├── prompt-forge/        ← Claude Code plugin: raw prompt → gradeable prompt (§16.8)
+│   └── docu-forge/          ← Claude Code plugin: one sentence → gated animated documentary
 ├── skill/
 │   ├── SKILL.md             ← the skill itself (loaded by the agent)
 │   └── reference.md         ← verbatim CLI & socket reference (+ m2herd/m2herd-up CLI surfaces)
