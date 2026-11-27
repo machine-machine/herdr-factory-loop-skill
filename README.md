@@ -239,7 +239,8 @@ herdr-factory-loop-skill/
 │   ├── m2herd-precompact.sh     ← Claude Code PreCompact: refile notes before compaction (§16)
 │   ├── m2herd-budget.js         ← Claude Code PostToolUse: budget advisory → offload to .m2herd/ (§16)
 │   ├── herd-board-subagents.py  ← Claude Code PreToolUse (Agent|Task): subagents onto the herd-board (§16.7)
-│   └── smoke.sh                 ← hook contract smokes: sample/empty/garbage stdin → exit 0 + valid JSON
+│   ├── smoke.sh                 ← hook contract smokes: sample/empty/garbage stdin → exit 0 + valid JSON
+│   └── statusline-chain.sh      ← one statusLine slot for two consumers: ctx-bridge writes, LifeOS renders
 ├── tui/                         ← m2herd-tui source (Go, bubbletea): dashboard + `,` settings editor
 ├── prebuilt/                    ← committed m2herd-tui binaries (darwin-arm64, linux-amd64, linux-arm64)
 ├── templates/

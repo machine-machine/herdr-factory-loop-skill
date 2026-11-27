@@ -1,6 +1,6 @@
 ---
 name: herdr
-version: 3.0.0-alpha.6
+version: 3.0.0-alpha.7
 description: 'Orchestrate parallel AI coding agents with herdr, the terminal workspace manager (workspaces/tabs/panes) on this machine: spawn agents (claude/codex/cursor/etc.), dispatch work, watch lifecycle (idle/working/blocked), unblock approvals, fan out and converge herds; manage agent integrations. Triggers: herdr, "the fleet", orchestrate agents, spawn an agent, "what are my agents doing", panes/workspaces/worktrees, herdr integrations, or driving agents in herdr panes. Also triggers: chat-channel intents (Mattermost/Discord/Slack) needing parallel workers, report back on the same channel; the factory pipeline (triage, quick/standard/full track, gates G0–G5, EGM goldfish/blind review, spec-kit, /speckit.*, onboard the factory); meta-orchestration (meta-orchestrator, fleet-loop/fleet-control, multi-mission /goal portfolios); m2herd — the Claude main-orchestrator context fabric (.m2herd dir; the folder holds the context, the orchestrator holds pointers; refile/notes/areas, fleet-memory gists, RESUME.md).'
 ---
 

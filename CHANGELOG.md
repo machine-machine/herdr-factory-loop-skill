@@ -6,6 +6,17 @@ adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [3.0.0-alpha.7] - 2026-11-27
+
+### Added
+- **`scripts/statusline-chain.sh`** — Claude Code has one `statusLine` slot; LifeOS wants the frame,
+  the budget bridge wants to write `/tmp/claude-ctx-<sid>.json`. The chain feeds the payload to
+  ctx-bridge (output dropped) and lets LifeOS render, so neither is lost.
+
+### Fixed
+- NixOS: `LIFEOS_StatusLine.sh` is `#!/bin/bash`, which does not exist there — the chain calls it
+  through `bash`, the raw path fails with 126.
+
 ## [3.0.0-alpha.6] - 2026-11-27
 
 ### Added
