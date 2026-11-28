@@ -19,6 +19,78 @@ adheres to [Semantic Versioning](https://semver.org/).
 - herd-board: Merged today — title with the count in brackets, then every PR number on its own
   (no `a–b` ranges), grouped by repo; small panels on one line. Dead agents are dropped.
 
+## [3.0.0-alpha.7] - 2026-11-27
+
+### Added
+- **`scripts/statusline-chain.sh`** — Claude Code has one `statusLine` slot; LifeOS wants the frame,
+  the budget bridge wants to write `/tmp/claude-ctx-<sid>.json`. The chain feeds the payload to
+  ctx-bridge (output dropped) and lets LifeOS render, so neither is lost.
+
+### Fixed
+- NixOS: `LIFEOS_StatusLine.sh` is `#!/bin/bash`, which does not exist there — the chain calls it
+  through `bash`, the raw path fails with 126.
+
+## [3.0.0-alpha.6] - 2026-11-27
+
+### Added
+- **Fetching row in the stack map** — hostile pages (403/429/JS) go through the `scrapling-fleet`
+  skill in nix-m2o: TLS impersonation, real browser, extract to a file. `curl` stays the default
+  for JSON and plain pages.
+
+## [3.0.0-alpha.5] - 2026-11-27
+
+LifeOS is a fleet default, documented where an agent will find it: the personal layer answers
+*who and why*, m2herd keeps answering *where the work stands*.
+
+### Added
+- **`docs/lifeos.md`** — the stack split, the pinned install, and the collision table
+  (`statusLine` one-only, additive `SessionStart`/`PreCompact` re-verified after setup, Pulse
+  :31337 one per machine, settings diffed). Fleet skill + prerequisites live in nix-m2o
+  (`skills/lifeos-fleet`, `bun`, `unzip`).
+- **README stack map** — a row for the personal layer so it is not mistaken for the repo fabric.
+
+## [3.0.0-alpha.4] - 2026-11-27
+
+The repo becomes a Claude Code marketplace. `m2herd prompt` ships as an installable plugin
+instead of prose to copy, and the animated-documentary method from Felix Riesenberger's second
+walkthrough ships beside it as a staged pipeline with a cost gate.
+
+### Added
+- **`.claude-plugin/marketplace.json`** — `machine-machine-skills`; install with
+  `/plugin marketplace add machine-machine/herdr-factory-loop-skill`.
+- **`plugins/prompt-forge`** — skill + `/prompt-forge:forge` command + `prompt-auditor` agent
+  (sonnet, read-only). Facts stay verbatim, intents get decomposed, the agent stops grading
+  itself. All manifests pass `claude plugin validate`; skill and agent verified live with
+  `--plugin-dir`.
+- **`plugins/docu-forge`** — brief → sourced research → script (hook inside 15 s) → locked
+  character sheet → scene plan → **gate + human approval** → assets → cut → packaging.
+  `scripts/docu-gate.sh` (python under a shim, because CSV quoting needs a real parser) fails a
+  scene without narration or visual, an unknown character, an uncited fact, an unlisted source,
+  a hook over 15 s and a runtime more than 15 % off the brief — verified with a good plan
+  (pass) and a deliberately broken one (7 findings, fail).
+
+## [3.0.0-alpha.3] - 2026-11-27
+
+The factory learns to sharpen the prompt before it dispatches one. `m2herd prompt` is a
+mechanical optimiser for the orchestrator's intent coaching: it separates **followup information**
+(a fact, filed verbatim as CONTEXT) from **a prompt with an intent** (filed as an INTENT and
+decomposed), states which of the two a turn is, and refuses a prompt that cannot be graded
+(SKILL.md §16.8, `docs/prompt-forge.md`).
+
+### Added
+- **`m2herd prompt new|add|classify|show|audit`** — `new "<raw>"` scaffolds `.m2herd/prompt/prompt.md`
+  with the four-question interview; `add` routes a delta by deterministic classification
+  (`context` verbatim, `intent`, `constraint`, `correction` striking the intent it replaces),
+  `--as` overrides; every decision lands in `prompt/ledger.jsonl`; `classify` prints `kind<TAB>basis`.
+- **`prompt audit`** — the external check applied to the optimiser itself: exit 1 on a missing
+  verifier command, role adjectives without a method, "so schnell wie möglich" without a number,
+  or an empty `## Done when`. Mirrors the rule that an agent never grades its own work.
+- **`hooks/m2herd-prompt-intent.sh`** — UserPromptSubmit hook; classifies each turn while a prompt
+  is under construction and names the branch. Silent outside `.m2herd/` repos, on slash commands
+  and on chatter under four words; registered by the installer next to the steer gate.
+- **`tests/prompt/test_prompt.py`** — 15 cases over routing, the supersede path, the ledger, the
+  audit and the hook.
+
 ## [3.0.0-alpha.2] - 2026-11-27
 
 The full track becomes runnable for domain work: triage sends an intent with a domain word to it,

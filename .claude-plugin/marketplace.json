@@ -1,0 +1,22 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "machine-machine-skills",
+  "description": "Machine Machine agent skills: prompt forging for delegation, animated documentary production.",
+  "owner": { "name": "Machine Machine", "url": "https://github.com/machine-machine" },
+  "plugins": [
+    {
+      "name": "prompt-forge",
+      "source": "./plugins/prompt-forge",
+      "description": "Turn a one-breath prompt into a gradeable one: facts filed verbatim, intents decomposed, external verifier.",
+      "version": "1.0.0",
+      "category": "productivity"
+    },
+    {
+      "name": "docu-forge",
+      "source": "./plugins/docu-forge",
+      "description": "One sentence to an animated short documentary: sourced research, 15s hook, locked character sheet, gated scene plan, cut and packaging.",
+      "version": "1.0.0",
+      "category": "creative"
+    }
+  ]
+}

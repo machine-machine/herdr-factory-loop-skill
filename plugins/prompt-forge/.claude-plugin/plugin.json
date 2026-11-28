@@ -1,0 +1,11 @@
+{
+  "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
+  "name": "prompt-forge",
+  "version": "1.0.0",
+  "description": "Turn a one-breath prompt into a gradeable one: facts filed verbatim as context, intents decomposed under four questions, an external verifier instead of self-review.",
+  "author": { "name": "Machine Machine", "url": "https://github.com/machine-machine" },
+  "homepage": "https://github.com/machine-machine/herdr-factory-loop-skill",
+  "license": "MIT",
+  "keywords": ["prompting", "delegation", "intent", "verification", "m2herd"],
+  "skills": ["./"]
+}

@@ -45,6 +45,12 @@
 #   m2herd.sh eval draft   --slice S --cmd C  # write candidate eval command to .m2herd/evals/draft/S/eval.json
 #   m2herd.sh eval approve --slice S          # freeze draft eval into .m2herd/evals/approved/S/ with checksum + read-only file
 #   m2herd.sh eval status  --slice S          # show draft/approved eval state
+#   m2herd.sh prompt new|add|show|audit ...   # prompt optimiser: `new "<raw sentence>"` opens the four-question
+#                                             #   interview, `add "<text>" [--as context|intent|constraint|correction]`
+#                                             #   files a session delta as CONTEXT (verbatim fact) or as an INTENT
+#                                             #   (instruction, decomposed), `classify "<text>"` prints kind<TAB>basis,
+#                                             #   `audit` fails a prompt that has no external verifier / uses role
+#                                             #   adjectives / has no invariant (exit 1)
 #   m2herd.sh loop run --slice S --attempt-cmd C [--rounds N]
 #                                             # run N isolated git-worktree attempts against approved eval S,
 #                                             # score each round, keep best patch under .m2herd/loops/<run-id>/
@@ -101,6 +107,7 @@ if [ "$CMD" = "loop" ]; then
   case "${1:-}" in -*|"") : ;; *) LOOP_ACTION="$1"; shift ;; esac
 fi
 CONFIG_ACTION=""; CONFIG_PATH=""; CONFIG_VALUE=""
+PROMPT_ACTION=""; PROMPT_AS=""
 DIR="$PWD"; GOAL=""; AREA=""; TEXT=""; CHECK=0; AUTO=0; PUSH=0; WATCH=0; INTERVAL=2; RUN=""; ACK_REPO=0; DRYRUN=0
 SLICE=""; EVAL_CMD=""; ATTEMPT_CMD=""; ROUNDS=3
 # `triage` and `gate` (the factory pipeline, docs/factory-v3.md) live in scripts/m2herd-gate; only
@@ -128,9 +135,14 @@ while [ $# -gt 0 ]; do
     --attempt-cmd) ATTEMPT_CMD="$2"; shift 2 ;;
     --rounds) ROUNDS="$2"; shift 2 ;;
     --ack-repo) ACK_REPO=1; shift ;;
+    --as)    PROMPT_AS="$2"; shift 2 ;;
     -h|--help) CMD="help"; shift ;;
     *)
-      if [ "$CMD" = "config" ]; then
+      if [ "$CMD" = "prompt" ]; then
+        if [ -z "$PROMPT_ACTION" ]; then PROMPT_ACTION="$1"; shift
+        elif [ -z "$TEXT" ]; then TEXT="$1"; shift
+        else TEXT="$TEXT $1"; shift; fi
+      elif [ "$CMD" = "config" ]; then
         if [ -z "$CONFIG_ACTION" ]; then CONFIG_ACTION="$1"; shift
         elif [ -z "$CONFIG_PATH" ]; then CONFIG_PATH="$1"; shift
         elif [ -z "$CONFIG_VALUE" ]; then CONFIG_VALUE="$1"; shift
@@ -2948,6 +2960,179 @@ GRAPHEOF
   echo "selftest: PASS"
 }
 
+# ---------- prompt: the prompt optimiser (delta vs intent) ---------------------
+# Prompt improvement distilled from Felix Riesenberger (ex-Anthropic eng lead):
+#   R1 verbs over adjectives — "you are an expert in X" only changes vocabulary,
+#      "do what an experienced X would do" changes method (and forces a method list).
+#   R2 absurd stretch target with the baseline and the ×N factor spelled out,
+#      plus the "it is possible — try every way" clause.
+#   R3 outcomes as invariants, not instances ("app is crash-free", not "fix crash #17").
+#   R4 the agent never grades itself — every prompt needs an external verifier
+#      command somebody else can run.
+#   R5 one-sentence raw prompt -> FOUR explicit questions -> full rewrite.
+#
+# The distinction this encodes: a session sends two very different things.
+#   followup information ("the file is at …", "the client wants v2") is CONTEXT —
+#      filed verbatim, never reworded, never turned into an instruction.
+#   a prompt with an intent ("make it faster") is an INSTRUCTION — decomposed,
+#      put under the four questions, measured by the verifier.
+# Getting that wrong is the classic failure both ways: a fact becomes a fake task,
+# or a task gets buried in a context blob.
+PROMPT_SECTIONS="Objective|Context|Constraints|Intents|Done when|Verifier"
+prompt_dir() { echo "$DIR/.m2herd/prompt"; }
+
+# prompt_classify <text> -> echoes "kind<TAB>basis". Deterministic, no model.
+prompt_classify() {
+  local t="$1" lc
+  lc="$(printf '%s' "$t" | tr '[:upper:]' '[:lower:]')"
+  if printf '%s' "$lc" | grep -Eq '(^nein|^ne,|stattdessen|instead of|nicht .* sondern|revidiere|correction|korrektur|\bactually\b)'; then
+    printf 'correction\tcontradiction marker\n'; return
+  fi
+  if printf '%s' "$lc" | grep -Eq '(darf nicht|must not|max(imal)? |mindestens|at least|only |nur |budget|deadline|frist|keine[nr]? )'; then
+    printf 'constraint\tboundary wording\n'; return
+  fi
+  # followup: carries machine-checkable state and no imperative at the front
+  if printf '%s' "$lc" | grep -Eq '([a-z0-9_./-]+\.(ts|tsx|js|jsx|py|go|rs|nix|sh|md|json|ya?ml|toml|sql))|(^|[^0-9])v?[0-9]+\.[0-9]+|(^| )(fyi|info|kontext|context|stand|aktuell|for the record|der kunde|die datei)'; then
+    if ! printf '%s' "$lc" | grep -Eq '(^|: | - |—) *(bau|baue|mach|mache|add|addiere|füge|fuege|implement|implementiere|refactor|refaktoriere|fix|behebe|schreib|write|erstell|create|change|ändere|aendere|optimiere|optimize|reduziere|reduce|sorge|ensure|prüfe|check)'; then
+      printf 'context\tcarries state, no imperative\n'; return
+    fi
+  fi
+  printf 'intent\tinstructional\n'
+}
+
+prompt_mark_superseded() {  # mark the last Intents bullet as superseded
+  local f="$1"
+  awk '
+    /^## Intents/ { insec = 1 }
+    /^## / && !/^## Intents/ { if (insec) insec = 0 }
+    { lines[NR] = $0; isin[NR] = insec }
+    END {
+      last = 0
+      for (i = 1; i <= NR; i++) if (isin[i] && lines[i] ~ /^- \[ \]/) last = i
+      for (i = 1; i <= NR; i++) if (i == last) print "~~" lines[i] "~~ (superseded)"; else print lines[i]
+    }' "$f" > "$f.t" && mv "$f.t" "$f"
+}
+
+prompt_new() {
+  resolve_dir; need_init
+  [ -n "$TEXT" ] || { echo 'prompt new needs the raw one-sentence prompt' >&2; exit 2; }
+  local pd f; pd="$(prompt_dir)"; mkdir -p "$pd"
+  f="$pd/prompt.md"
+  if [ -f "$f" ]; then mv "$f" "$pd/prompt-$(date -u +%Y%m%dT%H%M%SZ).md"; log "previous prompt archived"; fi
+  cat > "$f" <<EOF
+# Prompt
+
+<!-- optimiser: answer the four questions, then rewrite in place. A prompt that
+     still has an unanswered question or an empty Verifier is not done. -->
+
+## Objective
+
+$TEXT
+
+## Context
+
+## Constraints
+
+## Intents
+
+- [ ] $TEXT
+
+## Done when
+
+## Verifier
+
+\`\`\`bash
+# the command a THIRD party runs to grade this — never the agent's own opinion
+\`\`\`
+
+## Interview (answer all four, then rewrite)
+
+1. What is the observable that says done? (turn it into an invariant, not an instance)
+2. What would an experienced X do first, and in what order? (method, not role adjectives)
+3. What is the stretch target, its baseline, and the ×N factor?
+4. Which runnable command proves it, and what makes it fail?
+EOF
+  printf '%s\t%s\t%s\t%s\n' "$(ts)" new - "${TEXT:0:120}" >> "$pd/ledger.jsonl"
+  log "prompt created → .m2herd/prompt/prompt.md (answer the interview, then rewrite)"
+}
+
+prompt_add() {
+  resolve_dir; need_init
+  [ -n "$TEXT" ] || { echo 'prompt add needs text' >&2; exit 2; }
+  local pd f kind basis sec
+  pd="$(prompt_dir)"; f="$pd/prompt.md"
+  [ -f "$f" ] || { echo 'no prompt yet — run: m2herd prompt new "<raw>"' >&2; exit 2; }
+  if [ -n "$PROMPT_AS" ]; then
+    case "$PROMPT_AS" in context|intent|constraint|correction) kind="$PROMPT_AS"; basis="--as" ;;
+      *) echo "unknown --as: $PROMPT_AS (context|intent|constraint|correction)" >&2; exit 2 ;; esac
+  else
+    IFS=$'\t' read -r kind basis <<<"$(prompt_classify "$TEXT")"
+  fi
+  # never file the same line twice
+  if grep -Fqx -- "- [ ] $TEXT" "$f" || grep -Fqx -- "- $TEXT" "$f"; then
+    log "already present — nothing added"; return
+  fi
+  case "$kind" in
+    context)    sec="Context";    prompt_insert "$f" "$sec" "- $TEXT" ;;
+    constraint) sec="Constraints";prompt_insert "$f" "$sec" "- $TEXT" ;;
+    correction) sec="Intents"; prompt_mark_superseded "$f"; prompt_insert "$f" "$sec" "- [ ] CORRECTION: $TEXT" ;;
+    *)          sec="Intents";    prompt_insert "$f" "$sec" "- [ ] $TEXT" ;;
+  esac
+  printf '%s\t%s\t%s\t%s\n' "$(ts)" add "$kind" "${TEXT:0:120}" >> "$pd/ledger.jsonl"
+  log "filed as $kind ($basis) → ## $sec"
+  [ "$kind" = "intent" ] && log "answer it under ## Interview and give it a Verifier"
+  [ "$kind" = "intent" ] && return 0
+  return 0
+}
+
+prompt_insert() {  # prompt_insert <file> <section> <line>  (appends at the END of the section)
+  local f="$1" sec="$2" line="$3"
+  awk -v sec="## $sec" -v line="$line" '
+    $0 == sec { insec = 1; print; next }
+    /^## / {
+      if (insec) { print ""; print line; done = 1; insec = 0 }
+      print; next
+    }
+    { print }
+    END {
+      if (insec) { print ""; print line; done = 1 }
+      if (!done) { print "## " sec; print ""; print line }
+    }' "$f" > "$f.t" && mv "$f.t" "$f"
+}
+
+prompt_audit() {
+  resolve_dir
+  local f findings=0
+  f="$(prompt_dir)/prompt.md"
+  [ -f "$f" ] || { echo "no prompt at $f" >&2; exit 2; }
+  has() { grep -qiE "$1" "$f"; }
+  # R4 — the one that matters most: no verifier, no prompt
+  if ! awk '/^## Verifier/{v=1;next} /^## /{v=0} v && $0 !~ /^```/ && NF' "$f" | grep -qv '^#'; then
+    echo "HIGH  no verifier command — the agent would grade itself (R4)"; findings=$((findings+1))
+  fi
+  has 'du bist ein|you are an? (experienced |senior )?(expert|entwickler|developer|engineer)' \
+    && { echo "HIGH  role adjective without a method list — say what an experienced X DOES (R1)"; findings=$((findings+1)); }
+  has 'unmöglich|unmoeglich|impossible|as fast as possible|so schnell wie möglich|so schnell wie moeglich' \
+    && { echo "MED   no number — give a baseline and a ×N stretch target (R2)"; findings=$((findings+1)); }
+  if grep -qE '^## Done when$' "$f" && ! awk '/^## Done when/{d=1;next} /^## /{d=0} d && NF' "$f" | grep -q .; then
+    echo "HIGH  ## Done when empty — an instance is not an invariant (R3)"; findings=$((findings+1))
+  fi
+  awk '/^## Interview/{i=1;next} /^## /{i=0} i && /^[0-9]\./' "$f" | head -1 >/dev/null
+  echo "---"
+  if [ "$findings" -eq 0 ]; then echo "PASS ($findings findings)"; else echo "FAIL ($findings findings)"; exit 1; fi
+}
+
+prompt_cmd() {
+  case "$PROMPT_ACTION" in
+    new)   prompt_new ;;
+    add)   prompt_add ;;
+    classify) prompt_classify "$TEXT" ;;
+    show)  resolve_dir; cat "$(prompt_dir)/prompt.md" ;;
+    audit) prompt_audit ;;
+    *) echo "usage: m2herd.sh prompt {new|add|show|audit} [--dir P] [--as context|intent|constraint|correction] \"text\"" >&2; exit 2 ;;
+  esac
+}
+
 # ---------- dispatch ---------------------------------------------------------
 case "$CMD" in
   boot)     boot ;;
@@ -2975,6 +3160,7 @@ case "$CMD" in
     esac
     ;;
   eval)     eval_cmd_group ;;
+  prompt)   prompt_cmd ;;
   triage|gate) gate_cmd ;;
   loop)     loop_cmd_group ;;
   dashboard)

@@ -270,13 +270,17 @@ HERD_BOARD_MATCHER="Agent|Task"
 # registered timeout must stay above that, or Claude Code kills it and shows a hook error.
 M2HERD_STEER_HOOK="m2herd-steer-gate.sh"
 M2HERD_STEER_TIMEOUT=15
+# prompt optimiser (docs/prompt-forge.md): classifies each turn as followup CONTEXT or
+# INTENT and routes it, while a prompt is being authored under .m2herd/prompt/.
+M2HERD_PROMPT_HOOK="m2herd-prompt-intent.sh"
+M2HERD_PROMPT_TIMEOUT=10
 
 register_m2herd_hooks() {
   local hooks_dir="$HOME/.claude/hooks"
   local settings="$HOME/.claude/settings.json"
 
   if [ "$uninstall" -eq 1 ]; then
-    for h in "$M2HERD_SESSION_HOOK" "$M2HERD_PRECOMPACT_HOOK" "$M2HERD_BUDGET_HOOK" "$HERD_BOARD_HOOK" "$M2HERD_STEER_HOOK"; do
+    for h in "$M2HERD_SESSION_HOOK" "$M2HERD_PRECOMPACT_HOOK" "$M2HERD_BUDGET_HOOK" "$HERD_BOARD_HOOK" "$M2HERD_STEER_HOOK" "$M2HERD_PROMPT_HOOK"; do
       install_hook_file "$hooks_dir" "claude" "$h"
     done
     [ -f "$settings" ] || return 0
@@ -305,13 +309,14 @@ register_m2herd_hooks() {
       | strip("PostToolUse"; $bj)
       | strip("PreToolUse"; $hb)
       | strip("UserPromptSubmit"; $sg)
+      | strip("UserPromptSubmit"; $ph)
       | strip("Stop"; $sg)
     ' "$settings" > "$tmp" && mv "$tmp" "$settings"
     echo "[claude] removed m2herd hook entries from $settings"
     return 0
   fi
 
-  for h in "$M2HERD_SESSION_HOOK" "$M2HERD_PRECOMPACT_HOOK" "$M2HERD_BUDGET_HOOK" "$HERD_BOARD_HOOK" "$M2HERD_STEER_HOOK"; do
+  for h in "$M2HERD_SESSION_HOOK" "$M2HERD_PRECOMPACT_HOOK" "$M2HERD_BUDGET_HOOK" "$HERD_BOARD_HOOK" "$M2HERD_STEER_HOOK" "$M2HERD_PROMPT_HOOK"; do
     install_hook_file "$hooks_dir" "claude" "$h"
   done
   [ "$m2herd_hooks" -eq 1 ] || return 0
@@ -343,6 +348,8 @@ register_m2herd_hooks() {
      --arg hbmatcher "$HERD_BOARD_MATCHER" \
      --arg sg "$M2HERD_STEER_HOOK" --arg sgcmd "bash \"$hooks_dir/$M2HERD_STEER_HOOK\"" \
      --argjson sgto "$M2HERD_STEER_TIMEOUT" \
+     --arg ph "$M2HERD_PROMPT_HOOK" --arg phcmd "bash \"$hooks_dir/$M2HERD_PROMPT_HOOK\"" \
+     --argjson phto "$M2HERD_PROMPT_TIMEOUT" \
      --argjson budget "$budget_ok" --argjson board "$board_ok" '
     def have($ev; $name): [ .hooks[$ev][]?.hooks[]?.command // "" ] | map(contains($name)) | any;
     # an entry an earlier install registered with a too-short timeout is raised, nothing else changes
@@ -368,6 +375,9 @@ register_m2herd_hooks() {
     | (if $board == 0 or have("UserPromptSubmit"; $sg) then . else
          .hooks.UserPromptSubmit = ((.hooks.UserPromptSubmit // [])
            + [{"hooks":[{"type":"command","command":$sgcmd,"timeout":$sgto}]}]) end)
+    | (if have("UserPromptSubmit"; $ph) then . else
+         .hooks.UserPromptSubmit = ((.hooks.UserPromptSubmit // [])
+           + [{"hooks":[{"type":"command","command":$phcmd,"timeout":$phto}]}]) end)
     | (if $board == 0 or have("Stop"; $sg) then . else
          .hooks.Stop = ((.hooks.Stop // [])
            + [{"hooks":[{"type":"command","command":($sgcmd + " Stop"),"timeout":$sgto}]}]) end)

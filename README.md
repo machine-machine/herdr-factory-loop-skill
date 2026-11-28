@@ -146,6 +146,13 @@ See [`skill/SKILL.md`](./skill/SKILL.md) for the full reference and
     each self-driving its own herd.
 - **§18 eval/loop**: the Karpathy-style objective loop — use when a slice has a
   machine-checkable score and the builder must optimize against a judge it cannot edit.
+- **Personal layer — LifeOS** (fleet default, [`docs/lifeos.md`](./docs/lifeos.md)): the operator's
+  identity, TELOS and personal memory. Installed per human, never per repo; answers *who and why*.
+  m2herd stays the repo fabric and answers *where the work stands*. They must not share a hook
+  slot without checking the conflict table.
+- **Hostile fetching — Scrapling** (fleet skill `scrapling-fleet`, nix-m2o): TLS impersonation and a
+  real browser for pages that block `curl`. Use when a page 403s, 429s or needs JS; extract to a
+  file, never into the context.
 
 [`CONTRACT-m2herd.md`](./CONTRACT-m2herd.md) is the historical build contract the m2herd herd
 was built against (v2.0 era + amendments) — where it disagrees with `skill/SKILL.md` ≥ 2.6.0,
@@ -216,6 +223,11 @@ herdr-factory-loop-skill/
 ├── LICENSE                  ← MIT
 ├── CONTRIBUTING.md          ← how to propose changes
 ├── Makefile                 ← TUI build targets: tui (host), tui-release (cross), lint, test
+├── .claude-plugin/
+│   └── marketplace.json     ← this repo as a Claude Code marketplace: plugins/prompt-forge, plugins/docu-forge
+├── plugins/
+│   ├── prompt-forge/        ← Claude Code plugin: raw prompt → gradeable prompt (§16.8)
+│   └── docu-forge/          ← Claude Code plugin: one sentence → gated animated documentary
 ├── skill/
 │   ├── SKILL.md             ← the skill itself (loaded by the agent)
 │   └── reference.md         ← verbatim CLI & socket reference (+ m2herd/m2herd-up CLI surfaces)
@@ -227,7 +239,8 @@ herdr-factory-loop-skill/
 │   ├── m2herd-precompact.sh     ← Claude Code PreCompact: refile notes before compaction (§16)
 │   ├── m2herd-budget.js         ← Claude Code PostToolUse: budget advisory → offload to .m2herd/ (§16)
 │   ├── herd-board-subagents.py  ← Claude Code PreToolUse (Agent|Task): subagents onto the herd-board (§16.7)
-│   └── smoke.sh                 ← hook contract smokes: sample/empty/garbage stdin → exit 0 + valid JSON
+│   ├── smoke.sh                 ← hook contract smokes: sample/empty/garbage stdin → exit 0 + valid JSON
+│   └── statusline-chain.sh      ← one statusLine slot for two consumers: ctx-bridge writes, LifeOS renders
 ├── tui/                         ← m2herd-tui source (Go, bubbletea): dashboard + `,` settings editor
 ├── prebuilt/                    ← committed m2herd-tui binaries (darwin-arm64, linux-amd64, linux-arm64)
 ├── templates/
