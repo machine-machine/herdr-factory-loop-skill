@@ -1217,6 +1217,21 @@ The icon carries the meaning, colour only reinforces it (`NO_COLOR`); lines are 
 an ellipsis and overflow says `+N more`. A herd dir without events is drawn the v1 way until
 `herd-recover` migrates it.
 
+**Parked questions.** A question the orchestrator cannot settle itself is parked, never left
+in the scrollback. Two files, the board counts both (line `? Dev n · Together n · Infra n · Expert team n`
+under the header, de: `Gemeinsam`/`Fachteam`; groups with 0 left out, no line when all are 0):
+- the **ask file** (`HERD_BOARD_ASK`, default `/workspace/.m2herd/beim-nutzer.json`) holds what
+  waits on the human in chat: `{"_zweck": "…", "offen": [{"id", "gruppe", "seit", "frage"}]}`.
+  Every entry counts as Dev (it waits on the human in front of the board). The orchestrator adds
+  an entry when it asks and deletes it when answered; the whole list is asked in one go when the
+  human says so (e.g. "ama"), recommendation first.
+- the **register** (`HERD_BOARD_REGISTER`, default `/workspace/decisions-questions.json`) holds
+  durable open questions; each `open_questions[]` entry carries `gruppe`: `dev` (the human
+  orchestrators), `gemeinsam` (shared), `infra` (repo/tooling/DevOps), `fachteam` (domain experts).
+  Answered → converted to a decision and deleted in the same edit.
+Groups, not people: the line never names a person. `HERD_BOARD_ASK_PREVIEW=1` also shows the
+first ask-file question. A missing or broken file counts 0.
+
 **Subagents on the board.** `hooks/herd-board-subagents.py` (PreToolUse, matcher `Agent|Task`)
 registers every main-thread subagent in `~/.cache/herd-board/<anchor>.agents/` and opens the board
 if it is not live; silent in a herd worker's pane. It never blocks the tool call.
@@ -1226,7 +1241,8 @@ if it is not live; silent in a herd worker's pane. It never blocks the tool call
 running pane needs no restart (`herdr pane move <p> --tab <t> --target-pane <q> --split down`);
 pane ids survive, and a move steals focus, so focus `$SELF` again.
 
-**Settings.** `HERD_BOARD_LANG=de|en`, `HERD_BOARD_ORG`, `HERD_BOARD_REPOS` (board);
+**Settings.** `HERD_BOARD_LANG=de|en`, `HERD_BOARD_ORG`, `HERD_BOARD_REPOS`, `HERD_BOARD_ASK`,
+`HERD_BOARD_REGISTER`, `HERD_BOARD_ASK_PREVIEW`, `HERD_BOARD_GV_LOOP` (board);
 `HERD_MAX_SLOTS` (6), `HERD_MIN_FREE_MB` (8000), `HERD_MAX_LOAD` (cores×2.5) in the environment or
 `<herd>/limits.env`; `HERD_ORCH_PANE` / `HERD_ORCH_NAME` (who gets woken and reported to);
 `HERD_SPAWN_TAB`, `HERD_SPAWN_UNSET_KEYS`, `HERD_SPAWN_ENV`, `HERD_SPAWN_CONTEXT=0` (no ctx

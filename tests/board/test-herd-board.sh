@@ -70,11 +70,14 @@ cat >"$T/fake/herd-clash" <<'EOF'
 echo '{"pairs": [{"repo": "acme-api", "slices": ["blk", "run"], "files": ["src/a.py"], "relation": null}],
  "by_slice": {"blk": [{"other": "run"}], "run": [{"other": "blk"}]}, "changed": {}, "skipped": []}'
 EOF
+# no systemd user units: background chains of the host must not leak into the board
+printf '#!/usr/bin/env bash\nexit 0\n' >"$T/fake/systemctl"
 chmod +x "$T/fake/"*
-ln -s "$T/fake/herdr" "$T/notools/herdr"; ln -s "$T/fake/gh" "$T/notools/gh"
+ln -s "$T/fake/systemctl" "$T/notools/systemctl"; ln -s "$T/fake/herdr" "$T/notools/herdr"; ln -s "$T/fake/gh" "$T/notools/gh"
 
 export HOME="$T/home" NO_COLOR=1 COLUMNS=110 LINES=60 HERD_BOARD_LANG=de HERD_BOARD_ORG=acme \
-  HERD_BOARD_REPOS="api=acme-api"
+  HERD_BOARD_REPOS="api=acme-api" \
+  HERD_BOARD_ASK="$T/none.json" HERD_BOARD_REGISTER="$T/none.json" HERD_BOARD_GV_LOOP="$T/no-gv"
 BASEPATH="$(dirname "$PY"):/usr/bin:/bin"
 board() { HERD_BOARD_DETAIL=1 PATH="$T/fake:$BASEPATH" "$T/board/herd-board" "$@"; }  # detailed rows; --selftest covers the simple view
 phase() { PATH="$T/fake:$BASEPATH" "$T/board/herd-phase" "$@" >/dev/null; }
@@ -90,6 +93,7 @@ phase "$H" rep working --field pane=w1:p3 --field model=claude-sonnet-5-5 --fiel
 echo "report" >"$H/rep.out.md"
 echo '{"short": "baut die Lanes", "step": 1, "of": 3}' >"$H/run.status.json"
 for s in okp stp; do
+  echo "acme-api feat/$s main" >"$H/$s.repos"   # a slice with something to merge (no .repos = result without PR)
   phase "$H" "$s" queued; phase "$H" "$s" working --field pane=w1:gone --field model=claude-opus-5-5 --field effort=high
   phase "$H" "$s" accepted; phase "$H" "$s" review_running --field round=1
 done
@@ -121,7 +125,7 @@ has "working: tag + clash" "● run ⇄ blk baut die Lanes O·hi"
 has "working: progress bar" "███░░░░░░░ 1/3"
 has "reported: thin ✓" "✓ rep prüfe ich S·md"
 has "ready: stale by PR head" "⟳ stp veraltet: api#30 hat neue Commits"
-has "merged today from the search" "Heute gemergt 77"
+has "merged today: title with the count" "Heute gemergt (1)"; has "merged today from the search, by repo" "api 77"
 has "v1 fallback line" "herd-v1: v1-Herd — herd-recover migriert"
 has "v1 row the old way" "● old alter Worker"
 if grep -q $'\033' <<<"$OUT"; then bad "NO_COLOR: no escape codes"; else ok "NO_COLOR: no escape codes"; fi
